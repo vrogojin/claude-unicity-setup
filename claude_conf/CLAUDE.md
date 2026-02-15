@@ -112,6 +112,20 @@ Auto-detected by hooks based on project type. See `hooks/pre-commit-check.sh` fo
 
 The hooks inspect the working directory for `Cargo.toml`, `package.json`, `go.mod`, or `Makefile` and run the appropriate build/test/lint commands.
 
+## Remote Sync
+
+An async hook runs `git fetch` periodically (5-minute cooldown) after Bash tool calls. If the remote `main` or your current branch has new commits, a state file is written and a desktop notification sent.
+
+**You will be blocked from stopping** if remote updates are pending. Run `/sync-remote` to merge.
+
+### Notifications
+
+Desktop notifications are automatic (`notify-send` on Linux, `osascript` on macOS). For smartphone push notifications, set `CLAUDE_NOTIFY_URL` in `settings.json` env block:
+
+- **ntfy.sh** (recommended, free): Set to `https://ntfy.sh/<your-topic>`, install ntfy app on phone
+- **Pushover**: Set to your Pushover API endpoint
+- **Custom webhook**: Any URL that accepts POST with body text
+
 ## Documentation Pointers
 
 - `docs/ecosystem-map.md` — Master repo inventory with status and integration points

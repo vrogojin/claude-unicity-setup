@@ -55,4 +55,23 @@ if [ -f "go.mod" ]; then
   fi
 fi
 
+# --- Remote sync check ---
+SYNC_STATE="/tmp/claude/remote-sync.json"
+if [ -f "$SYNC_STATE" ]; then
+  PENDING=$(jq -r '.pending // false' "$SYNC_STATE" 2>/dev/null)
+  if [ "$PENDING" = "true" ]; then
+    MAIN_BEHIND=$(jq -r '.main_behind // 0' "$SYNC_STATE")
+    BRANCH_BEHIND=$(jq -r '.branch_behind // 0' "$SYNC_STATE")
+    BRANCH=$(jq -r '.branch // "unknown"' "$SYNC_STATE")
+
+    SYNC_MSG="Remote updates detected."
+    [ "$MAIN_BEHIND" -gt 0 ] 2>/dev/null && SYNC_MSG="$SYNC_MSG main is $MAIN_BEHIND commit(s) behind origin/main."
+    [ "$BRANCH_BEHIND" -gt 0 ] 2>/dev/null && SYNC_MSG="$SYNC_MSG $BRANCH is $BRANCH_BEHIND commit(s) behind remote."
+    SYNC_MSG="$SYNC_MSG Run /sync-remote to merge before finishing."
+
+    jq -n --arg reason "$SYNC_MSG" '{"decision":"block","reason":$reason}'
+    exit 0
+  fi
+fi
+
 exit 0

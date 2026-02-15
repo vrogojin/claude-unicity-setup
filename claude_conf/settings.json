@@ -1,6 +1,7 @@
 {
   "env": {
-    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+    "CLAUDE_NOTIFY_URL": ""
   },
   "teammateMode": "auto",
   "hooks": {
@@ -32,6 +33,19 @@
             "type": "command",
             "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/steelman-plan.sh",
             "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/remote-sync-check.sh",
+            "timeout": 30,
+            "async": true
           }
         ]
       }
