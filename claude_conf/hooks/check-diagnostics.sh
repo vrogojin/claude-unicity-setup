@@ -74,4 +74,20 @@ if [ -f "$SYNC_STATE" ]; then
   fi
 fi
 
+# --- Upstream dependency update check ---
+DEP_STATE="/tmp/claude/dep-updates.json"
+if [ -f "$DEP_STATE" ]; then
+  DEP_PENDING=$(jq -r '.pending // false' "$DEP_STATE" 2>/dev/null)
+  if [ "$DEP_PENDING" = "true" ]; then
+    UPDATE_COUNT=$(jq '.updates | length' "$DEP_STATE" 2>/dev/null)
+    DEP_NAMES=$(jq -r '[.updates[].name] | join(", ")' "$DEP_STATE" 2>/dev/null)
+
+    DEP_MSG="Upstream dependency updates detected. ${UPDATE_COUNT} dep(s) have new versions: ${DEP_NAMES}."
+    DEP_MSG="$DEP_MSG Run /update-deps to update before finishing."
+
+    jq -n --arg reason "$DEP_MSG" '{"decision":"block","reason":$reason}'
+    exit 0
+  fi
+fi
+
 exit 0

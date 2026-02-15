@@ -16,9 +16,11 @@ claude_conf/
 ├── hooks/                     # Shell hooks enforcing workflow
 │   ├── branch-guard.sh        # Blocks Edit/Write on main/master
 │   ├── pre-commit-check.sh    # Auto-detect: blocks git commit if lint/format fail
-│   ├── check-diagnostics.sh   # Auto-detect: blocks stop if build has errors or remote updates pending
+│   ├── check-diagnostics.sh   # Auto-detect: blocks stop if build has errors, remote updates, or dep updates pending
 │   ├── steelman-plan.sh       # Forces adversarial self-critique before ExitPlanMode
 │   ├── remote-sync-check.sh   # Async: detects remote branch updates (PostToolUse)
+│   ├── dep-update-check.sh    # Async: detects upstream dependency updates (PostToolUse)
+│   ├── dep-map.json           # Cross-repo dependency graph config
 │   └── notify.sh              # Cross-platform notification utility (sourced by hooks)
 ├── skills/                    # Custom slash commands for parallel agent workflows
 │   ├── breakdown/             # /breakdown — split phase doc into parallel work streams
@@ -28,7 +30,8 @@ claude_conf/
 │   ├── task-status/           # /task-status — check progress across tasks/worktrees
 │   ├── push-pr/               # /push-pr — push branch and create GitHub PR
 │   ├── update-issue/          # /update-issue — post progress update on GitHub issue
-│   └── sync-remote/           # /sync-remote — fetch and merge remote updates
+│   ├── sync-remote/           # /sync-remote — fetch and merge remote updates
+│   └── update-deps/           # /update-deps — update upstream deps, adapt code, build, test
 ├── reference/                 # Per-repository API reference docs (loaded on demand)
 └── docs/                      # Architecture docs, guides, design decisions
 ```
@@ -42,9 +45,10 @@ The hooks auto-detect project type and enforce quality gates:
   - Rust: blocks if `cargo fmt --all --check` or `cargo clippy` fail
   - TypeScript: blocks if `npm run lint` or `npm run typecheck` fail
   - Go: blocks if `go vet` or `gofmt` report issues
-- **Stop** → auto-detects and blocks if build errors exist; also blocks if remote has unmerged updates
+- **Stop** → auto-detects and blocks if build errors exist; also blocks if remote has unmerged updates or upstream dependency updates are pending
 - **ExitPlanMode** → blocked once to force steelman self-critique (5 adversarial questions), then allowed on second call
 - **PostToolUse (async)** → after Bash calls, runs `git fetch` with 5-minute cooldown to detect remote updates; writes state file and sends desktop notification if behind
+- **PostToolUse (async)** → after Bash calls, checks upstream npm/git deps with 15-minute cooldown; writes state file and sends desktop notification if newer versions available
 
 ## Skills Workflow
 

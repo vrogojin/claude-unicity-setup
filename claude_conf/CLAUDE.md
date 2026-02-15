@@ -126,6 +126,26 @@ Desktop notifications are automatic (`notify-send` on Linux, `osascript` on macO
 - **Pushover**: Set to your Pushover API endpoint
 - **Custom webhook**: Any URL that accepts POST with body text
 
+## Upstream Dependency Updates
+
+An async hook checks for upstream npm/git dependency updates after Bash tool calls (15-minute cooldown). It reads `hooks/dep-map.json` for the cross-repo dependency graph:
+
+```
+state-transition-sdk → sphere-sdk, openclaw-unicity
+sphere-sdk → sphere, openclaw-unicity, unicity-orchestrator
+openclaw-unicity → unicity-orchestrator
+```
+
+When a newer version is detected (via `npm view` or `git ls-remote`), a state file is written and a desktop notification sent. **You will be blocked from stopping** if upstream updates are pending. Run `/update-deps` to update, build, and test.
+
+### Configuration
+
+Edit `hooks/dep-map.json` to add/remove dependency relationships. Each entry specifies the check method (`npm` or `git`), package name, and source repository.
+
+### Escape Hatch
+
+To skip the dependency update gate: `rm -f /tmp/claude/dep-updates.json /tmp/claude/dep-updates-notified`
+
 ## Documentation Pointers
 
 - `docs/ecosystem-map.md` — Master repo inventory with status and integration points
