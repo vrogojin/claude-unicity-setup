@@ -52,15 +52,15 @@ run_or_dry() {
   fi
 }
 
-# Ensure sphere-helper.mjs can run by finding or installing sphere-sdk
+# Ensure sphere-sdk is available for sphere-helper.mjs
 ensure_sphere_sdk() {
   local helper="$SCRIPT_DIR/lib/sphere-helper.mjs"
   if [ ! -f "$helper" ]; then
     die "lib/sphere-helper.mjs not found in $SCRIPT_DIR"
   fi
 
-  # Check if sphere-sdk is available in the project or globally
-  if node -e "require.resolve('@unicity/sphere-sdk')" 2>/dev/null; then
+  # Check if sphere-sdk is already available
+  if NODE_PATH="$SCRIPT_DIR/node_modules:${NODE_PATH:-}" node -e "require.resolve('@unicity/sphere-sdk')" 2>/dev/null; then
     return 0
   fi
 
@@ -69,13 +69,30 @@ ensure_sphere_sdk() {
     return 0
   fi
 
-  # Install temporarily in script's own directory
+  # Try to install in script's own directory
   info "Installing @unicity/sphere-sdk..."
   if [ "$DRY_RUN" = "true" ]; then
     info "[dry-run] npm install --no-save @unicity/sphere-sdk (in $SCRIPT_DIR)"
   else
-    (cd "$SCRIPT_DIR" && npm install --no-save @unicity/sphere-sdk 2>/dev/null) || \
-      warn "Could not install @unicity/sphere-sdk. Identity operations may fail."
+    if (cd "$SCRIPT_DIR" && npm install --no-save @unicity/sphere-sdk 2>&1); then
+      return 0
+    fi
+    echo ""
+    warn "@unicity/sphere-sdk is not available on npm yet."
+    warn "Identity creation and messaging require sphere-sdk."
+    echo ""
+    echo "  Options:"
+    echo "    1) Provide a local path or git URL to sphere-sdk"
+    echo "    2) Skip identity creation (import existing npub/nsec later)"
+    echo ""
+    SPHERE_SDK_PATH=$(prompt_input "sphere-sdk path or git URL (leave empty to skip)" "")
+    if [ -n "$SPHERE_SDK_PATH" ]; then
+      (cd "$SCRIPT_DIR" && npm install --no-save "$SPHERE_SDK_PATH" 2>&1) || \
+        die "Could not install sphere-sdk from: $SPHERE_SDK_PATH"
+    else
+      SPHERE_SDK_AVAILABLE=false
+      return 1
+    fi
   fi
 }
 
@@ -184,27 +201,52 @@ else
   IDENTITY_CREATED=true
 fi
 
+SPHERE_SDK_AVAILABLE=true
+
 if [ "$IDENTITY_CREATED" = "true" ]; then
   if prompt_yn "Create a new Unicity ID for this Claude instance?"; then
-    ensure_sphere_sdk
-    info "Generating identity (BIP-39 mnemonic + secp256k1 keypair)..."
-    IDENTITY_JSON=$(run_sphere_helper create-identity)
+    if ensure_sphere_sdk; then
+      info "Generating identity (BIP-39 mnemonic + secp256k1 keypair)..."
+      IDENTITY_JSON=$(run_sphere_helper create-identity)
 
-    if [ "$DRY_RUN" != "true" ]; then
-      echo "$IDENTITY_JSON" > "$IDENTITY_FILE"
-      chmod 600 "$IDENTITY_FILE"
-    fi
+      if [ "$DRY_RUN" != "true" ]; then
+        echo "$IDENTITY_JSON" > "$IDENTITY_FILE"
+        chmod 600 "$IDENTITY_FILE"
+      fi
 
-    AGENT_NPUB=$(echo "$IDENTITY_JSON" | jq -r '.npub // "unknown"')
-    ok "Identity created: $AGENT_NPUB"
+      AGENT_NPUB=$(echo "$IDENTITY_JSON" | jq -r '.npub // "unknown"')
+      ok "Identity created: $AGENT_NPUB"
 
-    # Show mnemonic once
-    if [ "$DRY_RUN" != "true" ]; then
-      echo ""
-      warn "=== BACKUP YOUR MNEMONIC (shown once) ==="
-      echo "$IDENTITY_JSON" | jq -r '.mnemonic'
-      warn "==========================================="
-      echo ""
+      # Show mnemonic once
+      if [ "$DRY_RUN" != "true" ]; then
+        echo ""
+        warn "=== BACKUP YOUR MNEMONIC (shown once) ==="
+        echo "$IDENTITY_JSON" | jq -r '.mnemonic'
+        warn "==========================================="
+        echo ""
+      fi
+    else
+      warn "sphere-sdk not available — falling back to manual import."
+      IMPORT_NPUB=$(prompt_input "Enter existing npub")
+      IMPORT_NSEC=$(prompt_input "Enter existing nsec")
+      AGENT_NPUB="$IMPORT_NPUB"
+
+      if [ "$DRY_RUN" != "true" ]; then
+        jq -n \
+          --arg npub "$IMPORT_NPUB" \
+          --arg nsec "$IMPORT_NSEC" \
+          --arg created_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+          '{
+            created_at: $created_at,
+            mnemonic: "(imported)",
+            public_key: "(derived from npub)",
+            npub: $npub,
+            nsec: $nsec,
+            derivation_path: "m/44\u0027/0\u0027/0\u0027/0/0"
+          }' > "$IDENTITY_FILE"
+        chmod 600 "$IDENTITY_FILE"
+      fi
+      ok "Imported identity: $AGENT_NPUB"
     fi
   else
     # Import existing identity
@@ -233,6 +275,18 @@ else
   AGENT_NPUB=$(jq -r '.npub // "unknown"' "$IDENTITY_FILE" 2>/dev/null)
 fi
 
+# Agent nametag (human-readable name for this agent instance)
+echo ""
+AGENT_NAMETAG=$(prompt_input "Agent nametag for this instance (e.g., claude-otc-bot, claude-sphere)" "claude-$(basename "$TARGET_DIR")")
+ok "Agent nametag: $AGENT_NAMETAG"
+
+# Store nametag in identity file
+if [ -f "$IDENTITY_FILE" ] && [ "$DRY_RUN" != "true" ]; then
+  jq --arg nametag "$AGENT_NAMETAG" '.nametag = $nametag' "$IDENTITY_FILE" > "$IDENTITY_FILE.tmp" \
+    && mv "$IDENTITY_FILE.tmp" "$IDENTITY_FILE"
+  chmod 600 "$IDENTITY_FILE"
+fi
+
 # ============================================================
 # Phase 3: Owner configuration
 # ============================================================
@@ -245,14 +299,18 @@ OWNER_NAMETAG=""
 
 if [[ "$OWNER_INPUT" == @* ]]; then
   OWNER_NAMETAG="$OWNER_INPUT"
-  info "Resolving nametag $OWNER_INPUT..."
-  ensure_sphere_sdk
-  RESOLVED=$(run_sphere_helper resolve-nametag "${OWNER_INPUT#@}" 2>/dev/null || echo "")
-  if [ -n "$RESOLVED" ] && [ "$RESOLVED" != "null" ]; then
-    OWNER_NPUB=$(echo "$RESOLVED" | jq -r '.npub // empty' 2>/dev/null || echo "$RESOLVED")
-    ok "Resolved to: $OWNER_NPUB"
+  if [ "$SPHERE_SDK_AVAILABLE" = "true" ]; then
+    info "Resolving nametag $OWNER_INPUT..."
+    RESOLVED=$(run_sphere_helper resolve-nametag "${OWNER_INPUT#@}" 2>/dev/null || echo "")
+    if [ -n "$RESOLVED" ] && [ "$RESOLVED" != "null" ]; then
+      OWNER_NPUB=$(echo "$RESOLVED" | jq -r '.npub // empty' 2>/dev/null || echo "$RESOLVED")
+      ok "Resolved to: $OWNER_NPUB"
+    else
+      warn "Could not resolve nametag. Enter npub manually."
+      OWNER_NPUB=$(prompt_input "Owner npub")
+    fi
   else
-    warn "Could not resolve nametag. Enter npub manually."
+    warn "Nametag resolution requires sphere-sdk. Enter npub manually."
     OWNER_NPUB=$(prompt_input "Owner npub")
   fi
 elif [[ "$OWNER_INPUT" == npub1* ]]; then
@@ -387,17 +445,18 @@ info "Phase 7: UNICITY_DEV_AGENTS group setup..."
 GROUP_NAME="UNICITY_DEV_AGENTS"
 GROUP_ID=""
 
-ensure_sphere_sdk
-info "Joining $GROUP_NAME on $RELAY_URL..."
+if [ "$SPHERE_SDK_AVAILABLE" = "true" ]; then
+  info "Joining $GROUP_NAME on $RELAY_URL..."
 
-GROUP_RESULT=$(run_sphere_helper join-group "$GROUP_NAME" \
-  --identity "$IDENTITY_FILE" \
-  --relay "$RELAY_URL" 2>/dev/null || echo '{"error": "join failed"}')
+  GROUP_RESULT=$(run_sphere_helper join-group "$GROUP_NAME" \
+    --identity "$IDENTITY_FILE" \
+    --relay "$RELAY_URL" 2>/dev/null || echo '{"error": "join failed"}')
 
-GROUP_ID=$(echo "$GROUP_RESULT" | jq -r '.group_id // .id // ""' 2>/dev/null)
+  GROUP_ID=$(echo "$GROUP_RESULT" | jq -r '.group_id // .id // ""' 2>/dev/null)
+fi
 
 if [ -z "$GROUP_ID" ] || [ "$GROUP_ID" = "null" ]; then
-  warn "Could not join/create group. Using placeholder."
+  warn "Could not join/create group (sphere-sdk required). Using placeholder."
   GROUP_ID="unicity-dev-agents-${NETWORK}"
 fi
 
@@ -421,6 +480,7 @@ if [ "$DRY_RUN" = "true" ]; then
   info "[dry-run] Write $CONFIG_FILE"
 else
   jq -n \
+    --arg agent_nametag "$AGENT_NAMETAG" \
     --arg owner_npub "$OWNER_NPUB" \
     --arg owner_nametag "$OWNER_NAMETAG" \
     --arg notification_url "$NOTIFY_URL" \
@@ -430,6 +490,7 @@ else
     --argjson dep_enabled "$DEP_TRACKING_ENABLED" \
     --argjson selected_deps "$DEPS_JSON" \
     '{
+      agent_nametag: $agent_nametag,
       owner_npub: $owner_npub,
       owner_nametag: $owner_nametag,
       notification_url: $notification_url,
@@ -486,6 +547,7 @@ echo "============================================"
 echo "  Setup Complete"
 echo "============================================"
 echo ""
+echo "  Agent nametag:   $AGENT_NAMETAG"
 echo "  Agent identity:  $AGENT_NPUB"
 echo "  Owner:           ${OWNER_NAMETAG:+$OWNER_NAMETAG }($OWNER_NPUB)"
 echo "  Network:         $NETWORK ($RELAY_URL)"

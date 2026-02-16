@@ -1,3 +1,8 @@
+---
+name: check-messages
+description: Read and display agent messages from the UNICITY_DEV_AGENTS group and direct messages from the owner.
+---
+
 # /check-messages — Read Agent Messages
 
 On-demand skill to read and display messages from the UNICITY_DEV_AGENTS group and direct messages from the owner.

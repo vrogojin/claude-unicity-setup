@@ -1,3 +1,8 @@
+---
+name: dm-owner
+description: Send a direct message to the configured owner via Nostr transport. Accepts message text as argument.
+---
+
 # /dm-owner — Send DM to Owner
 
 Send a direct message to the configured owner via Nostr transport.
