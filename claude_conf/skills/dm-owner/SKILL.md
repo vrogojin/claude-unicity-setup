@@ -34,7 +34,7 @@ Send a direct message to the configured owner via Nostr transport.
 
 7. If sending fails, report the error and suggest checking:
    - Is the identity file present? (`ls .claude/agent/identity.json`)
-   - Is sphere-sdk installed? (`node -e "require.resolve('@unicity/sphere-sdk')"`)
+   - Is sphere-sdk installed? (`node -e "require.resolve('@unicitylabs/sphere-sdk')"`)
    - Are Nostr relays reachable?
 
 ## Use Cases

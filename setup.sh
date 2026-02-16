@@ -60,25 +60,25 @@ ensure_sphere_sdk() {
   fi
 
   # Check if sphere-sdk is already available
-  if NODE_PATH="$SCRIPT_DIR/node_modules:${NODE_PATH:-}" node -e "require.resolve('@unicity/sphere-sdk')" 2>/dev/null; then
+  if NODE_PATH="$SCRIPT_DIR/node_modules:${NODE_PATH:-}" node -e "require.resolve('@unicitylabs/sphere-sdk')" 2>/dev/null; then
     return 0
   fi
 
   # Check if target project has it
-  if [ -n "${TARGET_DIR:-}" ] && [ -f "$TARGET_DIR/node_modules/@unicity/sphere-sdk/package.json" ]; then
+  if [ -n "${TARGET_DIR:-}" ] && [ -f "$TARGET_DIR/node_modules/@unicitylabs/sphere-sdk/package.json" ]; then
     return 0
   fi
 
   # Try to install in script's own directory
-  info "Installing @unicity/sphere-sdk..."
+  info "Installing @unicitylabs/sphere-sdk..."
   if [ "$DRY_RUN" = "true" ]; then
-    info "[dry-run] npm install --no-save @unicity/sphere-sdk (in $SCRIPT_DIR)"
+    info "[dry-run] npm install --no-save @unicitylabs/sphere-sdk (in $SCRIPT_DIR)"
   else
-    if (cd "$SCRIPT_DIR" && npm install --no-save @unicity/sphere-sdk 2>&1); then
+    if (cd "$SCRIPT_DIR" && npm install --no-save @unicitylabs/sphere-sdk 2>&1); then
       return 0
     fi
     echo ""
-    warn "@unicity/sphere-sdk is not available on npm yet."
+    warn "@unicitylabs/sphere-sdk is not available on npm yet."
     warn "Identity creation and messaging require sphere-sdk."
     echo ""
     echo "  Options:"
