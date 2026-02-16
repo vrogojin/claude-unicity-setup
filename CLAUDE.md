@@ -11,7 +11,8 @@ This is the Claude Code configuration repository for the **Unicity Network** eco
 ```
 setup.sh                       # Interactive setup: deploy config, create identity, join group
 lib/
-└── sphere-helper.mjs          # Node.js CLI helper wrapping sphere-sdk for agent ops
+├── sphere-helper.mjs          # Node.js CLI helper wrapping sphere-sdk for agent ops
+└── sphere-daemon.mjs          # Background daemon: listens for Nostr DMs/group messages
 claude_conf/
 ├── CLAUDE.md                  # Main CLAUDE.md for Unicity projects
 ├── settings.json              # Hooks config (PreToolUse, Stop, PostToolUse), team agents mode

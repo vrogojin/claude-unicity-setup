@@ -171,7 +171,7 @@ Each agent has a direct message channel (NIP-17 encrypted) to its owner for:
 
 Messages are delivered through three channels with automatic fallback:
 
-1. **sphere-sdk daemon** (real-time push) — Background process listens to Nostr relays, triggers `on-dm.sh` and `on-group-message.sh` hooks on arrival. Run `sphere-daemon start` to activate.
+1. **sphere-sdk daemon** (real-time push) — Background process listens to Nostr relays, triggers `on-dm.sh` and `on-group-message.sh` hooks on arrival. Run `node lib/sphere-daemon.mjs start --project <dir> &` to activate.
 2. **PostToolUse polling** (async fallback) — `agent-comms-check.sh` polls relays every 10 minutes after Bash tool calls. Catches messages if the daemon isn't running.
 3. **`/check-messages` skill** (on-demand) — Manually read all pending messages. Useful for catching up or verifying inbox state.
 
