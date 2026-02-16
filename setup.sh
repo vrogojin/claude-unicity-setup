@@ -36,9 +36,9 @@ prompt_input() {
   local msg="$1" default="${2:-}"
   local val
   if [ -n "$default" ]; then
-    printf '%s [%s]: ' "$msg" "$default"
+    printf '%s [%s]: ' "$msg" "$default" >&2
   else
-    printf '%s: ' "$msg"
+    printf '%s: ' "$msg" >&2
   fi
   read -r val
   echo "${val:-$default}"
