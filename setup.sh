@@ -205,6 +205,7 @@ SPHERE_SDK_AVAILABLE=true
 
 # Agent nametag — ask first, before identity generation
 AGENT_NAMETAG=$(prompt_input "Agent nametag for this instance (e.g., claude-otc-bot, claude-sphere)" "claude-$(basename "$TARGET_DIR")")
+AGENT_NAMETAG="${AGENT_NAMETAG#@}"  # strip leading @ if present
 ok "Agent nametag: $AGENT_NAMETAG"
 
 if [ "$IDENTITY_CREATED" = "true" ]; then
@@ -292,34 +293,16 @@ fi
 echo ""
 info "Phase 3: Owner configuration..."
 
-OWNER_INPUT=$(prompt_input "Enter the owner's Unicity ID (npub or @nametag)")
-OWNER_NPUB=""
-OWNER_NAMETAG=""
+OWNER_NAMETAG=$(prompt_input "Enter the owner's nametag (e.g., babaika10)")
+OWNER_NAMETAG="${OWNER_NAMETAG#@}"  # strip leading @ if present
 
-if [[ "$OWNER_INPUT" == @* ]]; then
-  OWNER_NAMETAG="$OWNER_INPUT"
-  if [ "$SPHERE_SDK_AVAILABLE" = "true" ]; then
-    info "Resolving nametag $OWNER_INPUT..."
-    RESOLVED=$(run_sphere_helper resolve-nametag "${OWNER_INPUT#@}" 2>/dev/null || echo "")
-    if [ -n "$RESOLVED" ] && [ "$RESOLVED" != "null" ]; then
-      OWNER_NPUB=$(echo "$RESOLVED" | jq -r '.npub // empty' 2>/dev/null || echo "$RESOLVED")
-      ok "Resolved to: $OWNER_NPUB"
-    else
-      warn "Could not resolve nametag. Enter npub manually."
-      OWNER_NPUB=$(prompt_input "Owner npub")
-    fi
-  else
-    warn "Nametag resolution requires sphere-sdk. Enter npub manually."
-    OWNER_NPUB=$(prompt_input "Owner npub")
-  fi
-elif [[ "$OWNER_INPUT" == npub1* ]]; then
-  OWNER_NPUB="$OWNER_INPUT"
-else
-  warn "Input doesn't look like an npub or @nametag. Using as-is."
-  OWNER_NPUB="$OWNER_INPUT"
+OWNER_NPUB=$(prompt_input "Enter the owner's npub (leave empty if unknown)" "")
+
+if [ -z "$OWNER_NPUB" ]; then
+  info "Owner npub not set — nametag '$OWNER_NAMETAG' will be resolved at runtime by the agent."
 fi
 
-ok "Owner: ${OWNER_NAMETAG:+$OWNER_NAMETAG }($OWNER_NPUB)"
+ok "Owner: $OWNER_NAMETAG${OWNER_NPUB:+ ($OWNER_NPUB)}"
 
 # ============================================================
 # Phase 4: Network environment
@@ -548,7 +531,7 @@ echo "============================================"
 echo ""
 echo "  Agent nametag:   $AGENT_NAMETAG"
 echo "  Agent identity:  $AGENT_NPUB"
-echo "  Owner:           ${OWNER_NAMETAG:+$OWNER_NAMETAG }($OWNER_NPUB)"
+echo "  Owner:           $OWNER_NAMETAG${OWNER_NPUB:+ ($OWNER_NPUB)}"
 echo "  Network:         $NETWORK ($RELAY_URL)"
 echo "  Group:           $GROUP_NAME ($GROUP_ID)"
 echo "  Notifications:   ${NOTIFY_URL:-disabled (desktop only)}"
