@@ -203,6 +203,10 @@ fi
 
 SPHERE_SDK_AVAILABLE=true
 
+# Agent nametag — ask first, before identity generation
+AGENT_NAMETAG=$(prompt_input "Agent nametag for this instance (e.g., claude-otc-bot, claude-sphere)" "claude-$(basename "$TARGET_DIR")")
+ok "Agent nametag: $AGENT_NAMETAG"
+
 if [ "$IDENTITY_CREATED" = "true" ]; then
   if prompt_yn "Create a new Unicity ID for this Claude instance?"; then
     if ensure_sphere_sdk; then
@@ -275,12 +279,7 @@ else
   AGENT_NPUB=$(jq -r '.npub // "unknown"' "$IDENTITY_FILE" 2>/dev/null)
 fi
 
-# Agent nametag (human-readable name for this agent instance)
-echo ""
-AGENT_NAMETAG=$(prompt_input "Agent nametag for this instance (e.g., claude-otc-bot, claude-sphere)" "claude-$(basename "$TARGET_DIR")")
-ok "Agent nametag: $AGENT_NAMETAG"
-
-# Store nametag in identity file
+# Store nametag in identity file (after it's been created/imported above)
 if [ -f "$IDENTITY_FILE" ] && [ "$DRY_RUN" != "true" ]; then
   jq --arg nametag "$AGENT_NAMETAG" '.nametag = $nametag' "$IDENTITY_FILE" > "$IDENTITY_FILE.tmp" \
     && mv "$IDENTITY_FILE.tmp" "$IDENTITY_FILE"
