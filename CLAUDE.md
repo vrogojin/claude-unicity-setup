@@ -9,17 +9,23 @@ This is the Claude Code configuration repository for the **Unicity Network** eco
 ## Repository Structure
 
 ```
+setup.sh                       # Interactive setup: deploy config, create identity, join group
+lib/
+└── sphere-helper.mjs          # Node.js CLI helper wrapping sphere-sdk for agent ops
 claude_conf/
 ├── CLAUDE.md                  # Main CLAUDE.md for Unicity projects
-├── settings.json              # Hooks config (PreToolUse, Stop), team agents mode
+├── settings.json              # Hooks config (PreToolUse, Stop, PostToolUse), team agents mode
 ├── settings.local.json        # Permissions, sandbox config, MCP servers
 ├── hooks/                     # Shell hooks enforcing workflow
 │   ├── branch-guard.sh        # Blocks Edit/Write on main/master
 │   ├── pre-commit-check.sh    # Auto-detect: blocks git commit if lint/format fail
-│   ├── check-diagnostics.sh   # Auto-detect: blocks stop if build has errors, remote updates, or dep updates pending
+│   ├── check-diagnostics.sh   # Auto-detect: blocks stop if build errors, remote updates, dep updates, or urgent messages pending
 │   ├── steelman-plan.sh       # Forces adversarial self-critique before ExitPlanMode
 │   ├── remote-sync-check.sh   # Async: detects remote branch updates (PostToolUse)
 │   ├── dep-update-check.sh    # Async: detects upstream dependency updates (PostToolUse)
+│   ├── agent-comms-check.sh   # Async: fallback polling for agent messages (PostToolUse)
+│   ├── on-dm.sh               # Daemon hook: incoming DM → state file + notify
+│   ├── on-group-message.sh    # Daemon hook: incoming group msg → state file + notify
 │   ├── dep-map.json           # Cross-repo dependency graph config
 │   └── notify.sh              # Cross-platform notification utility (sourced by hooks)
 ├── skills/                    # Custom slash commands for parallel agent workflows
@@ -31,7 +37,10 @@ claude_conf/
 │   ├── push-pr/               # /push-pr — push branch and create GitHub PR
 │   ├── update-issue/          # /update-issue — post progress update on GitHub issue
 │   ├── sync-remote/           # /sync-remote — fetch and merge remote updates
-│   └── update-deps/           # /update-deps — update upstream deps, adapt code, build, test
+│   ├── update-deps/           # /update-deps — update upstream deps, adapt code, build, test
+│   ├── check-messages/        # /check-messages — read and display agent messages
+│   └── dm-owner/              # /dm-owner — send DM to configured owner
+├── agent/                     # Agent identity and config (created by setup.sh, gitignored)
 ├── reference/                 # Per-repository API reference docs (loaded on demand)
 └── docs/                      # Architecture docs, guides, design decisions
 ```
@@ -45,10 +54,11 @@ The hooks auto-detect project type and enforce quality gates:
   - Rust: blocks if `cargo fmt --all --check` or `cargo clippy` fail
   - TypeScript: blocks if `npm run lint` or `npm run typecheck` fail
   - Go: blocks if `go vet` or `gofmt` report issues
-- **Stop** → auto-detects and blocks if build errors exist; also blocks if remote has unmerged updates or upstream dependency updates are pending
+- **Stop** → auto-detects and blocks if build errors exist; also blocks if remote has unmerged updates, upstream dependency updates are pending, or unread priority agent messages exist
 - **ExitPlanMode** → blocked once to force steelman self-critique (5 adversarial questions), then allowed on second call
 - **PostToolUse (async)** → after Bash calls, runs `git fetch` with 5-minute cooldown to detect remote updates; writes state file and sends desktop notification if behind
 - **PostToolUse (async)** → after Bash calls, checks upstream npm/git deps with 15-minute cooldown; writes state file and sends desktop notification if newer versions available
+- **PostToolUse (async)** → after Bash calls, polls Nostr relays for agent messages with 10-minute cooldown (fallback if sphere-sdk daemon not running)
 
 ## Skills Workflow
 
@@ -59,6 +69,8 @@ The skills support a parallel agent development workflow:
 4. `/agent-review stream-x` — review completed work against task file
 5. `/steelman` — adversarial review before merge
 6. `/task-status` — check overall progress
+7. `/check-messages` — read agent messages (group + DMs)
+8. `/dm-owner <message>` — send a DM to the configured owner
 
 ## Editing Configuration
 

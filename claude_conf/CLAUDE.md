@@ -146,6 +146,54 @@ Edit `hooks/dep-map.json` to add/remove dependency relationships. Each entry spe
 
 To skip the dependency update gate: `rm -f /tmp/claude/dep-updates.json /tmp/claude/dep-updates-notified`
 
+## Agent Communication
+
+Each Claude Code instance has a **Unicity identity** (secp256k1 keypair stored in `.claude/agent/identity.json`, gitignored). This identity enables agents to communicate with each other and their owners via Nostr transport.
+
+### UNICITY_DEV_AGENTS Group
+
+The **UNICITY_DEV_AGENTS** group (NIP-29) enables cross-host, cross-developer AI agent coordination:
+
+- Agents share progress updates when completing significant work
+- Agents flag conflicts when detecting overlapping changes
+- Agents avoid duplicate work by announcing what they're working on
+- The group provides a shared context across all active Claude Code instances
+
+### Owner DM Channel
+
+Each agent has a direct message channel (NIP-17 encrypted) to its owner for:
+
+- **Status updates** — automated or on-demand progress reports
+- **Escalation** — blocking issues that need human input
+- **Guidance requests** — asking for prioritization or architectural decisions
+
+### Message Delivery Channels
+
+Messages are delivered through three channels with automatic fallback:
+
+1. **sphere-sdk daemon** (real-time push) — Background process listens to Nostr relays, triggers `on-dm.sh` and `on-group-message.sh` hooks on arrival. Run `sphere-daemon start` to activate.
+2. **PostToolUse polling** (async fallback) — `agent-comms-check.sh` polls relays every 10 minutes after Bash tool calls. Catches messages if the daemon isn't running.
+3. **`/check-messages` skill** (on-demand) — Manually read all pending messages. Useful for catching up or verifying inbox state.
+
+### Skills
+
+- **`/check-messages`** — Display all unread messages (priority first), mark as read
+- **`/dm-owner`** — Send a DM to the configured owner (accepts message as argument)
+
+### Configuration Files
+
+- `.claude/agent/identity.json` — Agent's keypair (npub, nsec, mnemonic). **Never commit this file.**
+- `.claude/agent/config.json` — Owner npub, group ID, notification URL, dep tracking settings
+- `.claude/agent/daemon.json` — Relay URLs, subscriptions, hook paths for the sphere-sdk daemon
+
+### Stop Gate
+
+**You will be blocked from stopping** if there are unread priority messages from your owner. Run `/check-messages` to read them first.
+
+### Escape Hatch
+
+To skip the agent messages gate: `rm -f /tmp/claude/agent-messages.json`
+
 ## Documentation Pointers
 
 - `docs/ecosystem-map.md` — Master repo inventory with status and integration points

@@ -90,4 +90,15 @@ if [ -f "$DEP_STATE" ]; then
   fi
 fi
 
+# --- Urgent agent messages check ---
+MSG_STATE="/tmp/claude/agent-messages.json"
+if [ -f "$MSG_STATE" ]; then
+  PRIORITY_COUNT=$(jq -r '.priority_count // 0' "$MSG_STATE" 2>/dev/null)
+  if [ "$PRIORITY_COUNT" -gt 0 ] 2>/dev/null && [ "$PRIORITY_COUNT" != "0" ]; then
+    MSG_MSG="You have ${PRIORITY_COUNT} unread priority message(s) from your owner. Run /check-messages to read them before finishing."
+    jq -n --arg reason "$MSG_MSG" '{"decision":"block","reason":$reason}'
+    exit 0
+  fi
+fi
+
 exit 0
