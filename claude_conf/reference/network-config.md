@@ -27,7 +27,7 @@
 | Aggregator (L3) | `https://aggregator.testnet.unicity.network` |
 | BFT (L2) | `https://bft.testnet.unicity.network` |
 | Alpha RPC (L1) | `https://alpha.testnet.unicity.network` |
-| Nostr Relays | `wss://relay.testnet.unicity.network` |
+| Nostr Relays | `wss://nostr-relay.testnet.unicity.network` |
 
 ### Devnet (Local)
 | Service | Endpoint |

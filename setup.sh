@@ -318,7 +318,7 @@ NETWORK=$(prompt_input "Network environment" "testnet")
 case "$NETWORK" in
   1|testnet)
     NETWORK="testnet"
-    RELAY_URL="wss://relay.testnet.unicity.network"
+    RELAY_URL="wss://nostr-relay.testnet.unicity.network"
     ;;
   2|mainnet)
     NETWORK="mainnet"
@@ -331,7 +331,7 @@ case "$NETWORK" in
   *)
     warn "Unknown network '$NETWORK', defaulting to testnet"
     NETWORK="testnet"
-    RELAY_URL="wss://relay.testnet.unicity.network"
+    RELAY_URL="wss://nostr-relay.testnet.unicity.network"
     ;;
 esac
 
