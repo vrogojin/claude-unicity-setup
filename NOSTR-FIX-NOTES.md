@@ -25,8 +25,16 @@ The Unicity nostr-js-sdk is internally consistent and standards-compliant (NIP-1
 - `npubToHex`: accepts (a) bare 64-hex x-only, (b) bare 66-hex compressed `02/03`-prefixed, (c) standard NIP-19 npub, (d) legacy L1-style npub (33 bytes). All paths normalize to 64-hex x-only.
 - `checkMessages`: wraps DM and group callbacks in `{ onEvent }` objects; widens DM `since` to `userSince - 2d` to absorb NIP-17 timestamp randomization; post-filters by rumor (truthful) timestamp; deduplicates by event id across both subscriptions.
 - `migrateIdentity` (new subcommand): re-derives canonical npub/nsec for an existing identity file. Idempotent. Defaults to dry-run; pass `--write` to apply. Creates `identity.json.bak` unless `--no-backup`.
+- `npubToHexCommand` (new `npub-to-hex` subcommand): prints canonical 32-byte x-only hex on stdout for any of the four input forms above. No JSON wrapper — for shell consumers (the hooks).
 
 Public key (`public_key` field) and `mnemonic` were always correct — migration only touches `npub`, `nsec`, and writes `private_key` (computed from mnemonic for completeness).
+
+`claude_conf/hooks/on-dm.sh` and `claude_conf/hooks/on-group-message.sh`:
+
+- Both hooks previously compared the incoming sender (32-byte x-only hex from the daemon's NIP-17-unwrapped message) to `owner_npub` (bech32 string from `config.json`) — they could never match, so owner-priority alerting was dead code, and the own-message filter in the group hook always leaked own messages into the inbox.
+- Fix: shell out to `sphere-helper.mjs npub-to-hex` once at startup to decode `owner_npub` and (for the group hook) `identity.npub` into canonical 32-byte hex. Compare hex-to-hex. The same helper handles standard NIP-19, legacy L1-style, and bare-hex inputs, so the hooks keep working through any future migration.
+- on-dm.sh also respects a `priority: true` field if the daemon-side helper already computed it (avoids re-doing the decode), with the local hex-to-hex compare as a defensive fallback.
+- The bug was masked because `owner_npub` is empty (`""`) in every observed config, so the dead priority paths just no-op'd. Verified by 11 unit tests covering: empty owner, standard npub owner, legacy npub owner, non-owner sender, helper-supplied priority flag, own-message drop, owner group msg, missing config file — all pass.
 
 ## What was verified
 
@@ -41,11 +49,9 @@ Public key (`public_key` field) and `mnemonic` were always correct — migration
 
 1. **`@unicitylabs/nostr-js-sdk`** — unchanged. It is correct. Considered patching to accept 33-byte keys for compatibility, decided against: x-only public keys are required by Schnorr (BIP-340) and NIP-44 ECDH; transparently stripping the parity byte would silently change signatures. The right fix is to never produce 33-byte npub/nsec in the first place.
 2. **sphere-sdk's `CommunicationsModule`, `NostrTransportProvider`** — untouched. These also pass bare functions to `client.subscribe()` in many places; they are affected by the same listener-shape bug. Separate work — flagging only.
-3. **Existing hook bug**: `claude_conf/hooks/on-dm.sh` compares incoming sender pubkey (32-byte hex) to `OWNER_NPUB` (bech32 string) for priority routing — they'll never match. `owner_npub` is currently empty in the configs I saw, so the hook silently no-ops. Flagging for separate fix.
 
 ## Follow-ups for the team
 
 1. Audit and fix subscribe-listener shape in sphere-sdk `NostrTransportProvider` and `CommunicationsModule`. Same pattern, same bug, same impact (silent message loss).
 2. The DM polling window in any consumer of NIP-17 gift wraps must widen by 2 days to absorb the privacy-randomized `created_at`. Document this in the sphere-sdk integration guide.
-3. `on-dm.sh` priority logic needs the daemon to pass either a bech32 npub OR the hook to convert hex → npub before comparing to `owner_npub`. Right now the priority path is dead code.
-4. `decodeNpub` could be extended in nostr-js-sdk to accept 33-byte legacy input and silently strip the leading version byte for backward compat — but this would mask future bugs, so a strict check is probably the right call. Document the legacy format and provide a migration helper (this helper now exists).
+3. `decodeNpub` could be extended in nostr-js-sdk to accept 33-byte legacy input and silently strip the leading version byte for backward compat — but this would mask future bugs, so a strict check is probably the right call. Document the legacy format and provide a migration helper (this helper now exists).
