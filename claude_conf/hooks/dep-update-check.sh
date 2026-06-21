@@ -23,7 +23,7 @@ DEP_MAP="$HOOK_DIR/dep-map.json"
 [ -f "$DEP_MAP" ] || exit 0
 jq -e --arg repo "$REPO_NAME" '.repos[$repo]' "$DEP_MAP" >/dev/null 2>&1 || exit 0
 
-STATE_DIR="/tmp/claude"
+. "$(cd "$(dirname "$0")" 2>/dev/null && pwd)/state-dir.sh" 2>/dev/null || STATE_DIR="/tmp/claude"
 STATE_FILE="$STATE_DIR/dep-updates.json"
 NOTIFIED_FILE="$STATE_DIR/dep-updates-notified"
 mkdir -p "$STATE_DIR"

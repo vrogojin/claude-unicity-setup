@@ -9,7 +9,14 @@ On-demand skill to read and display messages from the UNICITY_DEV_AGENTS group a
 
 ## Instructions
 
-1. Read the agent message state file at `/tmp/claude/agent-messages.json`.
+0. Resolve the per-repo state directory (hook state files are namespaced per repo to
+   avoid cross-session collisions). Use this `STATE_DIR` for every state-file path below:
+   ```bash
+   STATE_DIR="$( . "$CLAUDE_PROJECT_DIR/.claude/hooks/state-dir.sh" 2>/dev/null && printf '%s' "$STATE_DIR" )"
+   STATE_DIR="${STATE_DIR:-/tmp/claude}"
+   ```
+
+1. Read the agent message state file at `$STATE_DIR/agent-messages.json`.
 
 2. If the state file does not exist or has no messages, attempt a live poll:
    ```bash
@@ -36,8 +43,8 @@ On-demand skill to read and display messages from the UNICITY_DEV_AGENTS group a
 4. After displaying, mark all messages as read by updating the state file:
    ```bash
    jq '.unread = false | .unread_count = 0 | .priority_count = 0 | .messages = [.messages[] | .read = true]' \
-     /tmp/claude/agent-messages.json > /tmp/claude/agent-messages.json.tmp \
-     && mv /tmp/claude/agent-messages.json.tmp /tmp/claude/agent-messages.json
+     "$STATE_DIR/agent-messages.json" > "$STATE_DIR/agent-messages.json.tmp" \
+     && mv "$STATE_DIR/agent-messages.json.tmp" "$STATE_DIR/agent-messages.json"
    ```
 
 5. If there are no messages at all, report: "No messages. Agent inbox is empty."

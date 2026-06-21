@@ -12,7 +12,7 @@ INPUT=$(cat)
 cd "$CLAUDE_PROJECT_DIR" 2>/dev/null || exit 0
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 0
 
-STATE_DIR="/tmp/claude"
+. "$(cd "$(dirname "$0")" 2>/dev/null && pwd)/state-dir.sh" 2>/dev/null || STATE_DIR="/tmp/claude"
 STATE_FILE="$STATE_DIR/remote-sync.json"
 mkdir -p "$STATE_DIR"
 

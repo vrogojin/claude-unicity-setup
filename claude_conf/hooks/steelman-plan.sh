@@ -9,7 +9,8 @@
 #   3. Claude addresses each point, revises if needed → calls ExitPlanMode again
 #   4. Hook sees recent state file → allows through
 
-STATE_FILE="/tmp/claude/steelman-done"
+. "$(cd "$(dirname "$0")" 2>/dev/null && pwd)/state-dir.sh" 2>/dev/null || STATE_DIR="/tmp/claude"
+STATE_FILE="$STATE_DIR/steelman-done"
 
 if [ -f "$STATE_FILE" ]; then
   # Allow through if steelman was done recently (within 10 minutes)
@@ -28,7 +29,7 @@ if [ -f "$STATE_FILE" ]; then
 fi
 
 # Create state file and block with steelman critique
-mkdir -p /tmp/claude
+mkdir -p "$STATE_DIR"
 touch "$STATE_FILE"
 
 REASON="STEELMAN CHECK — Before submitting this plan, critically argue against it:
