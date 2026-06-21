@@ -163,6 +163,14 @@ fi
 run_or_dry cp -r "$CONF_DIR/." "$CLAUDE_DIR/"
 ok "Copied claude_conf/ → .claude/"
 
+# Ensure hook scripts are executable after deployment. cp -r preserves source
+# modes, but make the +x bit explicit so the harness can always invoke them
+# (and so a checkout that lost the bit doesn't silently break the hooks).
+if [ -d "$CLAUDE_DIR/hooks" ]; then
+  run_or_dry chmod +x "$CLAUDE_DIR/hooks"/*.sh
+  ok "Made hook scripts executable"
+fi
+
 # Append .claude to .gitignore
 GITIGNORE="$TARGET_DIR/.gitignore"
 if [ -f "$GITIGNORE" ] && grep -qx '.claude' "$GITIGNORE" 2>/dev/null; then

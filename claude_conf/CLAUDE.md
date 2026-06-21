@@ -144,7 +144,7 @@ Edit `hooks/dep-map.json` to add/remove dependency relationships. Each entry spe
 
 ### Escape Hatch
 
-To skip the dependency update gate: `rm -f /tmp/claude/dep-updates.json /tmp/claude/dep-updates-notified`
+To skip the dependency update gate: `rm -f /tmp/claude/*/dep-updates.json /tmp/claude/*/dep-updates-notified`
 
 ## Agent Communication
 
@@ -192,7 +192,7 @@ Messages are delivered through three channels with automatic fallback:
 
 ### Escape Hatch
 
-To skip the agent messages gate: `rm -f /tmp/claude/agent-messages.json`
+To skip the agent messages gate: `rm -f /tmp/claude/*/agent-messages.json`
 
 ## Documentation Pointers
 

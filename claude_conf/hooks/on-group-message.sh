@@ -5,7 +5,7 @@
 set -euo pipefail
 
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
-STATE_DIR="/tmp/claude"
+. "$HOOK_DIR/state-dir.sh" 2>/dev/null || STATE_DIR="/tmp/claude"
 STATE_FILE="$STATE_DIR/agent-messages.json"
 IDENTITY_FILE="$CLAUDE_PROJECT_DIR/.claude/agent/identity.json"
 CONFIG_FILE="$CLAUDE_PROJECT_DIR/.claude/agent/config.json"

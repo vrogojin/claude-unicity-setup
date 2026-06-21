@@ -11,7 +11,11 @@ Run this when the Stop hook blocks you with "Upstream dependency updates detecte
 ### 1. Read State File
 
 ```bash
-cat /tmp/claude/dep-updates.json
+# Resolve the per-repo state dir (hook state files are namespaced per repo).
+STATE_DIR="$( . "$CLAUDE_PROJECT_DIR/.claude/hooks/state-dir.sh" 2>/dev/null && printf '%s' "$STATE_DIR" )"
+STATE_DIR="${STATE_DIR:-/tmp/claude}"
+
+cat "$STATE_DIR/dep-updates.json"
 ```
 
 Parse the `updates` array. Each entry has: `name`, `method` (npm/git), `current`, `latest`, `source` (GitHub owner/repo).
@@ -81,7 +85,7 @@ deps(<repo>): update <dep-names> to latest
 ### 8. Clear State Files
 
 ```bash
-rm -f /tmp/claude/dep-updates.json /tmp/claude/dep-updates-notified
+rm -f "$STATE_DIR/dep-updates.json" "$STATE_DIR/dep-updates-notified"
 ```
 
 This clears the Stop gate so you can finish your session.
@@ -91,7 +95,8 @@ This clears the Stop gate so you can finish your session.
 If you need to skip the dependency update (e.g., the update is known-incompatible and being handled separately):
 
 ```bash
-rm -f /tmp/claude/dep-updates.json /tmp/claude/dep-updates-notified
+# State files are namespaced per repo under /tmp/claude/<key>/; glob to clear all.
+rm -f /tmp/claude/*/dep-updates.json /tmp/claude/*/dep-updates-notified
 ```
 
 This clears the state files without updating. Document why you skipped in your PR description.

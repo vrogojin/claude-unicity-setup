@@ -14,8 +14,12 @@ Fetch remote changes and merge them into the current working branch. Handles fas
 Run these commands in parallel:
 
 ```bash
+# Resolve the per-repo state dir (hook state files are namespaced per repo).
+STATE_DIR="$( . "$CLAUDE_PROJECT_DIR/.claude/hooks/state-dir.sh" 2>/dev/null && printf '%s' "$STATE_DIR" )"
+STATE_DIR="${STATE_DIR:-/tmp/claude}"
+
 git fetch --all --quiet
-cat /tmp/claude/remote-sync.json 2>/dev/null || echo '{"pending":false}'
+cat "$STATE_DIR/remote-sync.json" 2>/dev/null || echo '{"pending":false}'
 git rev-parse --abbrev-ref HEAD
 git status --short
 git log --oneline -5
@@ -103,8 +107,8 @@ After successful merge/rebase:
 Delete the state file so the Stop hook no longer blocks:
 
 ```bash
-rm -f /tmp/claude/remote-sync.json
-rm -f /tmp/claude/remote-sync-notified
+rm -f "$STATE_DIR/remote-sync.json"
+rm -f "$STATE_DIR/remote-sync-notified"
 ```
 
 ### 7. Report

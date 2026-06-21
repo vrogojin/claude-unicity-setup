@@ -56,7 +56,9 @@ if [ -f "go.mod" ]; then
 fi
 
 # --- Remote sync check ---
-SYNC_STATE="/tmp/claude/remote-sync.json"
+# Source per-repo STATE_DIR helper (namespaces coordination files; see state-dir.sh).
+. "$(cd "$(dirname "$0")" 2>/dev/null && pwd)/state-dir.sh" 2>/dev/null || STATE_DIR="/tmp/claude"
+SYNC_STATE="$STATE_DIR/remote-sync.json"
 if [ -f "$SYNC_STATE" ]; then
   PENDING=$(jq -r '.pending // false' "$SYNC_STATE" 2>/dev/null)
   if [ "$PENDING" = "true" ]; then
@@ -75,7 +77,7 @@ if [ -f "$SYNC_STATE" ]; then
 fi
 
 # --- Upstream dependency update check ---
-DEP_STATE="/tmp/claude/dep-updates.json"
+DEP_STATE="$STATE_DIR/dep-updates.json"
 if [ -f "$DEP_STATE" ]; then
   DEP_PENDING=$(jq -r '.pending // false' "$DEP_STATE" 2>/dev/null)
   if [ "$DEP_PENDING" = "true" ]; then
@@ -91,7 +93,7 @@ if [ -f "$DEP_STATE" ]; then
 fi
 
 # --- Urgent agent messages check ---
-MSG_STATE="/tmp/claude/agent-messages.json"
+MSG_STATE="$STATE_DIR/agent-messages.json"
 if [ -f "$MSG_STATE" ]; then
   PRIORITY_COUNT=$(jq -r '.priority_count // 0' "$MSG_STATE" 2>/dev/null)
   if [ "$PRIORITY_COUNT" -gt 0 ] 2>/dev/null && [ "$PRIORITY_COUNT" != "0" ]; then

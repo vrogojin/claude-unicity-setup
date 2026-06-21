@@ -18,7 +18,7 @@ CONFIG_FILE="$CLAUDE_PROJECT_DIR/.claude/agent/config.json"
 [ -f "$IDENTITY_FILE" ] || exit 0
 [ -f "$CONFIG_FILE" ] || exit 0
 
-STATE_DIR="/tmp/claude"
+. "$(cd "$(dirname "$0")" 2>/dev/null && pwd)/state-dir.sh" 2>/dev/null || STATE_DIR="/tmp/claude"
 STATE_FILE="$STATE_DIR/agent-messages.json"
 COOLDOWN_FILE="$STATE_DIR/agent-comms-last-poll"
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
