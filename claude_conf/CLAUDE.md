@@ -86,6 +86,8 @@ Serena runs **in Docker** (no host Python/toolchain install). The custom `unicit
 
 **Prerequisite (one-time per machine):** Docker, plus the `unicity/serena:latest` image. `setup.sh` offers to build it during deployment; to build manually: `docker build -t unicity/serena:latest -f .claude/docker/Dockerfile.serena .claude/docker`. The image Dockerfile lives at `.claude/docker/Dockerfile.serena`. Serena's Docker mode is upstream-flagged **experimental**; first indexing of a large repo takes a moment, then queries are fast and local (the `serena-cache` volume persists language servers between sessions).
 
+**Server approval:** the `serena` server is pre-enabled via `enabledMcpjsonServers` in `settings.local.json`, so it starts without a per-project approval prompt — but this is only honored in **trusted folders** (approve the workspace when Claude Code first prompts). In an untrusted folder the server stays at "⏸ Pending approval" until you enable it via `/mcp`.
+
 **Read vs. write tools:** Serena's read/navigation tools are pre-approved. Its editing/execute tools (`replace_symbol_body`, `insert_after_symbol`, `create_text_file`, `execute_shell_command`, memory writes, …) are intentionally **not** auto-allowed — they are not covered by the `Edit|Write` branch-guard or the `Bash` pre-commit hook, so route real edits through normal `Edit`/`Write` (on a feature branch) to keep the quality gates in force.
 
 ## Unicity Architecture Overview
