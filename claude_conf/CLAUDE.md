@@ -22,9 +22,43 @@ Configuration for developing across the Unicity Network ecosystem: TypeScript SD
 
 Conventional Commits: `<type>(<scope>): <description>`. Scope is the repository or module name (e.g., `sphere-sdk`, `aggregator`, `bft`, `alpha`).
 
-## CRITICAL: Only use Opus Model for code sub-agents
+## CRITICAL: Model Orchestration — Sonnet 6 Orchestrates
 
-Non-Opus sub-agents produce lower quality output, use Opus. Ensure they have thorough instructions.
+**Sonnet 6 is the orchestrator and default model.** It runs the main loop, plans work, and decides — per task, not per session — whether to handle the work itself or delegate to a more capable model. Route each step as its own decision; do not pin one model to a whole workflow. The best economics come from using the *minimum* model that produces acceptable output for each specific task, not the most powerful one everywhere.
+
+### Model capability & cost order
+
+From most capable / most expensive to least:
+
+- **Fable 5** — Mythos-class, sits *above* Opus. Senior-research-scientist-grade reasoning; the strongest model available. ~2× Opus cost (~$10 / $50 per 1M in/out tokens). Reserve for genuinely hard reasoning.
+- **Opus 4.8** — excellent for coding and strong general reasoning, at ~half Fable's cost (~$5 / $25). The workhorse for real implementation.
+- **Sonnet 6** — fast, cheap daily driver for orchestration and simpler tasks; the default.
+
+### The orchestrator has three moves
+
+1. **Handle it itself (Sonnet 6)** — the default. Orchestration/planning plus everyday, lower-complexity work: exploration, code review of a few files, test writing, routine fixes, simple edits. If a task is clearly in this band, do not delegate — delegation adds latency and coordination cost.
+2. **Delegate to Opus for coding** — implementation, refactoring, and any non-trivial or multi-file code changes. A weaker model on hard code produces lower-quality output that costs more to fix than it saves, so real coding sub-tasks go to Opus.
+3. **Delegate to Fable for heavy reasoning** — tasks that genuinely need maximum reasoning power (see routing table). Fable is the most expensive model, so escalate only when the task clearly warrants frontier-grade reasoning.
+
+### Be smart about routing — assess complexity first
+
+Before spawning a sub-agent, classify the task and pick the model deliberately:
+
+| Task profile | Model | Examples |
+|---|---|---|
+| Hardest reasoning: architecture & cross-repo design, subtle multi-system debugging, security/crypto/consensus analysis, novel first-principles problem solving, planning long branching multi-step work | **Fable 5** | Redesign the predicate system; reason through a Byzantine consensus edge case; audit proof-verification design; plan a cross-repo migration |
+| Real coding: implementation, refactors, non-trivial or multi-file code changes, writing substantial test suites | **Opus 4.8** | Implement a new state-transition flow; refactor the aggregator storage layer; build a REST endpoint with tests |
+| Orchestration itself plus everyday/simple work: exploration, review of 2–5 files, small fixes, boilerplate, quick lookups, first-pass triage | **Sonnet 6** (self) | Rename a symbol; summarize a log; fix a lint error; scope out a task before delegating |
+
+### Rules of thumb
+
+- **Default to Sonnet 6.** Escalate to Opus for actual coding; escalate to Fable only when the task *clearly* needs frontier-grade reasoning.
+- **Match the model to the step, not the project.** A single feature may warrant Fable for the design/architecture step, Opus for implementation, and Sonnet for cleanup.
+- **Never under-provision hard code or security boundaries** — crypto, key management, proof verification, transport encryption, and consensus logic get Opus (implementation) or Fable (design/audit), never Sonnet.
+- **Give every delegated sub-agent thorough, self-contained instructions** — a sub-agent only sees what you pass it.
+- When in doubt about whether a step exceeds Sonnet's band, prefer escalating over shipping weaker output.
+
+*Rationale drawn from 2026 multi-model routing practice: route the bulk of volume to cheaper/faster models and reserve frontier compute for the fraction that genuinely needs it; per-step routing yields 30–50% cost reduction at equal-or-better quality. See [Choosing the right Claude model](https://claude.com/resources/tutorials/choosing-the-right-claude-model), [Claude Fable 5 vs Opus 4.8](https://www.truefoundry.com/blog/claude-fable-5-vs-opus-4-8-benchmarks-pricing-when-to-use-each), and [multi-model routing 2026](https://mindra.co/blog/multi-model-routing-llm-orchestration-2026).*
 
 ## CRITICAL: Explore Before Building
 
