@@ -63,9 +63,28 @@ Before spawning a sub-agent, classify the task and pick the model deliberately:
 ## CRITICAL: Explore Before Building
 
 1. **Read `docs/ecosystem-map.md`** — full inventory of every repo, module, and integration point
-2. **Search existing packages/modules** before creating anything
+2. **Search existing packages/modules** before creating anything — use **Serena** (see below), not blind grep
 3. **Reuse and extend** existing types rather than creating parallel ones
 4. **Check `reference/<repo>.md`** for API surface and patterns of the repo you're working in
+
+## Codebase Search — Prefer Serena Over Grep
+
+This workspace ships the **Serena** MCP server (`.mcp.json` at the project root): a Language-Server-Protocol–backed semantic code toolkit covering every language in the stack (TypeScript/JavaScript, Go via gopls, Rust via rust-analyzer, C/C++ via clangd). It gives symbol-level, IDE-grade navigation instead of slow, token-expensive text scans.
+
+**Default to Serena's semantic tools when locating code.** Reach for `grep`/`rg` only for non-code text (logs, configs, prose) or when a language server isn't available.
+
+| Goal | Use | Instead of |
+|---|---|---|
+| Find a class/function/method/variable by name | `find_symbol` | `grep -r "def foo"` |
+| See everything a file defines | `get_symbols_overview` | reading the whole file |
+| Find all callers/usages of a symbol | `find_referencing_symbols` | `grep -r "foo("` |
+| Jump to a definition / implementations | `find_declaration`, `find_implementations` | manual search |
+| Compiler/type errors for a file or symbol | `get_diagnostics_for_file`, `get_diagnostics_for_symbol` | running a full build |
+| Pattern/text search (last resort) | `search_for_pattern` | `grep` |
+
+**Prerequisite (one-time per machine):** `uv tool install -p 3.13 serena-agent` (needs [`uv`](https://docs.astral.sh/uv/getting-started/installation/)). `setup.sh` warns if the `serena` launcher is missing. First indexing of a large repo takes a moment; queries are fast and fully local afterward.
+
+**Read vs. write tools:** Serena's read/navigation tools are pre-approved. Its editing/execute tools (`replace_symbol_body`, `insert_after_symbol`, `create_text_file`, `execute_shell_command`, memory writes, …) are intentionally **not** auto-allowed — they are not covered by the `Edit|Write` branch-guard or the `Bash` pre-commit hook, so route real edits through normal `Edit`/`Write` (on a feature branch) to keep the quality gates in force.
 
 ## Unicity Architecture Overview
 

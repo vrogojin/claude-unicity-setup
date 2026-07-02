@@ -184,6 +184,49 @@ else
   ok "Added .claude to .gitignore"
 fi
 
+# --- MCP: Serena semantic code search ---
+# Claude Code reads project-scoped MCP servers from <project-root>/.mcp.json,
+# NOT from inside .claude/. The template lives in claude_conf/.mcp.json and is
+# copied here into .claude/ by the recursive copy above; move/merge it to the
+# project root where Claude Code will actually load it.
+MCP_TEMPLATE="$CLAUDE_DIR/.mcp.json"
+MCP_DEST="$TARGET_DIR/.mcp.json"
+if [ -f "$MCP_TEMPLATE" ]; then
+  if [ "$DRY_RUN" = "true" ]; then
+    info "[dry-run] Deploy Serena MCP config → $MCP_DEST"
+  elif [ -f "$MCP_DEST" ]; then
+    # Merge the serena server into an existing project .mcp.json (idempotent).
+    jq --slurpfile add "$MCP_TEMPLATE" \
+      '.mcpServers = ((.mcpServers // {}) + $add[0].mcpServers)' \
+      "$MCP_DEST" > "$MCP_DEST.tmp" && mv "$MCP_DEST.tmp" "$MCP_DEST"
+    ok "Merged Serena MCP server into existing .mcp.json"
+  else
+    cp "$MCP_TEMPLATE" "$MCP_DEST"
+    ok "Deployed Serena MCP config → .mcp.json"
+  fi
+  # Remove the stray copy under .claude/ so there is a single source of truth.
+  run_or_dry rm -f "$MCP_TEMPLATE"
+
+  # Keep the agent-local .mcp.json out of the target repo's history.
+  if [ -f "$GITIGNORE" ] && grep -qx '.mcp.json' "$GITIGNORE" 2>/dev/null; then
+    ok ".mcp.json already in .gitignore"
+  elif [ "$DRY_RUN" = "true" ]; then
+    info "[dry-run] Append '.mcp.json' to $GITIGNORE"
+  else
+    echo '.mcp.json' >> "$GITIGNORE"
+    ok "Added .mcp.json to .gitignore"
+  fi
+
+  # Prerequisite check — Serena needs the `serena` launcher on PATH (uv tool).
+  if ! command -v serena >/dev/null 2>&1; then
+    warn "Serena MCP is configured but the 'serena' command was not found."
+    warn "Install it once with:  uv tool install -p 3.13 serena-agent"
+    warn "(Requires 'uv' — see https://docs.astral.sh/uv/getting-started/installation/)"
+  else
+    ok "Serena launcher found: $(command -v serena)"
+  fi
+fi
+
 # Create agent directory
 run_or_dry mkdir -p "$CLAUDE_DIR/agent"
 ok "Created .claude/agent/"
