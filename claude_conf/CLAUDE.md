@@ -71,6 +71,8 @@ Before spawning a sub-agent, classify the task and pick the model deliberately:
 
 This workspace ships the **Serena** MCP server (`.mcp.json` at the project root): a Language-Server-Protocol–backed semantic code toolkit covering every language in the stack (TypeScript/JavaScript, Go via gopls, Rust via rust-analyzer, C/C++ via clangd). It gives symbol-level, IDE-grade navigation instead of slow, token-expensive text scans.
 
+Serena runs **in Docker** (no host Python/toolchain install). The custom `unicity/serena:latest` image extends the official Serena image with Go+gopls and clangd so all four languages resolve. `.mcp.json` launches it per session with the project bind-mounted at `/workspace` and a `serena-cache` volume so downloaded language servers persist across runs.
+
 **Default to Serena's semantic tools when locating code.** Reach for `grep`/`rg` only for non-code text (logs, configs, prose) or when a language server isn't available.
 
 | Goal | Use | Instead of |
@@ -82,7 +84,7 @@ This workspace ships the **Serena** MCP server (`.mcp.json` at the project root)
 | Compiler/type errors for a file or symbol | `get_diagnostics_for_file`, `get_diagnostics_for_symbol` | running a full build |
 | Pattern/text search (last resort) | `search_for_pattern` | `grep` |
 
-**Prerequisite (one-time per machine):** `uv tool install -p 3.13 serena-agent` (needs [`uv`](https://docs.astral.sh/uv/getting-started/installation/)). `setup.sh` warns if the `serena` launcher is missing. First indexing of a large repo takes a moment; queries are fast and fully local afterward.
+**Prerequisite (one-time per machine):** Docker, plus the `unicity/serena:latest` image. `setup.sh` offers to build it during deployment; to build manually: `docker build -t unicity/serena:latest -f .claude/docker/Dockerfile.serena .claude/docker`. The image Dockerfile lives at `.claude/docker/Dockerfile.serena`. Serena's Docker mode is upstream-flagged **experimental**; first indexing of a large repo takes a moment, then queries are fast and local (the `serena-cache` volume persists language servers between sessions).
 
 **Read vs. write tools:** Serena's read/navigation tools are pre-approved. Its editing/execute tools (`replace_symbol_body`, `insert_after_symbol`, `create_text_file`, `execute_shell_command`, memory writes, …) are intentionally **not** auto-allowed — they are not covered by the `Edit|Write` branch-guard or the `Bash` pre-commit hook, so route real edits through normal `Edit`/`Write` (on a feature branch) to keep the quality gates in force.
 

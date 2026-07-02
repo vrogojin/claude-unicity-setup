@@ -1,11 +1,16 @@
 {
   "mcpServers": {
     "serena": {
-      "command": "serena",
+      "command": "docker",
       "args": [
-        "start-mcp-server",
+        "run", "--rm", "-i",
+        "-e", "SERENA_DOCKER=1",
+        "-v", "__PROJECT_DIR__:/workspace",
+        "-v", "serena-cache:/root/.cache",
+        "unicity/serena:latest",
+        "serena", "start-mcp-server",
         "--context", "claude-code",
-        "--project-from-cwd"
+        "--project", "/workspace"
       ]
     }
   }

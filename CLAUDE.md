@@ -25,7 +25,9 @@ lib/
 └── sphere-daemon.mjs          # Background daemon: listens for Nostr DMs/group messages
 claude_conf/
 ├── CLAUDE.md                  # Main CLAUDE.md for Unicity projects
-├── .mcp.json                  # MCP servers (Serena semantic code search); setup.sh deploys to project root
+├── .mcp.json                  # MCP servers (Serena, Dockerized); setup.sh deploys to project root
+├── docker/
+│   └── Dockerfile.serena      # Custom Serena image (adds Go+gopls, clangd to official image)
 ├── settings.json              # Hooks config (PreToolUse, Stop, PostToolUse), team agents mode
 ├── settings.local.json        # Permissions, sandbox config, MCP servers
 ├── hooks/                     # Shell hooks enforcing workflow
