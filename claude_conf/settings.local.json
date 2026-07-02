@@ -82,6 +82,9 @@
       "mcp__serena__serena_info"
     ]
   },
+  "enabledMcpjsonServers": [
+    "serena"
+  ],
   "sandbox": {
     "enabled": true,
     "autoAllowBashIfSandboxed": true,
