@@ -71,7 +71,7 @@ Before spawning a sub-agent, classify the task and pick the model deliberately:
 
 This workspace ships the **Serena** MCP server (`.mcp.json` at the project root): a Language-Server-Protocol–backed semantic code toolkit covering every language in the stack (TypeScript/JavaScript, Go via gopls, Rust via rust-analyzer, C/C++ via clangd). It gives symbol-level, IDE-grade navigation instead of slow, token-expensive text scans.
 
-Serena runs **in Docker** (no host Python/toolchain install). The custom `unicity/serena:latest` image extends the official Serena image with Go+gopls and clangd so all four languages resolve. `.mcp.json` launches it per session with the project bind-mounted at `/workspace` and a `serena-cache` volume so downloaded language servers persist across runs.
+Serena runs **in Docker** (no host Python/toolchain install). The custom `unicity/serena:<version>` image extends the official Serena image with Go+gopls and clangd so all four languages resolve. `.mcp.json` launches it per session with the project bind-mounted at `/workspace` and a `serena-cache` volume so downloaded language servers persist across runs.
 
 **Default to Serena's semantic tools when locating code.** Reach for `grep`/`rg` only for non-code text (logs, configs, prose) or when a language server isn't available.
 
@@ -84,7 +84,7 @@ Serena runs **in Docker** (no host Python/toolchain install). The custom `unicit
 | Compiler/type errors for a file or symbol | `get_diagnostics_for_file`, `get_diagnostics_for_symbol` | running a full build |
 | Pattern/text search (last resort) | `search_for_pattern` | `grep` |
 
-**Prerequisite (one-time per machine):** Docker, plus the `unicity/serena:latest` image. `setup.sh` offers to build it during deployment; to build manually: `docker build -t unicity/serena:latest -f .claude/docker/Dockerfile.serena .claude/docker`. The image Dockerfile lives at `.claude/docker/Dockerfile.serena`. Serena's Docker mode is upstream-flagged **experimental**; first indexing of a large repo takes a moment, then queries are fast and local (the `serena-cache` volume persists language servers between sessions).
+**Prerequisite: a working Docker install — nothing else.** `setup.sh` **auto-builds** the pinned `unicity/serena:<version>` image the first time you deploy on a machine (skipped on later runs; rebuilt automatically when the version bumps in `setup.sh`). The Dockerfile lives at `.claude/docker/Dockerfile.serena`; to rebuild by hand, use the exact image tag shown in your project's `.mcp.json`: `docker build -t <tag> -f .claude/docker/Dockerfile.serena .claude/docker`. Serena's Docker mode is upstream-flagged **experimental**; first indexing of a large repo takes a moment, then queries are fast and local (the `serena-cache` volume persists language servers between sessions).
 
 **Server approval:** the `serena` server is pre-enabled via `enabledMcpjsonServers` in `settings.local.json`, so it starts without a per-project approval prompt — but this is only honored in **trusted folders** (approve the workspace when Claude Code first prompts). In an untrusted folder the server stays at "⏸ Pending approval" until you enable it via `/mcp`.
 

@@ -192,7 +192,11 @@ fi
 # absolute project path used for the Docker bind mount.
 MCP_TEMPLATE="$CLAUDE_DIR/.mcp.json"
 MCP_DEST="$TARGET_DIR/.mcp.json"
-SERENA_IMAGE="unicity/serena:latest"
+# Bump SERENA_IMAGE_VERSION whenever Dockerfile.serena changes: every machine
+# then transparently rebuilds the image on its next setup run (the tag it looks
+# for no longer exists locally), while unchanged versions are reused as-is.
+SERENA_IMAGE_VERSION="1.0.0"
+SERENA_IMAGE="unicity/serena:${SERENA_IMAGE_VERSION}"
 SERENA_DOCKERFILE="$CLAUDE_DIR/docker/Dockerfile.serena"
 if [ -f "$MCP_TEMPLATE" ]; then
   if [ "$DRY_RUN" = "true" ]; then
@@ -207,9 +211,9 @@ if [ -f "$MCP_TEMPLATE" ]; then
     cp "$MCP_TEMPLATE" "$MCP_DEST"
     ok "Deployed Serena MCP config → .mcp.json"
   fi
-  # Point the Docker bind mount at this project's absolute path.
+  # Fill in the bind-mount path and the pinned image tag.
   if [ "$DRY_RUN" != "true" ]; then
-    sed -i "s|__PROJECT_DIR__|$TARGET_DIR|g" "$MCP_DEST"
+    sed -i "s|__PROJECT_DIR__|$TARGET_DIR|g; s|__SERENA_IMAGE__|$SERENA_IMAGE|g" "$MCP_DEST"
   fi
   # Remove the stray copy under .claude/ so there is a single source of truth
   # (the Dockerfile stays under .claude/docker/ for rebuilds).
@@ -228,26 +232,26 @@ if [ -f "$MCP_TEMPLATE" ]; then
     fi
   done
 
-  # Prerequisite: Docker + the custom Serena image (Go+gopls, clangd added on
-  # top of the official image which already ships Node/TS and rust-analyzer).
+  # Auto-build the pinned Serena image when this version isn't present yet, so
+  # the only developer prerequisite is a working Docker install. Reused as-is on
+  # later runs; re-triggered automatically when SERENA_IMAGE_VERSION bumps. The
+  # image adds Go+gopls and clangd on top of the official image (which already
+  # ships Node/TS and rust-analyzer).
   if ! command -v docker >/dev/null 2>&1; then
-    warn "Serena MCP is configured to run via Docker, but 'docker' was not found."
-    warn "Install Docker, then build the image with:"
-    warn "  docker build -t $SERENA_IMAGE -f .claude/docker/Dockerfile.serena .claude/docker"
+    warn "Serena runs via Docker, but 'docker' was not found on PATH."
+    warn "Install Docker to enable semantic code search — the rest of setup continues."
   elif docker image inspect "$SERENA_IMAGE" >/dev/null 2>&1; then
-    ok "Serena Docker image present: $SERENA_IMAGE"
+    ok "Serena Docker image already built: $SERENA_IMAGE"
   elif [ "$DRY_RUN" = "true" ]; then
     info "[dry-run] docker build -t $SERENA_IMAGE -f $SERENA_DOCKERFILE $(dirname "$SERENA_DOCKERFILE")"
-  elif prompt_yn "  Build the Serena Docker image ($SERENA_IMAGE) now? (first build pulls the base image)"; then
+  else
+    info "Building Serena Docker image $SERENA_IMAGE (one-time per version; first build may take a few minutes)..."
     if docker build -t "$SERENA_IMAGE" -f "$SERENA_DOCKERFILE" "$(dirname "$SERENA_DOCKERFILE")"; then
       ok "Built Serena Docker image: $SERENA_IMAGE"
     else
-      warn "Serena image build failed — build it manually later with:"
+      warn "Serena image build failed — retry later with:"
       warn "  docker build -t $SERENA_IMAGE -f .claude/docker/Dockerfile.serena .claude/docker"
     fi
-  else
-    warn "Skipped Serena image build. Serena search will be unavailable until you run:"
-    warn "  docker build -t $SERENA_IMAGE -f .claude/docker/Dockerfile.serena .claude/docker"
   fi
 fi
 

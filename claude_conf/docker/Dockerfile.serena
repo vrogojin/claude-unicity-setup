@@ -6,8 +6,10 @@
 #   Base already provides:  Node (TypeScript/JavaScript), rust-analyzer (Rust), Python
 #   This image adds:        gopls (Go: aggregator-go, bft-core), clangd (C/C++: alpha)
 #
-# Build:  docker build -t unicity/serena:latest -f Dockerfile.serena .
-# (setup.sh builds this automatically when Docker is available.)
+# setup.sh auto-builds and tags this (unicity/serena:<version>) the first time
+# you deploy on a machine — a working Docker install is the only prerequisite.
+# Manual rebuild (use the tag from your project's .mcp.json):
+#   docker build -t unicity/serena:<version> -f Dockerfile.serena .
 FROM ghcr.io/oraios/serena:latest
 
 USER root
