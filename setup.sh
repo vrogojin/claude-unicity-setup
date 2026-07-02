@@ -184,6 +184,73 @@ else
   ok "Added .claude to .gitignore"
 fi
 
+# --- MCP: Serena semantic code search (Dockerized) ---
+# Claude Code reads project-scoped MCP servers from <project-root>/.mcp.json,
+# NOT from inside .claude/. The template lives in claude_conf/.mcp.json and is
+# copied here into .claude/ by the recursive copy above; move/merge it to the
+# project root where Claude Code will actually load it, and substitute the
+# absolute project path used for the Docker bind mount.
+MCP_TEMPLATE="$CLAUDE_DIR/.mcp.json"
+MCP_DEST="$TARGET_DIR/.mcp.json"
+SERENA_IMAGE="unicity/serena:latest"
+SERENA_DOCKERFILE="$CLAUDE_DIR/docker/Dockerfile.serena"
+if [ -f "$MCP_TEMPLATE" ]; then
+  if [ "$DRY_RUN" = "true" ]; then
+    info "[dry-run] Deploy Serena MCP config → $MCP_DEST (bind mount $TARGET_DIR)"
+  elif [ -f "$MCP_DEST" ]; then
+    # Merge the serena server into an existing project .mcp.json (idempotent).
+    jq --slurpfile add "$MCP_TEMPLATE" \
+      '.mcpServers = ((.mcpServers // {}) + $add[0].mcpServers)' \
+      "$MCP_DEST" > "$MCP_DEST.tmp" && mv "$MCP_DEST.tmp" "$MCP_DEST"
+    ok "Merged Serena MCP server into existing .mcp.json"
+  else
+    cp "$MCP_TEMPLATE" "$MCP_DEST"
+    ok "Deployed Serena MCP config → .mcp.json"
+  fi
+  # Point the Docker bind mount at this project's absolute path.
+  if [ "$DRY_RUN" != "true" ]; then
+    sed -i "s|__PROJECT_DIR__|$TARGET_DIR|g" "$MCP_DEST"
+  fi
+  # Remove the stray copy under .claude/ so there is a single source of truth
+  # (the Dockerfile stays under .claude/docker/ for rebuilds).
+  run_or_dry rm -f "$MCP_TEMPLATE"
+
+  # Keep agent-local files out of the target repo's history: the .mcp.json
+  # itself and Serena's per-project cache (.serena/, written by the container).
+  for ignore in '.mcp.json' '.serena/'; do
+    if [ -f "$GITIGNORE" ] && grep -qx "$ignore" "$GITIGNORE" 2>/dev/null; then
+      ok "$ignore already in .gitignore"
+    elif [ "$DRY_RUN" = "true" ]; then
+      info "[dry-run] Append '$ignore' to $GITIGNORE"
+    else
+      echo "$ignore" >> "$GITIGNORE"
+      ok "Added $ignore to .gitignore"
+    fi
+  done
+
+  # Prerequisite: Docker + the custom Serena image (Go+gopls, clangd added on
+  # top of the official image which already ships Node/TS and rust-analyzer).
+  if ! command -v docker >/dev/null 2>&1; then
+    warn "Serena MCP is configured to run via Docker, but 'docker' was not found."
+    warn "Install Docker, then build the image with:"
+    warn "  docker build -t $SERENA_IMAGE -f .claude/docker/Dockerfile.serena .claude/docker"
+  elif docker image inspect "$SERENA_IMAGE" >/dev/null 2>&1; then
+    ok "Serena Docker image present: $SERENA_IMAGE"
+  elif [ "$DRY_RUN" = "true" ]; then
+    info "[dry-run] docker build -t $SERENA_IMAGE -f $SERENA_DOCKERFILE $(dirname "$SERENA_DOCKERFILE")"
+  elif prompt_yn "  Build the Serena Docker image ($SERENA_IMAGE) now? (first build pulls the base image)"; then
+    if docker build -t "$SERENA_IMAGE" -f "$SERENA_DOCKERFILE" "$(dirname "$SERENA_DOCKERFILE")"; then
+      ok "Built Serena Docker image: $SERENA_IMAGE"
+    else
+      warn "Serena image build failed — build it manually later with:"
+      warn "  docker build -t $SERENA_IMAGE -f .claude/docker/Dockerfile.serena .claude/docker"
+    fi
+  else
+    warn "Skipped Serena image build. Serena search will be unavailable until you run:"
+    warn "  docker build -t $SERENA_IMAGE -f .claude/docker/Dockerfile.serena .claude/docker"
+  fi
+fi
+
 # Create agent directory
 run_or_dry mkdir -p "$CLAUDE_DIR/agent"
 ok "Created .claude/agent/"

@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1
+#
+# Unicity Serena image — extends the official Serena MCP image with the Go and
+# C/C++ language servers so semantic code search covers the FULL Unicity stack.
+#
+#   Base already provides:  Node (TypeScript/JavaScript), rust-analyzer (Rust), Python
+#   This image adds:        gopls (Go: aggregator-go, bft-core), clangd (C/C++: alpha)
+#
+# Build:  docker build -t unicity/serena:latest -f Dockerfile.serena .
+# (setup.sh builds this automatically when Docker is available.)
+FROM ghcr.io/oraios/serena:latest
+
+USER root
+SHELL ["/bin/bash", "-c"]
+
+# --- C/C++ language server (alpha) ---
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends clangd \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- Go toolchain + gopls (aggregator-go, bft-core) ---
+# TARGETARCH is populated by BuildKit (amd64 / arm64), matching Go's release naming.
+ARG TARGETARCH=amd64
+ARG GO_VERSION=1.22.5
+RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${TARGETARCH}.tar.gz" -o /tmp/go.tgz \
+    && tar -C /usr/local -xzf /tmp/go.tgz \
+    && rm /tmp/go.tgz
+ENV GOPATH=/root/go
+ENV PATH="/usr/local/go/bin:/root/go/bin:${PATH}"
+RUN go install golang.org/x/tools/gopls@latest
+
+# The base image's ENTRYPOINT is inherited: it activates the venv and runs the
+# `serena start-mcp-server ...` command passed as arguments by the MCP client.
