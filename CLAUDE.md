@@ -6,6 +6,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is the Claude Code configuration repository for the **Unicity Network** ecosystem — a multi-language, multi-repository development environment covering TypeScript SDKs, Go infrastructure, Rust tooling, and C++ consensus layer. The `claude_conf/` directory contains the full `.claude/` configuration that gets deployed to any Unicity workspace.
 
+## Model Orchestration
+
+**Sonnet 6 orchestrates and is the default model.** Decide per task — not per session — whether to handle it yourself or delegate. Model capability/cost order (most capable/expensive first): **Fable 5** (Mythos-class, above Opus; frontier reasoning; ~2× Opus cost) > **Opus 4.8** (excellent for coding) > **Sonnet 6** (fast, cheap default).
+
+- **Handle it yourself (Sonnet 6)** — orchestration/planning plus everyday, low-complexity work: exploration, small fixes, review of a few files, quick lookups.
+- **Delegate coding to Opus** — implementation, refactors, non-trivial or multi-file code changes.
+- **Delegate heavy reasoning to Fable** — hardest reasoning only: architecture, subtle multi-system debugging, security/crypto/consensus analysis, novel problem solving. It's the most expensive model, so escalate only when the task clearly warrants it.
+
+Route per step (a feature may use Fable to design, Opus to implement, Sonnet to clean up), default to Sonnet 6, and never under-provision hard code or security boundaries. See `claude_conf/CLAUDE.md` → "Model Orchestration" for the full policy applied in deployed workspaces.
+
 ## Repository Structure
 
 ```
