@@ -79,7 +79,8 @@
       "mcp__serena__list_queryable_projects",
       "mcp__serena__query_project",
       "mcp__serena__initial_instructions",
-      "mcp__serena__serena_info"
+      "mcp__serena__serena_info",
+      "mcp__serena__activate_project"
     ]
   },
   "enabledMcpjsonServers": [
