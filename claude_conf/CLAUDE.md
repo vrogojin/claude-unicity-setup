@@ -75,6 +75,8 @@ Serena runs **in Docker** (no host Python/toolchain install). The custom `unicit
 
 **Default to Serena's semantic tools when locating code.** Reach for `grep`/`rg` only for non-code text (logs, configs, prose) or when a language server isn't available.
 
+**This is enforced, not just recommended.** A `PreToolUse` hook (`hooks/prefer-serena.sh`) intercepts the native **Grep** tool: a code search is **blocked** with a redirect to the right Serena tool. Grep passes through only when it targets non-code — either a non-code glob (`glob:"*.md"`, `glob:"*.json"`), a non-code `type`, or a non-code path (`docs/`, `*.log`, `package.json`, …). So when you need to find code, go straight to Serena; use `search_for_pattern` for regex/string searches *inside* code rather than a broad Grep. Escape hatches: give Grep a non-code glob, or export `CLAUDE_PREFER_SERENA=0`; the hook also auto-disables when Docker (hence Serena) is unavailable.
+
 | Goal | Use | Instead of |
 |---|---|---|
 | Find a class/function/method/variable by name | `find_symbol` | `grep -r "def foo"` |

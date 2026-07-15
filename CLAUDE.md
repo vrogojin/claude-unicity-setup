@@ -32,6 +32,7 @@ claude_conf/
 ├── settings.local.json        # Permissions, sandbox config, MCP servers
 ├── hooks/                     # Shell hooks enforcing workflow
 │   ├── branch-guard.sh        # Blocks Edit/Write on main/master
+│   ├── prefer-serena.sh       # Blocks native Grep on code; redirects to Serena semantic tools
 │   ├── pre-commit-check.sh    # Auto-detect: blocks git commit if lint/format fail
 │   ├── check-diagnostics.sh   # Auto-detect: blocks stop if build errors, remote updates, dep updates, or urgent messages pending
 │   ├── steelman-plan.sh       # Forces adversarial self-critique before ExitPlanMode
@@ -64,6 +65,7 @@ claude_conf/
 The hooks auto-detect project type and enforce quality gates:
 
 - **Edit/Write on main** → blocked; must create a feature branch first
+- **Grep (native tool) on code** → blocked; redirected to Serena's semantic tools (`find_symbol`, `find_referencing_symbols`, `search_for_pattern`, …). Grep passes through only for non-code text — a non-code glob (`*.md`, `*.json`), a non-code `type`, or a non-code path (`docs/`, `*.log`, `package.json`). Auto-disabled when Docker/Serena is unavailable; bypass with `CLAUDE_PREFER_SERENA=0`
 - **git commit** → auto-detects language:
   - Rust: blocks if `cargo fmt --all --check` or `cargo clippy` fail
   - TypeScript: blocks if `npm run lint` or `npm run typecheck` fail
