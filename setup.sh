@@ -10,6 +10,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONF_DIR="$SCRIPT_DIR/claude_conf"
 DRY_RUN=false
+SERENA_ONLY=false
 
 # --- Helpers ---
 
@@ -106,20 +107,153 @@ run_sphere_helper() {
   NODE_PATH="$SCRIPT_DIR/node_modules:${NODE_PATH:-}" node "$helper" "$@"
 }
 
+# --- Serena MCP deployment (Dockerized semantic code search) ---
+# Deploys/merges the project-root .mcp.json for Serena and relocates all of
+# Serena's writable data OFF the read-only workspace mount. Used by both the
+# normal setup flow and `--serena-only`. Relies on globals: TARGET_DIR,
+# CLAUDE_DIR, GITIGNORE, DRY_RUN.
+deploy_serena_mcp() {
+  # Claude Code reads project-scoped MCP servers from <project-root>/.mcp.json,
+  # NOT from inside .claude/. The template lives in claude_conf/.mcp.json and is
+  # copied into .claude/ by the recursive copy in Phase 1 (or directly by
+  # --serena-only); move/merge it to the project root where Claude Code actually
+  # loads it, and substitute the paths + pinned image tag.
+  local MCP_TEMPLATE="$CLAUDE_DIR/.mcp.json"
+  local MCP_DEST="$TARGET_DIR/.mcp.json"
+  # Bump SERENA_IMAGE_VERSION whenever Dockerfile.serena changes: every machine
+  # then transparently rebuilds the image on its next setup run (the tag it looks
+  # for no longer exists locally), while unchanged versions are reused as-is.
+  local SERENA_IMAGE_VERSION="1.0.0"
+  local SERENA_IMAGE="unicity/serena:${SERENA_IMAGE_VERSION}"
+  local SERENA_DOCKERFILE="$CLAUDE_DIR/docker/Dockerfile.serena"
+
+  # Workspace ROOT that Serena is allowed to see: a BROAD, READ-ONLY, identity
+  # mount (host path == container path). Identity-mounting the root is what makes
+  # git worktrees self-consistent inside the container — both a worktree's files
+  # AND its gitdir under <repo>/.git/worktrees/<name> resolve at their true paths
+  # — so Serena's activate_project can open ANY branch/worktree/repo/folder under
+  # the root. Defaults to the target repo's parent dir; override with
+  # SERENA_WORKSPACE_ROOT (e.g. a shared multi-repo parent).
+  local WORKSPACE_ROOT="${SERENA_WORKSPACE_ROOT:-$(dirname "$TARGET_DIR")}"
+  WORKSPACE_ROOT="$(cd "$WORKSPACE_ROOT" 2>/dev/null && pwd)" || WORKSPACE_ROOT="$(dirname "$TARGET_DIR")"
+
+  if [ -f "$MCP_TEMPLATE" ] || [ "$DRY_RUN" = "true" ]; then
+    if [ "$DRY_RUN" = "true" ]; then
+      info "[dry-run] Deploy Serena MCP config -> $MCP_DEST (read-only mount $WORKSPACE_ROOT, project $TARGET_DIR)"
+    elif [ -f "$MCP_DEST" ]; then
+      # Merge the serena server into an existing project .mcp.json (idempotent).
+      jq --slurpfile add "$MCP_TEMPLATE" \
+        '.mcpServers = ((.mcpServers // {}) + $add[0].mcpServers)' \
+        "$MCP_DEST" > "$MCP_DEST.tmp" && mv "$MCP_DEST.tmp" "$MCP_DEST"
+      ok "Merged Serena MCP server into existing .mcp.json"
+    else
+      cp "$MCP_TEMPLATE" "$MCP_DEST"
+      ok "Deployed Serena MCP config -> .mcp.json"
+    fi
+    # Fill in the read-only workspace-root mount, the real project path, and the
+    # pinned image tag.
+    if [ "$DRY_RUN" != "true" ]; then
+      sed -i "s|__WORKSPACE_ROOT__|$WORKSPACE_ROOT|g; s|__PROJECT_DIR__|$TARGET_DIR|g; s|__SERENA_IMAGE__|$SERENA_IMAGE|g" "$MCP_DEST"
+    fi
+    # Remove the stray copy under .claude/ so there is a single source of truth
+    # (the Dockerfile stays under .claude/docker/ for rebuilds).
+    run_or_dry rm -f "$MCP_TEMPLATE"
+
+    # Keep agent-local files out of the target repo's history: the .mcp.json
+    # itself and Serena's per-project cache (.serena/, written by the container).
+    local ignore
+    for ignore in '.mcp.json' '.serena/'; do
+      if [ -f "$GITIGNORE" ] && grep -qx "$ignore" "$GITIGNORE" 2>/dev/null; then
+        ok "$ignore already in .gitignore"
+      elif [ "$DRY_RUN" = "true" ]; then
+        info "[dry-run] Append '$ignore' to $GITIGNORE"
+      else
+        echo "$ignore" >> "$GITIGNORE"
+        ok "Added $ignore to .gitignore"
+      fi
+    done
+
+    # Auto-build the pinned Serena image when this version isn't present yet, so
+    # the only developer prerequisite is a working Docker install. Reused as-is on
+    # later runs; re-triggered automatically when SERENA_IMAGE_VERSION bumps. The
+    # image adds Go+gopls and clangd on top of the official image (which already
+    # ships Node/TS and rust-analyzer).
+    if ! command -v docker >/dev/null 2>&1; then
+      warn "Serena runs via Docker, but 'docker' was not found on PATH."
+      warn "Install Docker to enable semantic code search — the rest of setup continues."
+    elif docker image inspect "$SERENA_IMAGE" >/dev/null 2>&1; then
+      ok "Serena Docker image already built: $SERENA_IMAGE"
+    elif [ "$DRY_RUN" = "true" ]; then
+      info "[dry-run] docker build -t $SERENA_IMAGE -f $SERENA_DOCKERFILE $(dirname "$SERENA_DOCKERFILE")"
+    else
+      info "Building Serena Docker image $SERENA_IMAGE (one-time per version; first build may take a few minutes)..."
+      if docker build -t "$SERENA_IMAGE" -f "$SERENA_DOCKERFILE" "$(dirname "$SERENA_DOCKERFILE")"; then
+        ok "Built Serena Docker image: $SERENA_IMAGE"
+      else
+        warn "Serena image build failed — retry later with:"
+        warn "  docker build -t $SERENA_IMAGE -f .claude/docker/Dockerfile.serena .claude/docker"
+      fi
+    fi
+
+    # Relocate Serena's per-project data OFF the read-only workspace mount.
+    # Serena writes each project's .serena/ (project.yml, symbol cache, memories)
+    # INSIDE the project by default, which fails under the :ro bind mount. The
+    # ONLY supported relocation is the global-config key
+    # `project_serena_folder_location` (there is no CLI flag or env var override
+    # for it), so we (a) pin SERENA_HOME onto the writable `serena-data` volume in
+    # .mcp.json (-e SERENA_HOME=/serena-data) and (b) seed that volume's
+    # serena_config.yml to mirror project data under
+    # /serena-data/projects$projectDir/.serena — a full-path mirror, so it is
+    # collision-free across repos/worktrees that share a basename. Idempotent and
+    # host-global (the named volume is shared by every repo on this machine).
+    # VERIFY: verifier should confirm end-to-end that activate_project +
+    # find_symbol work over a worktree with the :ro mount + this seed (proven in
+    # isolation via `serena project index`; confirm through the live MCP path).
+    if command -v docker >/dev/null 2>&1 && docker image inspect "$SERENA_IMAGE" >/dev/null 2>&1; then
+      if [ "$DRY_RUN" = "true" ]; then
+        info "[dry-run] Seed serena-data volume: project_serena_folder_location -> /serena-data/projects\$projectDir/.serena"
+      elif docker run --rm -i -e SERENA_HOME=/serena-data -v serena-data:/serena-data "$SERENA_IMAGE" python - <<'PYSEED' >/dev/null 2>&1
+import os
+from serena.config.serena_config import SerenaConfig
+p = SerenaConfig._determine_config_file_path()
+if not os.path.exists(p):
+    SerenaConfig._generate_config_file(p)
+s = open(p).read()
+old = 'project_serena_folder_location: "$projectDir/.serena"'
+new = 'project_serena_folder_location: "/serena-data/projects$projectDir/.serena"'
+if old in s and new not in s:
+    open(p, "w").write(s.replace(old, new))
+PYSEED
+      then
+        ok "Relocated Serena project data off the read-only mount (serena-data volume)"
+      else
+        warn "Could not seed the serena-data volume; a read-only project may fail"
+        warn "until project_serena_folder_location is set in /serena-data/serena_config.yml."
+      fi
+    fi
+  fi
+}
+
 # --- Parse arguments ---
 
 TARGET_DIR=""
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
+    --serena-only) SERENA_ONLY=true ;;
     --help|-h)
-      echo "Usage: $0 <target-project-dir> [--dry-run]"
+      echo "Usage: $0 <target-project-dir> [--dry-run] [--serena-only]"
       echo ""
       echo "Deploys Unicity Claude Code configuration to a target project."
       echo ""
       echo "Options:"
-      echo "  --dry-run   Print actions without executing"
-      echo "  --help      Show this help"
+      echo "  --dry-run      Print actions without executing"
+      echo "  --serena-only  Re-apply ONLY the Serena MCP config (.mcp.json +"
+      echo "                 substitution + gitignore + image/volume setup) and"
+      echo "                 exit; skips identity/owner/network/notify/deps/config."
+      echo "                 Idempotent; safe to re-run without clobbering an"
+      echo "                 existing agent identity."
+      echo "  --help         Show this help"
       exit 0
       ;;
     *) TARGET_DIR="$arg" ;;
@@ -127,7 +261,7 @@ for arg in "$@"; do
 done
 
 if [ -z "$TARGET_DIR" ]; then
-  die "Usage: $0 <target-project-dir> [--dry-run]"
+  die "Usage: $0 <target-project-dir> [--dry-run] [--serena-only]"
 fi
 
 # Resolve to absolute path
@@ -141,6 +275,38 @@ echo ""
 info "Target project: $TARGET_DIR"
 [ "$DRY_RUN" = "true" ] && warn "DRY RUN mode — no changes will be made"
 echo ""
+
+# ============================================================
+# --serena-only: re-apply just the Serena MCP config, then exit.
+# Self-contained — does not depend on any of the skipped phases.
+# ============================================================
+if [ "$SERENA_ONLY" = "true" ]; then
+  info "Serena-only mode: deploying just the Serena MCP configuration..."
+  if [ ! -d "$TARGET_DIR/.git" ]; then
+    die "Target directory is not a git repository: $TARGET_DIR"
+  fi
+  CLAUDE_DIR="$TARGET_DIR/.claude"
+  GITIGNORE="$TARGET_DIR/.gitignore"
+  # Bring just the .mcp.json template + the Serena Dockerfile into place, without
+  # touching any existing agent identity/config already under .claude/.
+  run_or_dry mkdir -p "$CLAUDE_DIR/docker"
+  run_or_dry cp "$CONF_DIR/.mcp.json" "$CLAUDE_DIR/.mcp.json"
+  if [ -f "$CONF_DIR/docker/Dockerfile.serena" ]; then
+    run_or_dry cp "$CONF_DIR/docker/Dockerfile.serena" "$CLAUDE_DIR/docker/Dockerfile.serena"
+  fi
+  # Keep .claude out of the target repo's history (parity with the full flow).
+  if [ -f "$GITIGNORE" ] && grep -qx '.claude' "$GITIGNORE" 2>/dev/null; then
+    ok ".claude already in .gitignore"
+  elif [ "$DRY_RUN" = "true" ]; then
+    info "[dry-run] Append '.claude' to $GITIGNORE"
+  else
+    echo '.claude' >> "$GITIGNORE"
+    ok "Added .claude to .gitignore"
+  fi
+  deploy_serena_mcp
+  ok "Serena-only deployment complete."
+  exit 0
+fi
 
 # ============================================================
 # Phase 1: File deployment
@@ -185,75 +351,10 @@ else
 fi
 
 # --- MCP: Serena semantic code search (Dockerized) ---
-# Claude Code reads project-scoped MCP servers from <project-root>/.mcp.json,
-# NOT from inside .claude/. The template lives in claude_conf/.mcp.json and is
-# copied here into .claude/ by the recursive copy above; move/merge it to the
-# project root where Claude Code will actually load it, and substitute the
-# absolute project path used for the Docker bind mount.
-MCP_TEMPLATE="$CLAUDE_DIR/.mcp.json"
-MCP_DEST="$TARGET_DIR/.mcp.json"
-# Bump SERENA_IMAGE_VERSION whenever Dockerfile.serena changes: every machine
-# then transparently rebuilds the image on its next setup run (the tag it looks
-# for no longer exists locally), while unchanged versions are reused as-is.
-SERENA_IMAGE_VERSION="1.0.0"
-SERENA_IMAGE="unicity/serena:${SERENA_IMAGE_VERSION}"
-SERENA_DOCKERFILE="$CLAUDE_DIR/docker/Dockerfile.serena"
-if [ -f "$MCP_TEMPLATE" ]; then
-  if [ "$DRY_RUN" = "true" ]; then
-    info "[dry-run] Deploy Serena MCP config → $MCP_DEST (bind mount $TARGET_DIR)"
-  elif [ -f "$MCP_DEST" ]; then
-    # Merge the serena server into an existing project .mcp.json (idempotent).
-    jq --slurpfile add "$MCP_TEMPLATE" \
-      '.mcpServers = ((.mcpServers // {}) + $add[0].mcpServers)' \
-      "$MCP_DEST" > "$MCP_DEST.tmp" && mv "$MCP_DEST.tmp" "$MCP_DEST"
-    ok "Merged Serena MCP server into existing .mcp.json"
-  else
-    cp "$MCP_TEMPLATE" "$MCP_DEST"
-    ok "Deployed Serena MCP config → .mcp.json"
-  fi
-  # Fill in the bind-mount path and the pinned image tag.
-  if [ "$DRY_RUN" != "true" ]; then
-    sed -i "s|__PROJECT_DIR__|$TARGET_DIR|g; s|__SERENA_IMAGE__|$SERENA_IMAGE|g" "$MCP_DEST"
-  fi
-  # Remove the stray copy under .claude/ so there is a single source of truth
-  # (the Dockerfile stays under .claude/docker/ for rebuilds).
-  run_or_dry rm -f "$MCP_TEMPLATE"
-
-  # Keep agent-local files out of the target repo's history: the .mcp.json
-  # itself and Serena's per-project cache (.serena/, written by the container).
-  for ignore in '.mcp.json' '.serena/'; do
-    if [ -f "$GITIGNORE" ] && grep -qx "$ignore" "$GITIGNORE" 2>/dev/null; then
-      ok "$ignore already in .gitignore"
-    elif [ "$DRY_RUN" = "true" ]; then
-      info "[dry-run] Append '$ignore' to $GITIGNORE"
-    else
-      echo "$ignore" >> "$GITIGNORE"
-      ok "Added $ignore to .gitignore"
-    fi
-  done
-
-  # Auto-build the pinned Serena image when this version isn't present yet, so
-  # the only developer prerequisite is a working Docker install. Reused as-is on
-  # later runs; re-triggered automatically when SERENA_IMAGE_VERSION bumps. The
-  # image adds Go+gopls and clangd on top of the official image (which already
-  # ships Node/TS and rust-analyzer).
-  if ! command -v docker >/dev/null 2>&1; then
-    warn "Serena runs via Docker, but 'docker' was not found on PATH."
-    warn "Install Docker to enable semantic code search — the rest of setup continues."
-  elif docker image inspect "$SERENA_IMAGE" >/dev/null 2>&1; then
-    ok "Serena Docker image already built: $SERENA_IMAGE"
-  elif [ "$DRY_RUN" = "true" ]; then
-    info "[dry-run] docker build -t $SERENA_IMAGE -f $SERENA_DOCKERFILE $(dirname "$SERENA_DOCKERFILE")"
-  else
-    info "Building Serena Docker image $SERENA_IMAGE (one-time per version; first build may take a few minutes)..."
-    if docker build -t "$SERENA_IMAGE" -f "$SERENA_DOCKERFILE" "$(dirname "$SERENA_DOCKERFILE")"; then
-      ok "Built Serena Docker image: $SERENA_IMAGE"
-    else
-      warn "Serena image build failed — retry later with:"
-      warn "  docker build -t $SERENA_IMAGE -f .claude/docker/Dockerfile.serena .claude/docker"
-    fi
-  fi
-fi
+# Broad, read-only, identity-mounted workspace root so Serena sees every
+# branch/worktree/repo/folder under it; project data is relocated onto a
+# writable volume (see deploy_serena_mcp).
+deploy_serena_mcp
 
 # Create agent directory
 run_or_dry mkdir -p "$CLAUDE_DIR/agent"

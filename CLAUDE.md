@@ -20,12 +20,14 @@ Route per step (a feature may use Fable to design, Opus to implement, Sonnet to 
 
 ```
 setup.sh                       # Interactive setup: deploy config, create identity, join group
+#                                (use `--serena-only <repo>` to re-apply just the Serena MCP config)
 lib/
 ├── sphere-helper.mjs          # Node.js CLI helper wrapping sphere-sdk for agent ops
 └── sphere-daemon.mjs          # Background daemon: listens for Nostr DMs/group messages
 claude_conf/
 ├── CLAUDE.md                  # Main CLAUDE.md for Unicity projects
-├── .mcp.json                  # MCP servers (Serena, Dockerized); setup.sh deploys to project root
+├── .mcp.json                  # MCP servers (Serena, Dockerized): broad READ-ONLY identity mount of the
+#                                workspace root → Serena sees every branch/worktree/repo; setup.sh deploys to project root
 ├── docker/
 │   └── Dockerfile.serena      # Custom Serena image (adds Go+gopls, clangd to official image)
 ├── settings.json              # Hooks config (PreToolUse, Stop, PostToolUse), team agents mode
