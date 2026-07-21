@@ -536,6 +536,34 @@ else
 fi
 
 # ============================================================
+# Phase 5b: Semantic firewall (semanticd / SIF)
+# ============================================================
+echo ""
+info "Phase 5b: Semantic firewall (semanticd)..."
+echo "  The agent bus FAILS CLOSED: with no reachable semanticd, inbound peer"
+echo "  messages are HELD (never silently allowed). A LOCAL sidecar is the primary"
+echo "  hot path (red-team F13); the remote sif.* is failover."
+echo "  Local sidecar quickstart:  docker run -p 8080:8080 semanticd/semanticd:latest"
+
+SIF_SIDECAR_URL=$(prompt_input "Local semanticd sidecar URL (primary)" "http://localhost:8080")
+SIF_FAILOVER_URL=$(prompt_input "Remote SIF failover URL (empty to disable failover)" "https://sif.staging.unicity.network")
+SIF_API_KEY=$(prompt_input "SIF API key (from the dashboard; empty to set later)" "")
+
+# The API key is a SECRET — never write it into config.json/daemon.json. Store it
+# in a gitignored env file under .claude/ that the operator sources before
+# starting the daemon (daemon.json references it by env var name only).
+SIF_ENV_FILE="$CLAUDE_DIR/agent/.env.sif"
+if [ "$DRY_RUN" != "true" ]; then
+  if [ -n "$SIF_API_KEY" ]; then
+    printf 'export SIF_API_KEY=%q\n' "$SIF_API_KEY" > "$SIF_ENV_FILE"
+    chmod 600 "$SIF_ENV_FILE"
+    ok "Wrote SIF_API_KEY to .claude/agent/.env.sif (chmod 600, gitignored). Source it before 'sphere-daemon start'."
+  else
+    warn "No SIF API key set — inbound messages will be HELD until semanticd is reachable + keyed."
+  fi
+fi
+
+# ============================================================
 # Phase 6: Dependency tracking
 # ============================================================
 echo ""
@@ -669,6 +697,42 @@ else
 fi
 ok "Wrote agent/config.json"
 
+# --- agent/contacts.json (authorization firewall — seed with owner only) ---
+CONTACTS_FILE="$CLAUDE_DIR/agent/contacts.json"
+if [ "$DRY_RUN" = "true" ]; then
+  info "[dry-run] Write $CONTACTS_FILE (owner-only seed)"
+else
+  if [ -f "$CONTACTS_FILE" ]; then
+    ok "contacts.json already exists — leaving the trust store intact"
+  else
+    if [ -n "$OWNER_NPUB" ]; then
+      jq -n --arg owner "$OWNER_NPUB" --arg tag "$OWNER_NAMETAG" \
+        '{ version: 1,
+           contacts: { ($owner): { tier: "owner", nametag: $tag, label: "owner",
+                                   added_by: "setup", added_at: (now | todate),
+                                   last_seen_seq: 0, notes: "" } },
+           pending: {}, blocked: [],
+           rate_limits: { per_contact_per_min: 10, pending_hold_max: 20,
+                          global_per_min: 60, near_dup_window_ms: 600000 } }' \
+        > "$CONTACTS_FILE"
+    else
+      jq -n '{ version: 1, contacts: {}, pending: {}, blocked: [],
+               rate_limits: { per_contact_per_min: 10, pending_hold_max: 20,
+                              global_per_min: 60, near_dup_window_ms: 600000 } }' \
+        > "$CONTACTS_FILE"
+    fi
+    chmod 600 "$CONTACTS_FILE"
+    ok "Wrote agent/contacts.json (owner-seeded, chmod 600)"
+  fi
+fi
+
+# Regenerate the (previously dead — BUG-4) dm_contacts list from the trust store,
+# so daemon.json.subscriptions.dm_contacts reflects real authorized contacts.
+DM_CONTACTS_JSON='[]'
+if [ "$DRY_RUN" != "true" ] && [ -f "$CONTACTS_FILE" ]; then
+  DM_CONTACTS_JSON=$(jq -c '([.contacts | to_entries[] | select(.value.tier=="owner" or .value.tier=="team") | .key])' "$CONTACTS_FILE" 2>/dev/null || echo '[]')
+fi
+
 # --- agent/daemon.json ---
 DAEMON_FILE="$CLAUDE_DIR/agent/daemon.json"
 if [ "$DRY_RUN" = "true" ]; then
@@ -678,16 +742,30 @@ else
     --arg relay "$RELAY_URL" \
     --arg group_id "$GROUP_ID" \
     --arg group_name "$GROUP_NAME" \
-    --arg owner_npub "$OWNER_NPUB" \
+    --argjson dm_contacts "$DM_CONTACTS_JSON" \
+    --arg sif_sidecar "${SIF_SIDECAR_URL:-http://localhost:8080}" \
+    --arg sif_failover "${SIF_FAILOVER_URL:-}" \
     '{
       relays: [$relay],
+      realtime: false,
       subscriptions: {
         groups: [{id: $group_id, name: $group_name}],
-        dm_contacts: [$owner_npub]
+        dm_contacts: $dm_contacts
+      },
+      semantic_firewall: {
+        url: $sif_sidecar,
+        failover_url: $sif_failover,
+        api_key_env: "SIF_API_KEY",
+        policy_inbound: "low-latency-cascade",
+        policy_responder: "mission-critical",
+        policy_outbound: "low-latency-cascade",
+        timeout_ms: 3000,
+        fail_mode: "closed"
       },
       hooks: {
         on_dm: ".claude/hooks/on-dm.sh",
-        on_group_message: ".claude/hooks/on-group-message.sh"
+        on_group_message: ".claude/hooks/on-group-message.sh",
+        on_notice: ".claude/hooks/on-notice.sh"
       }
     }' > "$DAEMON_FILE"
 fi
