@@ -64,42 +64,39 @@ POLL_RESULT=$(node "$HELPER" check-messages \
   --config "$CONFIG_FILE" \
   --since "$SINCE" 2>/dev/null || echo '{"messages":[]}')
 
-NEW_COUNT=$(echo "$POLL_RESULT" | jq '.messages | length' 2>/dev/null || echo 0)
+# The helper output is ALREADY firewalled (only owner/team surfaced messages
+# appear in .messages; unknown senders / blocked / SIF-held never do). We do NOT
+# merge raw here — we dispatch each record through the SAME hooks the daemon uses,
+# so the F15 tier re-derivation + wrapped-only write happen in exactly one place.
+NEW_COUNT=$(echo "$POLL_RESULT" | jq '(.messages // []) | length' 2>/dev/null || echo 0)
+PENDING_COUNT=$(echo "$POLL_RESULT" | jq '(.pending // []) | length' 2>/dev/null || echo 0)
+HELD_COUNT=$(echo "$POLL_RESULT" | jq '(.held // []) | length' 2>/dev/null || echo 0)
 
-# Exit if no new messages
-if [ "$NEW_COUNT" -eq 0 ] 2>/dev/null; then
+if [ "$NEW_COUNT" -eq 0 ] 2>/dev/null && [ "$PENDING_COUNT" -eq 0 ] 2>/dev/null && [ "$HELD_COUNT" -eq 0 ] 2>/dev/null; then
   exit 0
 fi
 
-# --- Merge into state file ---
-if [ -f "$STATE_FILE" ]; then
-  CURRENT=$(cat "$STATE_FILE")
-else
-  CURRENT='{"unread": false, "unread_count": 0, "priority_count": 0, "messages": []}'
-fi
+dispatch() { # $1 = hook script, stdin = record JSON
+  local hook="$HOOK_DIR/$1"
+  [ -x "$hook" ] || return 0
+  CLAUDE_PROJECT_DIR="$CLAUDE_PROJECT_DIR" bash "$hook" || true
+}
 
-# Merge: append new messages, update counts
-MERGED=$(echo "$CURRENT" | jq \
-  --argjson new_msgs "$(echo "$POLL_RESULT" | jq '.messages')" \
-  '.messages += $new_msgs |
-   .unread = true |
-   .unread_count = (.unread_count + ($new_msgs | length)) |
-   .priority_count = (.priority_count + ($new_msgs | map(select(.priority == true)) | length))')
-
-echo "$MERGED" > "$STATE_FILE"
-
-# --- Notify ---
-PRIORITY_NEW=$(echo "$POLL_RESULT" | jq '[.messages[] | select(.priority == true)] | length' 2>/dev/null || echo 0)
-
-if [ -f "$HOOK_DIR/notify.sh" ]; then
-  # shellcheck source=notify.sh
-  source "$HOOK_DIR/notify.sh"
-
-  if [ "$PRIORITY_NEW" -gt 0 ] 2>/dev/null; then
-    notify "Unicity Agent: Priority Messages" "$PRIORITY_NEW priority + $NEW_COUNT total new message(s)" "critical"
+# Surfaced messages → on-dm.sh / on-group-message.sh
+echo "$POLL_RESULT" | jq -c '.messages[]?' 2>/dev/null | while IFS= read -r rec; do
+  if [ "$(echo "$rec" | jq -r '.type')" = "group" ]; then
+    echo "$rec" | dispatch "on-group-message.sh"
   else
-    notify "Unicity Agent: New Messages" "$NEW_COUNT new message(s) from dev group" "normal"
+    echo "$rec" | dispatch "on-dm.sh"
   fi
-fi
+done
+
+# Pending contact requests + SIF-held → on-notice.sh (structural only, F6)
+echo "$POLL_RESULT" | jq -c '.pending[]? | {kind:"pending_contact", from_npub:.npub, count_held:.count_held}' 2>/dev/null | while IFS= read -r rec; do
+  echo "$rec" | dispatch "on-notice.sh"
+done
+echo "$POLL_RESULT" | jq -c '.held[]? | {kind:"held", from_npub:.npub, tier:.tier, reason:.reason}' 2>/dev/null | while IFS= read -r rec; do
+  echo "$rec" | dispatch "on-notice.sh"
+done
 
 exit 0

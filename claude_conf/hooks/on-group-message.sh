@@ -1,104 +1,104 @@
 #!/bin/bash
-# Daemon hook: called by sphere-sdk daemon when a group message arrives.
-# Receives message JSON on stdin. Filters own messages, appends to state file, notifies.
+# Daemon hook: called when a FIREWALLED group message surfaces (owner/team only).
+# Receives one surfaced record JSON on stdin (from sphere-helper's pipeline):
+#   { type:"group", from_npub, nametag, tier, sif, msg_id, timestamp, wrapped,
+#     priority, group:{id,name} }
+#
+# Red-team F5: group senders are classified by the per-npub contacts.json, NEVER
+# by relay group presence. This hook RE-DERIVES the tier from contacts.json (F15)
+# and refuses to surface anything not owner|team — an unknown npub posting into
+# the group is NOT trusted merely for being in the group.
 # Always exits 0 (daemon hooks must not fail).
 set -euo pipefail
 
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$HOOK_DIR/state-dir.sh" 2>/dev/null || STATE_DIR="/tmp/claude"
 STATE_FILE="$STATE_DIR/agent-messages.json"
-IDENTITY_FILE="$CLAUDE_PROJECT_DIR/.claude/agent/identity.json"
 CONFIG_FILE="$CLAUDE_PROJECT_DIR/.claude/agent/config.json"
+CONTACTS_FILE="$CLAUDE_PROJECT_DIR/.claude/agent/contacts.json"
 
 mkdir -p "$STATE_DIR"
 
-# Read message from stdin
 MSG_JSON=$(cat)
 
-# Extract fields
-SENDER=$(echo "$MSG_JSON" | jq -r '.pubkey // .from // "unknown"')
-BODY=$(echo "$MSG_JSON" | jq -r '.content // .body // ""')
-TIMESTAMP=$(echo "$MSG_JSON" | jq -r '.created_at // empty')
-GROUP_ID=$(echo "$MSG_JSON" | jq -r '.tags[] | select(.[0] == "h") | .[1] // empty' 2>/dev/null || echo "")
-GROUP_NAME=$(echo "$MSG_JSON" | jq -r '.group_name // "UNICITY_DEV_AGENTS"')
+FROM_NPUB=$(echo "$MSG_JSON" | jq -r '.from_npub // empty')
+WRAPPED=$(echo "$MSG_JSON" | jq -r '.wrapped // empty')
+MSG_ID=$(echo "$MSG_JSON" | jq -r '.msg_id // empty')
+SIF=$(echo "$MSG_JSON" | jq -r '.sif // "unknown"')
+NAMETAG=$(echo "$MSG_JSON" | jq -r '.nametag // ""')
+TIMESTAMP=$(echo "$MSG_JSON" | jq -r '.timestamp // empty')
+TIMESTAMP="${TIMESTAMP:-$(date -u +"%Y-%m-%dT%H:%M:%SZ")}"
+GROUP_ID=$(echo "$MSG_JSON" | jq -r '.group.id // ""')
+GROUP_NAME=$(echo "$MSG_JSON" | jq -r '.group.name // "UNICITY_DEV_AGENTS"')
 
-# Filter out own messages
-OWN_NPUB=""
-if [ -f "$IDENTITY_FILE" ]; then
-  OWN_NPUB=$(jq -r '.npub // ""' "$IDENTITY_FILE" 2>/dev/null)
-fi
-if [ -n "$OWN_NPUB" ] && [ "$SENDER" = "$OWN_NPUB" ]; then
+if [ -z "$WRAPPED" ] || [ -z "$FROM_NPUB" ]; then
+  echo "on-group: dropping malformed record (no wrapped frame / from_npub)" >&2
   exit 0
 fi
 
-# Convert unix timestamp to ISO if numeric
-if [[ "$TIMESTAMP" =~ ^[0-9]+$ ]]; then
-  TIMESTAMP=$(date -u -d "@$TIMESTAMP" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || \
-    date -u -r "$TIMESTAMP" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || \
-    echo "$TIMESTAMP")
-fi
-TIMESTAMP="${TIMESTAMP:-$(date -u +"%Y-%m-%dT%H:%M:%SZ")}"
-
-# Check if sender is owner (priority)
+# --- F15/F5: re-derive tier from contacts.json ---
 OWNER_NPUB=""
-IS_PRIORITY=false
-if [ -f "$CONFIG_FILE" ]; then
-  OWNER_NPUB=$(jq -r '.owner_npub // ""' "$CONFIG_FILE" 2>/dev/null)
-  if [ -n "$OWNER_NPUB" ] && [ "$SENDER" = "$OWNER_NPUB" ]; then
-    IS_PRIORITY=true
+[ -f "$CONFIG_FILE" ] && OWNER_NPUB=$(jq -r '.owner_npub // ""' "$CONFIG_FILE" 2>/dev/null || echo "")
+TIER="pending"
+if [ -n "$OWNER_NPUB" ] && [ "$FROM_NPUB" = "$OWNER_NPUB" ]; then
+  TIER="owner"
+elif [ -f "$CONTACTS_FILE" ]; then
+  if jq -e --arg n "$FROM_NPUB" '.blocked | index($n)' "$CONTACTS_FILE" >/dev/null 2>&1; then
+    TIER="blocked"
+  else
+    TIER=$(jq -r --arg n "$FROM_NPUB" '.contacts[$n].tier // "pending"' "$CONTACTS_FILE" 2>/dev/null || echo "pending")
   fi
 fi
 
-# Build message entry
+case "$TIER" in
+  owner|team) : ;;
+  *)
+    echo "on-group: refusing to surface $FROM_NPUB — re-derived tier '$TIER' not owner|team (F5/F15)" >&2
+    exit 0
+    ;;
+esac
+
+IS_PRIORITY=false
+[ "$TIER" = "owner" ] && IS_PRIORITY=true
+
 NEW_MSG=$(jq -n \
   --arg type "group" \
-  --arg from "$SENDER" \
-  --arg from_name "" \
-  --arg body "$BODY" \
+  --arg from "$FROM_NPUB" \
+  --arg from_name "$NAMETAG" \
+  --arg tier "$TIER" \
+  --arg sif "$SIF" \
+  --arg msg_id "$MSG_ID" \
+  --arg wrapped "$WRAPPED" \
   --arg timestamp "$TIMESTAMP" \
   --argjson priority "$IS_PRIORITY" \
   --arg group_id "$GROUP_ID" \
   --arg group_name "$GROUP_NAME" \
-  '{
-    type: $type,
-    from: $from,
-    from_name: $from_name,
-    body: $body,
-    timestamp: $timestamp,
-    priority: $priority,
-    read: false,
-    group: {
-      id: $group_id,
-      name: $group_name
-    }
-  }')
+  '{ type: $type, from: $from, from_name: $from_name, tier: $tier, sif: $sif,
+     msg_id: $msg_id, wrapped: $wrapped, timestamp: $timestamp,
+     priority: $priority, read: false,
+     group: { id: $group_id, name: $group_name } }')
 
-# Append to state file (create if missing)
-if [ -f "$STATE_FILE" ]; then
-  CURRENT=$(cat "$STATE_FILE")
-else
+if [ -f "$STATE_FILE" ]; then CURRENT=$(cat "$STATE_FILE"); else
   CURRENT='{"unread": false, "unread_count": 0, "priority_count": 0, "messages": []}'
 fi
 
 UPDATED=$(echo "$CURRENT" | jq \
   --argjson msg "$NEW_MSG" \
   --argjson is_priority "$IS_PRIORITY" \
-  '.messages += [$msg] |
-   .unread = true |
+  '.messages += [$msg] | .unread = true |
    .unread_count = (.unread_count + 1) |
    .priority_count = (if $is_priority then .priority_count + 1 else .priority_count end)')
 
 echo "$UPDATED" > "$STATE_FILE"
 
-# Notify
 if [ -f "$HOOK_DIR/notify.sh" ]; then
   # shellcheck source=notify.sh
   source "$HOOK_DIR/notify.sh"
-
+  WHO="${NAMETAG:-${FROM_NPUB:0:14}…}"
   if [ "$IS_PRIORITY" = "true" ]; then
-    notify "Unicity Agent: Priority Group Message" "From owner in ${GROUP_NAME}: ${BODY:0:100}" "critical"
+    notify "Unicity Agent: Priority Group Message" "From owner ${WHO} in ${GROUP_NAME} — run /check-messages" "critical"
   else
-    notify "Unicity Agent: Group" "${GROUP_NAME}: ${BODY:0:100}" "low"
+    notify "Unicity Agent: Group" "${WHO} [${TIER}] in ${GROUP_NAME} — run /check-messages" "low"
   fi
 fi
 

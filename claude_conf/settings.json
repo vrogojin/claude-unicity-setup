@@ -4,6 +4,19 @@
     "CLAUDE_NOTIFY_URL": ""
   },
   "teammateMode": "auto",
+  "permissions": {
+    "deny": [
+      "Read(./.claude/agent/identity.json)",
+      "Read(./.claude/agent/.env.sif)",
+      "Read(./.claude/agent/bus-state.json)",
+      "Read(./.claude/agent/quarantine/**)",
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./.secrets/**)",
+      "Edit(./.claude/agent/identity.json)",
+      "Edit(./.claude/agent/contacts.json)"
+    ]
+  },
   "hooks": {
     "PreToolUse": [
       {
