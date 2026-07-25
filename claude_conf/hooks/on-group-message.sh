@@ -9,26 +9,39 @@ HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 STATE_FILE="$STATE_DIR/agent-messages.json"
 IDENTITY_FILE="$CLAUDE_PROJECT_DIR/.claude/agent/identity.json"
 CONFIG_FILE="$CLAUDE_PROJECT_DIR/.claude/agent/config.json"
+# Canonical npub → 32-byte x-only hex decoder. See on-dm.sh for rationale.
+SPHERE_HELPER="$HOOK_DIR/../../lib/sphere-helper.mjs"
+if [ ! -f "$SPHERE_HELPER" ]; then
+  SPHERE_HELPER="$HOME/claude_unicity_setup/lib/sphere-helper.mjs"
+fi
 
 mkdir -p "$STATE_DIR"
 
 # Read message from stdin
 MSG_JSON=$(cat)
 
-# Extract fields
-SENDER=$(echo "$MSG_JSON" | jq -r '.pubkey // .from // "unknown"')
+# Extract fields. SENDER is the group-message author's x-only hex pubkey
+# (NIP-29 events are not gift-wrapped — pubkey on the event is the real
+# sender, exposed by the helper as `.from`).
+SENDER=$(echo "$MSG_JSON" | jq -r '.from // .pubkey // "unknown"')
 BODY=$(echo "$MSG_JSON" | jq -r '.content // .body // ""')
 TIMESTAMP=$(echo "$MSG_JSON" | jq -r '.created_at // empty')
-GROUP_ID=$(echo "$MSG_JSON" | jq -r '.tags[] | select(.[0] == "h") | .[1] // empty' 2>/dev/null || echo "")
+GROUP_ID=$(echo "$MSG_JSON" | jq -r '.tags[]? | select(.[0] == "h") | .[1] // empty' 2>/dev/null || echo "")
 GROUP_NAME=$(echo "$MSG_JSON" | jq -r '.group_name // "UNICITY_DEV_AGENTS"')
 
-# Filter out own messages
-OWN_NPUB=""
-if [ -f "$IDENTITY_FILE" ]; then
+# Filter out own messages. Previously compared SENDER (hex) to OWN_NPUB
+# (bech32 from identity.json) — never matched, so own messages always
+# leaked into the inbox. Decode the npub to canonical hex first. (The
+# helper-side check-messages already filters by pubkey equality, so this
+# is a belt-and-braces guard for direct event delivery paths.)
+if [ -f "$IDENTITY_FILE" ] && [ -f "$SPHERE_HELPER" ]; then
   OWN_NPUB=$(jq -r '.npub // ""' "$IDENTITY_FILE" 2>/dev/null)
-fi
-if [ -n "$OWN_NPUB" ] && [ "$SENDER" = "$OWN_NPUB" ]; then
-  exit 0
+  if [ -n "$OWN_NPUB" ]; then
+    OWN_HEX=$(node "$SPHERE_HELPER" npub-to-hex "$OWN_NPUB" 2>/dev/null || true)
+    if [ -n "$OWN_HEX" ] && [ "$SENDER" = "$OWN_HEX" ]; then
+      exit 0
+    fi
+  fi
 fi
 
 # Convert unix timestamp to ISO if numeric
@@ -39,14 +52,23 @@ if [[ "$TIMESTAMP" =~ ^[0-9]+$ ]]; then
 fi
 TIMESTAMP="${TIMESTAMP:-$(date -u +"%Y-%m-%dT%H:%M:%SZ")}"
 
-# Check if sender is owner (priority)
+# Check if sender is owner (priority). Same bech32-vs-hex bug as own-message
+# filter above — fixed by decoding owner_npub to hex via sphere-helper.
+# Trust the helper-computed priority field when the daemon passed one.
+HELPER_PRIORITY=$(echo "$MSG_JSON" | jq -r '.priority // empty')
 OWNER_NPUB=""
+OWNER_HEX=""
 IS_PRIORITY=false
 if [ -f "$CONFIG_FILE" ]; then
   OWNER_NPUB=$(jq -r '.owner_npub // ""' "$CONFIG_FILE" 2>/dev/null)
-  if [ -n "$OWNER_NPUB" ] && [ "$SENDER" = "$OWNER_NPUB" ]; then
-    IS_PRIORITY=true
+  if [ -n "$OWNER_NPUB" ] && [ -f "$SPHERE_HELPER" ]; then
+    OWNER_HEX=$(node "$SPHERE_HELPER" npub-to-hex "$OWNER_NPUB" 2>/dev/null || true)
   fi
+fi
+if [ "$HELPER_PRIORITY" = "true" ]; then
+  IS_PRIORITY=true
+elif [ -n "$OWNER_HEX" ] && [ "$SENDER" = "$OWNER_HEX" ]; then
+  IS_PRIORITY=true
 fi
 
 # Build message entry
