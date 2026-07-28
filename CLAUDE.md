@@ -41,6 +41,7 @@ claude_conf/
 │   ├── remote-sync-check.sh   # Async: detects remote branch updates (PostToolUse)
 │   ├── dep-update-check.sh    # Async: detects upstream dependency updates (PostToolUse)
 │   ├── agent-comms-check.sh   # Async: fallback polling for agent messages (PostToolUse)
+│   ├── roadmap-sync-check.sh  # Async: nudges when a branch changed code but not docs/ROADMAP.md (PostToolUse)
 │   ├── on-dm.sh               # Daemon hook: incoming DM → state file + notify
 │   ├── on-group-message.sh    # Daemon hook: incoming group msg → state file + notify
 │   ├── dep-map.json           # Cross-repo dependency graph config
@@ -54,10 +55,12 @@ claude_conf/
 │   ├── push-pr/               # /push-pr — push branch and create GitHub PR
 │   ├── update-issue/          # /update-issue — post progress update on GitHub issue
 │   ├── sync-remote/           # /sync-remote — fetch and merge remote updates
+│   ├── roadmap-sync/          # /roadmap-sync — reconcile docs/ROADMAP.md ⇄ GitHub Project board
 │   ├── update-deps/           # /update-deps — update upstream deps, adapt code, build, test
 │   ├── check-messages/        # /check-messages — read and display agent messages
 │   └── dm-owner/              # /dm-owner — send DM to configured owner
 ├── agent/                     # Agent identity and config (created by setup.sh, gitignored)
+├── templates/                 # Seed files setup.sh copies into targets (ROADMAP.md skeleton, roadmap memory record)
 ├── reference/                 # Per-repository API reference docs (loaded on demand)
 └── docs/                      # Architecture docs, guides, design decisions
 ```
@@ -72,11 +75,23 @@ The hooks auto-detect project type and enforce quality gates:
   - Rust: blocks if `cargo fmt --all --check` or `cargo clippy` fail
   - TypeScript: blocks if `npm run lint` or `npm run typecheck` fail
   - Go: blocks if `go vet` or `gofmt` report issues
-- **Stop** → auto-detects and blocks if build errors exist; also blocks if remote has unmerged updates, upstream dependency updates are pending, or unread priority agent messages exist
+- **Stop** → auto-detects and blocks if build errors exist; also blocks if remote has unmerged updates, upstream dependency updates are pending, the roadmap is out of sync (code changed without a `docs/ROADMAP.md` update), or unread priority agent messages exist
 - **ExitPlanMode** → blocked once to force steelman self-critique (5 adversarial questions), then allowed on second call
 - **PostToolUse (async)** → after Bash calls, runs `git fetch` with 5-minute cooldown to detect remote updates; writes state file and sends desktop notification if behind
 - **PostToolUse (async)** → after Bash calls, checks upstream npm/git deps with 15-minute cooldown; writes state file and sends desktop notification if newer versions available
 - **PostToolUse (async)** → after Bash calls, polls Nostr relays for agent messages with 10-minute cooldown (fallback if sphere-sdk daemon not running)
+- **PostToolUse (async)** → after Bash calls (i.e. once a `git commit` moves HEAD), if the current **feature branch** changed code/feature files but not `docs/ROADMAP.md`, writes a state file and notifies; dedup keyed on HEAD sha. No-op on `main`/`master`, doc-only or trivial commits, or when `gh` is unavailable
+
+## Roadmap ⇄ Project Board Sync Pipeline
+
+Every project provisioned by `setup.sh` gets a roadmap that is kept in lockstep
+with its GitHub Project board. **`docs/ROADMAP.md` and the Project board MUST
+always stay in sync** — they are two views of the same plan.
+
+- **Four-state model:** ✅ Completed · 🚧 In progress · ⏸️ Stalled/paused · 🔵 Planned. The emoji on each roadmap line maps to the card's board `Status`.
+- **`/roadmap-sync`** (`skills/roadmap-sync/`) reconciles both directions, idempotently (cards matched to lines by title, so no duplicates). It creates `docs/ROADMAP.md` from the four-state skeleton if absent, and creates the board via `gh project create` if none exists — surfacing `gh auth refresh -s project` when the token lacks the `project` scope rather than faking success.
+- **`roadmap-sync-check.sh`** (PostToolUse) detects drift after a commit and nudges; **`check-diagnostics.sh`** escalates a pending state into a Stop-nudge (same soft→Stop pattern as remote-sync / dep-update). Escape hatch: `rm -f /tmp/claude/*/roadmap-sync.json`.
+- **On install**, `setup.sh` (Phase 9) seeds `docs/ROADMAP.md` from `claude_conf/templates/ROADMAP.md` (if the target lacks one) and writes a per-project memory record from `claude_conf/templates/roadmap-memory.md` into the resolved `~/.claude/projects/<slug>/memory/` dir (index line appended to `MEMORY.md`), both guarded against clobbering existing files.
 
 ## Skills Workflow
 
