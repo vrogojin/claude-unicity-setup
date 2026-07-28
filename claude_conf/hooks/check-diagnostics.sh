@@ -92,6 +92,23 @@ if [ -f "$DEP_STATE" ]; then
   fi
 fi
 
+# --- Roadmap ⇄ board sync check ---
+ROADMAP_STATE="$STATE_DIR/roadmap-sync.json"
+if [ -f "$ROADMAP_STATE" ]; then
+  ROADMAP_PENDING=$(jq -r '.pending // false' "$ROADMAP_STATE" 2>/dev/null)
+  if [ "$ROADMAP_PENDING" = "true" ]; then
+    RM_BRANCH=$(jq -r '.branch // "this branch"' "$ROADMAP_STATE" 2>/dev/null)
+    RM_FILES=$(jq -r '.code_files // 0' "$ROADMAP_STATE" 2>/dev/null)
+
+    RM_MSG="Roadmap out of sync: ${RM_BRANCH} changed ${RM_FILES} code file(s) but docs/ROADMAP.md was not updated."
+    RM_MSG="$RM_MSG Run /roadmap-sync to reconcile the roadmap and the GitHub Project board before finishing"
+    RM_MSG="$RM_MSG (or, if this branch genuinely needs no roadmap change, clear it: rm -f \"$ROADMAP_STATE\")."
+
+    jq -n --arg reason "$RM_MSG" '{"decision":"block","reason":$reason}'
+    exit 0
+  fi
+fi
+
 # --- Urgent agent messages check ---
 MSG_STATE="$STATE_DIR/agent-messages.json"
 if [ -f "$MSG_STATE" ]; then

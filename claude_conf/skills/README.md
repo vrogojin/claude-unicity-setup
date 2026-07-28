@@ -13,6 +13,7 @@ Custom slash commands for managing parallel agent workflows across the Unicity e
 | `/push-pr <description>` | Push branch and create a GitHub PR with structured template |
 | `/update-issue <number> [message]` | Push branch and post progress update on a GitHub issue |
 | `/steelman [branch]` | Adversarial review — try to break code before it ships |
+| `/roadmap-sync [--dry-run]` | Reconcile `docs/ROADMAP.md` ⇄ the GitHub Project board (four-state model) |
 
 ## Usage
 
@@ -96,8 +97,10 @@ Systematically reviews work against task file, runs verification, and prepares m
 │   └── SKILL.md           # /push-pr command
 ├── steelman/
 │   └── SKILL.md           # /steelman command
-└── update-issue/
-    └── SKILL.md           # /update-issue command
+├── update-issue/
+│   └── SKILL.md           # /update-issue command
+└── roadmap-sync/
+    └── SKILL.md           # /roadmap-sync command
 ```
 
 ## Tips

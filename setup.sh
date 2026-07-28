@@ -100,7 +100,9 @@ ensure_sphere_sdk() {
 run_sphere_helper() {
   local helper="$SCRIPT_DIR/lib/sphere-helper.mjs"
   if [ "$DRY_RUN" = "true" ]; then
-    info "[dry-run] node $helper $*"
+    # Notice to stderr so callers that capture this helper's stdout (Phase 2
+    # create-identity, Phase 7 join-group) parse ONLY the JSON below, not the notice.
+    info "[dry-run] node $helper $*" >&2
     echo '{"dry_run": true}'
     return 0
   fi
@@ -702,7 +704,68 @@ if [ -f "$SETTINGS_FILE" ] && [ "$DRY_RUN" != "true" ]; then
 fi
 
 # ============================================================
-# Phase 9: Summary
+# Phase 9: Roadmap ⇄ board sync pipeline
+# ============================================================
+echo ""
+info "Phase 9: Roadmap ⇄ project-board sync pipeline..."
+
+# The roadmap-sync hook + /roadmap-sync skill were already copied into .claude/ by
+# the Phase 1 `cp -r claude_conf/.` and registered via the deployed settings.json.
+# Here we (a) ensure the target project has a docs/ROADMAP.md to reconcile against
+# and (b) seed a per-project memory record documenting the always-in-sync rule.
+
+# --- (a) Ensure docs/ROADMAP.md (create the four-state skeleton if absent) ---
+ROADMAP_FILE="$TARGET_DIR/docs/ROADMAP.md"
+ROADMAP_TEMPLATE="$CONF_DIR/templates/ROADMAP.md"
+if [ -f "$ROADMAP_FILE" ]; then
+  ok "docs/ROADMAP.md already present — leaving it untouched"
+elif [ ! -f "$ROADMAP_TEMPLATE" ]; then
+  warn "Roadmap template missing ($ROADMAP_TEMPLATE) — skipping ROADMAP.md seed"
+elif [ "$DRY_RUN" = "true" ]; then
+  info "[dry-run] mkdir -p $TARGET_DIR/docs && cp roadmap skeleton -> $ROADMAP_FILE"
+else
+  mkdir -p "$TARGET_DIR/docs"
+  cp "$ROADMAP_TEMPLATE" "$ROADMAP_FILE"
+  ok "Seeded docs/ROADMAP.md (four-state skeleton) — commit it and run /roadmap-sync"
+fi
+
+# --- (b) Seed the per-project memory record (guarded against clobber) ---
+# Memory lives OUTSIDE the repo, under the user's Claude projects dir. The project
+# slug is the absolute target path with every '/' replaced by '-' (e.g.
+# /home/u/proj -> -home-u-proj), matching how Claude Code names the dir.
+MEM_TEMPLATE="$CONF_DIR/templates/roadmap-memory.md"
+MEM_SLUG=$(printf '%s' "$TARGET_DIR" | sed 's#/#-#g')
+MEM_DIR="$HOME/.claude/projects/$MEM_SLUG/memory"
+MEM_FILE="$MEM_DIR/roadmap-board-sync.md"
+MEM_INDEX="$MEM_DIR/MEMORY.md"
+MEM_INDEX_LINE="- [Roadmap ⇄ board sync](roadmap-board-sync.md) — docs/ROADMAP.md and the GitHub Project board stay auto-synced (four-state model); run /roadmap-sync to reconcile."
+
+if [ ! -f "$MEM_TEMPLATE" ]; then
+  warn "Memory template missing ($MEM_TEMPLATE) — skipping memory seed"
+elif [ "$DRY_RUN" = "true" ]; then
+  info "[dry-run] Seed memory record -> $MEM_FILE (+ index line in $MEM_INDEX)"
+elif [ -f "$MEM_FILE" ]; then
+  ok "Roadmap memory record already present — leaving it untouched"
+else
+  if mkdir -p "$MEM_DIR" 2>/dev/null; then
+    cp "$MEM_TEMPLATE" "$MEM_FILE"
+    # Create the index with a header if absent, then append the pointer once.
+    if [ ! -f "$MEM_INDEX" ]; then
+      printf '# Memory index\n\n' > "$MEM_INDEX"
+    fi
+    if ! grep -qF 'roadmap-board-sync.md' "$MEM_INDEX" 2>/dev/null; then
+      printf '%s\n' "$MEM_INDEX_LINE" >> "$MEM_INDEX"
+    fi
+    ok "Seeded roadmap memory record -> $MEM_FILE"
+  else
+    warn "Could not resolve/create memory dir ($MEM_DIR) — skipped memory seed."
+    warn "To seed it by hand: cp '$MEM_TEMPLATE' into that project's memory/ dir"
+    warn "and add an index line to its MEMORY.md."
+  fi
+fi
+
+# ============================================================
+# Phase 10: Summary
 # ============================================================
 echo ""
 echo "============================================"
@@ -719,6 +782,7 @@ echo "  Dep tracking:    ${SELECTED_DEPS[*]:-disabled}"
 echo ""
 echo "  Config dir:      $CLAUDE_DIR/"
 echo "  Identity:        $CLAUDE_DIR/agent/identity.json"
+echo "  Roadmap:         $TARGET_DIR/docs/ROADMAP.md (⇄ Project board — run /roadmap-sync)"
 echo ""
 info "To start the message daemon:"
 info "  node $SCRIPT_DIR/lib/sphere-daemon.mjs start --project $TARGET_DIR &"
