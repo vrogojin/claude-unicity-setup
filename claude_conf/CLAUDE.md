@@ -242,20 +242,47 @@ Messages are delivered through three channels with automatic fallback:
 
 - **`/check-messages`** — Display all unread messages (priority first), mark as read
 - **`/dm-owner`** — Send a DM to the configured owner (accepts message as argument)
+- **`/dm-agent <name-or-npub> <message>`** — DM another Claude agent (first-contact handshake introduces us)
+- **`/list-agents [status]`** — Show the authorized-agents registry
+- **`/authorize-agent <name-or-npub> <caps>`** — Authorize a remote agent + grant capabilities
+- **`/deny-agent <name-or-npub>`** — Deny a remote agent (its messages are dropped)
+- **`/process-agent-requests`** — Dispatch queued authorized requests to capability-scoped processors
+
+### Master-Manager Coordination (owner-in-the-loop, default-deny)
+
+This instance (**cryptohog-concierge-dev**) is the **master manager** of the concierge
+project: Claude agents on other hosts coordinate through it. Every inbound agent message
+is routed by `classify-inbound.sh` against an **authorized-agents registry**
+(`.claude/hooks/agent-registry.sh`, keyed by the sender's unspoofable **pubkey**):
+
+- **Unknown/pending** → surfaced to you for a decision; **nothing is acted upon**.
+- **Authorized** → the request is queued and dispatched (via `/process-agent-requests`)
+  to a subagent scoped to *only* that agent's granted capabilities.
+- **Denied** → dropped.
+
+Capabilities are an explicit enum: `read-status`, `chat`, `dev-advice`,
+`rebuild-reload-service`, `review-merge-pr` (the last two are request-only — they still
+need your confirmation to execute). Full model: **`docs/agent-coordination.md`**.
 
 ### Configuration Files
 
 - `.claude/agent/identity.json` — Agent's keypair (npub, nsec, mnemonic). **Never commit this file.**
 - `.claude/agent/config.json` — Owner npub, group ID, notification URL, dep tracking settings
 - `.claude/agent/daemon.json` — Relay URLs, subscriptions, hook paths for the sphere-sdk daemon
+- `.claude/agent/agent-registry.json` — Authorized-agents registry (gitignored, self-initializing, **default-deny**). Template: `agent-registry.example.json`.
 
 ### Stop Gate
 
-**You will be blocked from stopping** if there are unread priority messages from your owner. Run `/check-messages` to read them first.
+**You will be blocked from stopping** if: there are unread priority messages from your
+owner (run `/check-messages`); an unknown agent is **awaiting your authorization** (run
+`/authorize-agent` or `/deny-agent`); or authorized agent requests are **queued for
+dispatch** (run `/process-agent-requests`).
 
 ### Escape Hatch
 
-To skip the agent messages gate: `rm -f /tmp/claude/*/agent-messages.json`
+To skip the agent messages gate: `rm -f /tmp/claude/*/agent-messages.json`.
+To clear a pending-authorization block without deciding: `/deny-agent <name-or-npub>`
+(or `rm -f /tmp/claude/*/agent-authz-pending.json`).
 
 ## Documentation Pointers
 
@@ -265,4 +292,5 @@ To skip the agent messages gate: `rm -f /tmp/claude/*/agent-messages.json`
 - `docs/sphere-sdk-guide.md` — sphere-sdk development guide
 - `docs/sphere-guide.md` — sphere app development guide
 - `docs/developer-guidelines.md` — Cross-repo coding standards (TypeScript, Go, Rust, C++)
+- `docs/agent-coordination.md` — Owner-in-the-loop master-manager model: authorization registry, capabilities, inbound/outbound flows
 - `reference/<repo>.md` — Per-repository API reference (see `reference/TEMPLATE.md` for format)

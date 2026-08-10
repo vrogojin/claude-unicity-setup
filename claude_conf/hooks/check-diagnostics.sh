@@ -120,4 +120,45 @@ if [ -f "$MSG_STATE" ]; then
   fi
 fi
 
+# --- Inbound agent authorization gate (owner-in-the-loop, DEFAULT-DENY) ---------
+# Master-manager coordination: unknown agents that have made contact must be
+# authorized (or denied) by the owner before anything they ask is acted upon.
+DIAG_HOOK_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo .)"
+# Refresh the pending surface from the registry so /authorize-agent · /deny-agent
+# decisions clear the gate immediately (also classifies any not-yet-routed messages).
+if [ -f "$DIAG_HOOK_DIR/classify-inbound.sh" ]; then
+  bash "$DIAG_HOOK_DIR/classify-inbound.sh" >/dev/null 2>&1 || true
+fi
+AUTHZ_PENDING="$STATE_DIR/agent-authz-pending.json"
+if [ -f "$AUTHZ_PENDING" ]; then
+  PCOUNT=$(jq -r '.count // 0' "$AUTHZ_PENDING" 2>/dev/null)
+  if [ "$PCOUNT" -gt 0 ] 2>/dev/null && [ "$PCOUNT" != "0" ]; then
+    CAPS_LIST=$(bash "$DIAG_HOOK_DIR/agent-registry.sh" caps 2>/dev/null || echo "")
+    DETAILS=$(jq -r '
+      .pending[] |
+      "  • " + (if (.name // "") != "" then .name else (.pubkey[0:12] + "…") end)
+      + " (" + (.firstContact // "?") + " · pubkey " + (.pubkey[0:16]) + "…)\n"
+      + "    says: \"" + ((.intro // "") | gsub("[\n\r]";" ") | .[0:200]) + "\""
+    ' "$AUTHZ_PENDING" 2>/dev/null)
+    AUTHZ_MSG="${PCOUNT} unknown agent(s) are requesting to coordinate and need your authorization decision:\n${DETAILS}\n\nAuthorize:  /authorize-agent <name-or-npub> <cap,cap,...>\nDeny:       /deny-agent <name-or-npub>\nCapabilities: ${CAPS_LIST}\nNothing from these agents is acted upon until you decide."
+    jq -n --arg reason "$AUTHZ_MSG" '{"decision":"block","reason":$reason}'
+    exit 0
+  fi
+fi
+
+# --- Authorized agent requests queued for capability-scoped dispatch -----------
+WI_DIR="$STATE_DIR/agent-workitems"
+if [ -d "$WI_DIR" ]; then
+  QUEUED=0
+  for f in "$WI_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    [ "$(jq -r '.status // "queued"' "$f" 2>/dev/null)" = "queued" ] && QUEUED=$((QUEUED+1))
+  done
+  if [ "$QUEUED" -gt 0 ] 2>/dev/null; then
+    WI_MSG="${QUEUED} authorized agent request(s) are queued for dispatch. Run /process-agent-requests to hand each to a capability-scoped processor (a subagent constrained to that sender's granted capabilities). Requests outside the grant are refused and reported; destructive/outward actions still require your confirmation."
+    jq -n --arg reason "$WI_MSG" '{"decision":"block","reason":$reason}'
+    exit 0
+  fi
+fi
+
 exit 0
