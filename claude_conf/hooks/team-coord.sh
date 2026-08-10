@@ -218,8 +218,20 @@ JSON
   cat "$d/team.json"
 }
 
-team_join() {  # team_join from an invite: <teamId> <goal> <coordNpub> [coordName] [epoch] [ttl_hours]
-  local id="$1" goal="$2" coord="$3" cname="${4:-}" epoch="${5:-1}" ttl="${6:-168}"
+team_join() {  # join a team from an invite. Flags OR positional:
+  #   --team <id> --goal <g> --coord <npub> [--coord-name N --epoch E --ttl-hours H]
+  #   <teamId> <goal> <coordNpub> [coordName] [epoch] [ttl_hours]
+  local id="" goal="" coord="" cname="" epoch="1" ttl="168"
+  if [ "${1:-}" = "--team" ] || [ "${1:-}" = "--goal" ] || [ "${1:-}" = "--coord" ]; then
+    while [ $# -gt 0 ]; do case "$1" in
+      --team) id="$2"; shift 2;; --goal) goal="$2"; shift 2;; --coord) coord="$2"; shift 2;;
+      --coord-name) cname="$2"; shift 2;; --epoch) epoch="$2"; shift 2;; --ttl-hours) ttl="$2"; shift 2;; *) shift;; esac; done
+  else
+    id="$1" goal="${2:-}" coord="${3:-}" cname="${4:-}" epoch="${5:-1}" ttl="${6:-168}"
+  fi
+  [ -n "$id" ] && [ -n "$coord" ] || { echo "ERR: --team and --coord (coordinator npub) required" >&2; return 1; }
+  [[ "$epoch" =~ ^[0-9]+$ ]] || epoch=1
+  [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=168
   local d; d="$(team_dir "$id")"; _tc_ensure_dir "$d/knowledge"
   local me_npub; me_npub="$(team_self_npub)"
   local exp; exp="$(date -u -d "+${ttl} hours" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || now_iso)"
@@ -319,7 +331,7 @@ team_ready_serialized() {
           | .exclusiveScope | select(. != "") ] ) as $held
     | map(select(.state=="todo"
         and ((.blockedBy // []) | all(. as $b | ($st[$b] // "done")=="done"))
-        and ((.exclusiveScope=="") or (($held | index(.exclusiveScope)) | not))))
+        and (.exclusiveScope as $sc | ($sc=="") or (($held | index($sc)) | not))))
     | map({taskId, subject, objective, exclusiveScope, artifactType, acceptanceCriteria, effortBudget})
   ' "$f"
 }

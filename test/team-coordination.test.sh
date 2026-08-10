@@ -151,6 +151,27 @@ for f in "$TE_DIR"/*.json; do bash "$TC" ingest "$f" >/dev/null 2>&1; done
 DUP="$(bash "$TC" ingest "$BID")"
 chk "duplicate message id is de-duplicated" 'echo "$DUP" | grep -qi dup'
 
+echo; echo "── Member side: join → cfp-open → awarded-to-us; scope serialization ──"
+(
+  # Run as a DIFFERENT identity (a member) against a fresh team.
+  export TEAM_SELF_NPUB="npub1memberZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"
+  export TEAM_SELF_NAME="member-z"
+  bash "$TC" join --team proj --goal "Docs" --coord npub1coordAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA --coord-name coord --epoch 3 >/dev/null
+  [ "$(bash "$TC" get proj | jq -r .role)" = member ] && echo "  PASS member joined as member (epoch 3)" || echo "  FAIL member join"
+  CFP2="$(jq -nc '{a2a:"1",kind:"task.cfp",team:"proj",epoch:3,id:"cfp-m",lamport:2,fromNpub:"npub1coordAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",from:"coord",task:"tM",deadline:"2099-01-01T00:00:00Z",payload:{subject:"intro",objective:"x",exclusiveScope:"docs/intro",artifactType:"doc",acceptanceCriteria:"clear",effortBudget:"1h"}}')"
+  bash "$TC" ingest "$CFP2" >/dev/null
+  [ "$(bash "$TC" tasks proj | jq -r '.[0].state')" = cfp-open ] && echo "  PASS CFP observed as cfp-open (bid candidate)" || echo "  FAIL cfp ingest"
+  AW2="$(jq -nc '{a2a:"1",kind:"task.award",team:"proj",epoch:3,id:"aw-m",lamport:5,fromNpub:"npub1coordAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",from:"coord",task:"tM",payload:{assigneeNpub:"npub1memberZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",lease:{epoch:3,expiresAt:"2099-01-01T00:00:00Z"}}}')"
+  bash "$TC" ingest "$AW2" >/dev/null
+  [ "$(bash "$TC" tasks proj | jq -r '.[0].state')" = awarded ] && echo "  PASS award-to-us adopted (execute under lease)" || echo "  FAIL award ingest"
+)
+# Scope serialization: a second todo task sharing an exclusiveScope with an in-flight CFP is held out.
+T2="$(bash "$TC" task-add --team demo --subject "Rework export" --scope src/export)"
+bash "$TC" open-cfp demo "$T2" >/dev/null
+T3="$(bash "$TC" task-add --team demo --subject "Also export" --scope src/export)"
+chk "overlapping-scope task held out of ready-serialized" '[ "$(bash "$TC" ready-serialized demo | jq -r --arg t "'"$T3"'" "map(.taskId)|index(\$t)")" = null ]'
+chk "same task appears in unserialized ready" '[ "$(bash "$TC" ready demo | jq -r --arg t "'"$T3"'" "map(.taskId)|index(\$t)")" != null ]'
+
 echo; echo "── Rendered ledgers ──"
 bash "$TC" render demo >/dev/null
 chk "ledger.md rendered" '[ -f "$TEAM_ROOT/demo/ledger.md" ]'
