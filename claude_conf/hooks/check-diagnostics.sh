@@ -167,4 +167,25 @@ if [ -d "$WI_DIR" ]; then
   fi
 fi
 
+# --- Content-guard (SIF) quarantined agent messages awaiting owner review ------
+Q_DIR="$STATE_DIR/agent-quarantine"
+if [ -d "$Q_DIR" ]; then
+  QN=0
+  for f in "$Q_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    [ "$(jq -r '.status // "quarantined"' "$f" 2>/dev/null)" = "quarantined" ] && QN=$((QN+1))
+  done
+  if [ "$QN" -gt 0 ] 2>/dev/null; then
+    Q_DETAILS=$(for f in "$Q_DIR"/*.json; do [ -e "$f" ] || continue
+      [ "$(jq -r '.status // "quarantined"' "$f" 2>/dev/null)" = "quarantined" ] || continue
+      jq -r '"  • " + (if (.unicityName // "") != "" then .unicityName else (.from_pubkey[0:12] + "…") end)
+             + " — reasons: " + (((.sif.reasons // []) | join(", ")) | if . == "" then "(unspecified)" else . end)
+             + "\n    body: \"" + ((.body // "") | gsub("[\n\r]";" ") | .[0:160]) + "\""' "$f" 2>/dev/null
+    done)
+    Q_MSG="${QN} authorized agent message(s) were QUARANTINED by the content-guard (SIF) and NOT processed:\n${Q_DETAILS}\n\nReview them under ${Q_DIR}. If a message is safe, handle it manually; otherwise leave it quarantined (and consider /deny-agent for a repeat offender). Escape hatch: rm -f \"${Q_DIR}\"/*.json"
+    jq -n --arg reason "$Q_MSG" '{"decision":"block","reason":$reason}'
+    exit 0
+  fi
+fi
+
 exit 0

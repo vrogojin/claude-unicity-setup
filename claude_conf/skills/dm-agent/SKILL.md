@@ -45,7 +45,19 @@ the remote knows who is reaching out and why.
    ```
    For an ongoing thread, send `<message>` as-is.
 
-4. Send it:
+4. **Egress content-guard (SIF).** Before sending, run the final message body through the
+   content-guard the same way inbound is guarded. If it quarantines, DO NOT send — report
+   the block to the caller.
+   ```bash
+   SIF=$(printf '%s' "<final-message>" | bash "$CLAUDE_PROJECT_DIR/.claude/hooks/sif-guard.sh" \
+     check --direction outbound --principal "<recipient-npub>" --source agent-comms)
+   echo "$SIF" | jq -r '.decision'   # "pass" → send · "quarantine" → refuse
+   ```
+   On `quarantine`, tell the caller: "Outbound message blocked by the content-guard
+   (reasons: …). Not sent." and stop. (With SIF disabled/keyless this returns `pass`, so
+   it is a no-op on dev.)
+
+5. Send it:
    ```bash
    node "$CLAUDE_PROJECT_DIR/../lib/sphere-helper.mjs" send-dm \
      "<recipient-npub>" "<final-message>" \
@@ -53,7 +65,7 @@ the remote knows who is reaching out and why.
    ```
    If the helper is not found there, try `"$CLAUDE_PROJECT_DIR/lib/sphere-helper.mjs"`.
 
-5. Confirm to the caller:
+6. Confirm to the caller:
    ```
    Sent to <name-or-npub-short>. (first-contact intro included / continuing thread)
    ```

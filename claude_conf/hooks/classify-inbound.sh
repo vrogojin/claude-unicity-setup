@@ -33,8 +33,10 @@ REGISTRY="$HOOK_DIR/agent-registry.sh"
 STATE_FILE="$STATE_DIR/agent-messages.json"
 PENDING_FILE="$STATE_DIR/agent-authz-pending.json"
 WORKITEMS_DIR="$STATE_DIR/agent-workitems"
+QUARANTINE_DIR="$STATE_DIR/agent-quarantine"
+SIF_GUARD="$HOOK_DIR/sif-guard.sh"
 LOCK="$STATE_FILE.classify.lock"
-mkdir -p "$WORKITEMS_DIR" 2>/dev/null || true
+mkdir -p "$WORKITEMS_DIR" "$QUARANTINE_DIR" 2>/dev/null || true
 
 # --- Resolve owner identity (to keep owner messages out of the agent pipeline) ---
 CONFIG_FILE="${CLAUDE_PROJECT_DIR:-}"
@@ -82,6 +84,25 @@ enqueue_workitem() {  # args: from ts body type group name npub caps_json [skill
        unicityName:$name, capabilities:$caps, requestedSkill:$skill, type:$type,
        group:$group, body:$body, receivedAt:$ts, classifiedAt:$now}' > "$wf.tmp.$$" 2>/dev/null \
      && mv "$wf.tmp.$$" "$wf" 2>/dev/null || rm -f "$wf.tmp.$$" 2>/dev/null || true
+}
+
+# Quarantine an authorized message the content-guard (SIF) flagged: it is NOT dispatched.
+# Recorded for owner review; deterministic id ⇒ no duplicates.
+quarantine_message() {  # args: from ts body type group name npub sif_verdict_json
+  local from="$1" ts="$2" body="$3" type="$4" group="$5" name="$6" npub="$7" sif="$8"
+  local id qf
+  id="$(printf '%s|%s|%s' "$from" "$ts" "$body" | sha1sum 2>/dev/null | cut -c1-16)"
+  [ -n "$id" ] || return 0
+  qf="$QUARANTINE_DIR/$id.json"
+  [ -f "$qf" ] && return 0
+  echo "$sif" | jq -e . >/dev/null 2>&1 || sif='{}'
+  jq -nc --arg id "$id" --arg from "$from" --arg npub "$npub" --arg name "$name" \
+     --arg type "$type" --arg group "$group" --arg body "$body" --arg ts "$ts" \
+     --argjson sif "$sif" --arg now "$(now_iso)" \
+     '{id:$id, status:"quarantined", from_pubkey:$from, did:("did:nostr:"+$from), npub:$npub,
+       unicityName:$name, type:$type, group:$group, body:$body, receivedAt:$ts,
+       quarantinedAt:$now, sif:$sif}' > "$qf.tmp.$$" 2>/dev/null \
+     && mv "$qf.tmp.$$" "$qf" 2>/dev/null || rm -f "$qf.tmp.$$" 2>/dev/null || true
 }
 
 # Nothing to scan yet — still refresh the surface (reflects registry edits) and exit.
@@ -147,9 +168,25 @@ while [ "$i" -lt "$TOTAL" ]; do
         NAME="$(echo "$ENTRY" | jq -r '.unicityName // ""')"
         NPUB="$(echo "$ENTRY" | jq -r '.npub // ""')"
         CAPS="$(echo "$ENTRY" | jq -c '.capabilities // []')"
-        AUTHZJSON="$(jq -nc --arg name "$NAME" --argjson caps "$CAPS" --arg skill "$REQ_SKILL" \
-          '{role:"agent", status:"authorized", unicityName:$name, capabilities:$caps, requestedSkill:$skill, classified:true}')"
-        enqueue_workitem "$FROM" "$TS" "$DISPLAY_BODY" "$TYPE" "$GROUP" "$NAME" "$NPUB" "$CAPS" "$REQ_SKILL"
+        # Content-guard (SIF) BEFORE dispatch — mirror the concierge backend's fail-closed
+        # ingestion guard. A flagged (or fail-closed guard-error) body is QUARANTINED and
+        # never dispatched; a clean body is queued for the capability-scoped processor.
+        SIF_Q=0
+        if [ -f "$SIF_GUARD" ]; then
+          # NB: sif-guard exits 10 on quarantine (0 on pass). Capture stdout via $() —
+          # which ignores the exit code — and do NOT chain `|| echo` (a non-zero exit is
+          # the quarantine signal, not a failure, and would corrupt the captured JSON).
+          SIF_OUT="$(printf '%s' "$DISPLAY_BODY" | bash "$SIF_GUARD" check --direction inbound --principal "$FROM" --source agent-comms 2>/dev/null)"
+          [ -n "$SIF_OUT" ] || SIF_OUT='{}'
+          [ "$(echo "$SIF_OUT" | jq -r '.decision // "pass"' 2>/dev/null)" = "quarantine" ] && SIF_Q=1
+        fi
+        if [ "$SIF_Q" = "1" ]; then
+          quarantine_message "$FROM" "$TS" "$DISPLAY_BODY" "$TYPE" "$GROUP" "$NAME" "$NPUB" "$SIF_OUT"
+        else
+          enqueue_workitem "$FROM" "$TS" "$DISPLAY_BODY" "$TYPE" "$GROUP" "$NAME" "$NPUB" "$CAPS" "$REQ_SKILL"
+        fi
+        AUTHZJSON="$(jq -nc --arg name "$NAME" --argjson caps "$CAPS" --arg skill "$REQ_SKILL" --argjson q "$SIF_Q" \
+          '{role:"agent", status:"authorized", unicityName:$name, capabilities:$caps, requestedSkill:$skill, sifQuarantined:($q==1), classified:true}')"
         ;;
       denied)
         AUTHZJSON='{"role":"agent","status":"denied","classified":true}'

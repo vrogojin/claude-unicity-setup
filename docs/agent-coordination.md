@@ -241,7 +241,50 @@ matched against its granted capabilities by the capability-scoped processor.
 
 ---
 
-## 8. Security posture
+## 8. Content-guard (SIF)
+
+Agent-comms message bodies are run through the **SIF content-guard** (semantic firewall)
+the same way the concierge backend guards its agent I/O — **fail-closed by design, at
+ingestion and at egress**. It composes with the A2A direction: the guard runs on the A2A
+message payload regardless of transport.
+
+- **Inbound (ingestion):** after a message passes authz (authorized sender + granted
+  capability) and **before** it is dispatched to the capability-scoped processor,
+  `classify-inbound.sh` runs the body through `sif-guard.sh`. A **flag → quarantine**: the
+  message is NOT dispatched, a record is written to `$STATE_DIR/agent-quarantine/<id>.json`,
+  the message is stamped `sifQuarantined:true`, and the owner is surfaced the quarantine at
+  the Stop gate. Clean → queued as normal.
+- **Outbound (egress):** `/dm-agent` runs the final body through `sif-guard.sh --direction
+  outbound` before sending; a flag refuses the send.
+
+**`sif-guard.sh`** is a thin, isolated step so it is trivial to point at the real SIF once
+the key lands. It POSTs `{content, source, direction, principal}` to the configured guard
+(`POST /api/guard/check` on the concierge backend, or any SIF endpoint) and reads a flag
+liberally (`flagged` / `blocked` / `allowed:false` / `action:block` / `decision|verdict`
+matching block/deny/unsafe/malicious). Exit `0`=pass, `10`=quarantine.
+
+**Config knobs** (ENV overrides > `.claude/agent/config.json` `.sif.*` > safe defaults):
+
+| config `.sif.*` | ENV | default | meaning |
+|-----------------|-----|---------|---------|
+| `enabled` | `SIF_ENABLED` | `false` | master switch — **off = inert pass-through** (opt-in) |
+| `url` | `SIF_GUARD_URL` | — | guard endpoint, e.g. `https://concierge-dev.dyndns.org/api/guard/check` |
+| `token` | `SIF_GUARD_TOKEN` | — | Bearer token if required |
+| `required` | `SIF_REQUIRED` | `false` | strictness on **guard error**: `false`=fail-**open** (dev), `true`=fail-**closed** (prod) |
+| `host_header` | `SIF_GUARD_HOST` | — | optional `Host:` header for vhost routing |
+| `timeout_ms` | `SIF_GUARD_TIMEOUT_MS` | `4000` | request timeout |
+
+> **Fail-open vs fail-closed.** A genuine content **flag always quarantines**, regardless
+> of strictness. `required` only governs what happens on a guard **error** (endpoint
+> unreachable/keyless/misconfigured): dev defaults to fail-**open** (SIF is HELD/keyless),
+> prod sets `required:true` (or `SIF_REQUIRED=1`) for fail-**closed**. With `enabled:false`
+> (the default) the guard is a no-op, so the whole integration is inert-safe until wired.
+
+Debug the effective config with `bash .claude/hooks/sif-guard.sh config`.
+
+---
+
+## 9. Security posture
 
 - **Default-deny everywhere.** No registry entry ⇒ unknown ⇒ pending ⇒ never acted upon.
   Only `authorized` + the specific capability clears the gate.
@@ -255,10 +298,13 @@ matched against its granted capabilities by the capability-scoped processor.
   never transmitted; processors are told not to touch them.
 - **No hook auto-executes remote intent.** Hooks classify, queue, and surface — they
   never run a remote agent's requested action.
+- **Content-guarded I/O.** Authorized inbound bodies are SIF-checked before dispatch and
+  quarantined on a flag; outbound bodies are SIF-checked before send. Fail-open on dev
+  (keyless), fail-closed in prod (`sif.required`).
 
 ---
 
-## 9. Files
+## 10. Files
 
 | Path | Role |
 |------|------|
@@ -266,7 +312,8 @@ matched against its granted capabilities by the capability-scoped processor.
 | `.claude/hooks/classify-inbound.sh` | inbound authorization router (owner / authorized / pending / denied) |
 | `.claude/hooks/on-dm.sh`, `on-group-message.sh` | daemon delivery → append → classify |
 | `.claude/hooks/agent-comms-check.sh` | poll fallback → merge → classify |
-| `.claude/hooks/check-diagnostics.sh` | Stop gate: block on pending authz + queued work items |
+| `.claude/hooks/check-diagnostics.sh` | Stop gate: block on pending authz + queued work items + quarantined messages |
+| `.claude/hooks/sif-guard.sh` | content-guard (SIF) step — inbound ingestion + outbound egress; pluggable, fail-open/closed knob |
 | `.claude/skills/authorize-agent/` | `/authorize-agent` — grant capabilities |
 | `.claude/skills/deny-agent/` | `/deny-agent` — refuse an agent |
 | `.claude/skills/list-agents/` | `/list-agents` — view the registry |
@@ -277,4 +324,5 @@ matched against its granted capabilities by the capability-scoped processor.
 
 **Runtime state** (per-repo `$STATE_DIR`, default `/tmp/claude/<repo-hash>/`):
 `agent-messages.json` (messages + `.authz` stamps), `agent-authz-pending.json`
-(owner-facing pending surface), `agent-workitems/<id>.json` (authorized request queue).
+(owner-facing pending surface), `agent-workitems/<id>.json` (authorized request queue),
+`agent-quarantine/<id>.json` (SIF-quarantined messages awaiting owner review).

@@ -262,7 +262,10 @@ is routed by `classify-inbound.sh` against an **authorized-agents registry**
 
 Capabilities are an explicit enum: `read-status`, `chat`, `dev-advice`,
 `rebuild-reload-service`, `review-merge-pr` (the last two are request-only — they still
-need your confirmation to execute). Full model: **`docs/agent-coordination.md`**.
+need your confirmation to execute). Inbound (pre-dispatch) and outbound (`/dm-agent`)
+message bodies are also run through the **SIF content-guard** (`sif-guard.sh`) — flagged
+inbound is quarantined for your review, flagged outbound is not sent; off by default,
+fail-open on dev / fail-closed in prod. Full model: **`docs/agent-coordination.md`**.
 
 ### Configuration Files
 
@@ -270,13 +273,15 @@ need your confirmation to execute). Full model: **`docs/agent-coordination.md`**
 - `.claude/agent/config.json` — Owner npub, group ID, notification URL, dep tracking settings
 - `.claude/agent/daemon.json` — Relay URLs, subscriptions, hook paths for the sphere-sdk daemon
 - `.claude/agent/agent-registry.json` — Authorized-agents registry (gitignored, self-initializing, **default-deny**). Template: `agent-registry.example.json`.
+- `.claude/agent/config.json` `.sif` block — content-guard config: `{enabled, url, token, required, host_header, timeout_ms}` (ENV `SIF_ENABLED`/`SIF_GUARD_URL`/`SIF_GUARD_TOKEN`/`SIF_REQUIRED` override). Off by default; `required:true` = fail-closed (prod).
 
 ### Stop Gate
 
 **You will be blocked from stopping** if: there are unread priority messages from your
 owner (run `/check-messages`); an unknown agent is **awaiting your authorization** (run
-`/authorize-agent` or `/deny-agent`); or authorized agent requests are **queued for
-dispatch** (run `/process-agent-requests`).
+`/authorize-agent` or `/deny-agent`); authorized agent requests are **queued for
+dispatch** (run `/process-agent-requests`); or agent messages were **quarantined by the
+content-guard** and need review.
 
 ### Escape Hatch
 
