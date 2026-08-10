@@ -68,8 +68,8 @@ rebuild_pending_surface() {
 }
 
 # Enqueue a work item for an authorized sender (deterministic id ⇒ no duplicates).
-enqueue_workitem() {  # args: from ts body type group name npub caps_json
-  local from="$1" ts="$2" body="$3" type="$4" group="$5" name="$6" npub="$7" caps="$8"
+enqueue_workitem() {  # args: from ts body type group name npub caps_json [skill]
+  local from="$1" ts="$2" body="$3" type="$4" group="$5" name="$6" npub="$7" caps="$8" skill="${9:-}"
   local id wf
   id="$(printf '%s|%s|%s' "$from" "$ts" "$body" | sha1sum 2>/dev/null | cut -c1-16)"
   [ -n "$id" ] || return 0
@@ -77,10 +77,10 @@ enqueue_workitem() {  # args: from ts body type group name npub caps_json
   [ -f "$wf" ] && return 0   # already queued (or already processed & left in place)
   jq -nc --arg id "$id" --arg from "$from" --arg npub "$npub" --arg name "$name" \
      --argjson caps "$caps" --arg type "$type" --arg group "$group" \
-     --arg body "$body" --arg ts "$ts" --arg now "$(now_iso)" \
-     '{id:$id, status:"queued", from_pubkey:$from, npub:$npub, unicityName:$name,
-       capabilities:$caps, type:$type, group:$group, body:$body,
-       receivedAt:$ts, classifiedAt:$now}' > "$wf.tmp.$$" 2>/dev/null \
+     --arg body "$body" --arg ts "$ts" --arg skill "$skill" --arg now "$(now_iso)" \
+     '{id:$id, status:"queued", from_pubkey:$from, did:("did:nostr:"+$from), npub:$npub,
+       unicityName:$name, capabilities:$caps, requestedSkill:$skill, type:$type,
+       group:$group, body:$body, receivedAt:$ts, classifiedAt:$now}' > "$wf.tmp.$$" 2>/dev/null \
      && mv "$wf.tmp.$$" "$wf" 2>/dev/null || rm -f "$wf.tmp.$$" 2>/dev/null || true
 }
 
@@ -114,6 +114,23 @@ while [ "$i" -lt "$TOTAL" ]; do
   GROUP="$(echo "$MSG" | jq -r '.group.name // ""')"
   PRI="$(echo "$MSG" | jq -r '.priority // false')"
 
+  # --- Optional A2A-over-Nostr envelope --------------------------------------
+  # The interop direction is A2A schema carried over Nostr. If the body is a JSON
+  # object, leniently pull a CLAIMED agent name, a requested skill (→ maps onto our
+  # capability enum), and a human-readable message. Plain-text bodies fall through.
+  # The claimed name is display/intent only — NEVER an identity (that is the pubkey).
+  CLAIMED_NAME="$FROMNAME"
+  REQ_SKILL=""
+  DISPLAY_BODY="$BODY"
+  if echo "$BODY" | jq -e 'type=="object"' >/dev/null 2>&1; then
+    ENV_NAME="$(echo "$BODY" | jq -r '(.from // .agentCard.name // .agent.name // .name // "") | tostring' 2>/dev/null)"
+    REQ_SKILL="$(echo "$BODY" | jq -r '(.skill // .capability // .skillId // .method // "") | tostring' 2>/dev/null)"
+    ENV_MSG="$(echo "$BODY" | jq -r '(.message.text // .message // .task.text // .task // .text // "") | if type=="object" then tojson else tostring end' 2>/dev/null)"
+    [ "$REQ_SKILL" = "null" ] && REQ_SKILL=""
+    { [ -z "$CLAIMED_NAME" ] && [ -n "$ENV_NAME" ] && [ "$ENV_NAME" != "null" ]; } && CLAIMED_NAME="$ENV_NAME"
+    { [ -n "$ENV_MSG" ] && [ "$ENV_MSG" != "null" ]; } && DISPLAY_BODY="$ENV_MSG"
+  fi
+
   AUTHZJSON=""
 
   # --- Owner: never enters the agent-authorization pipeline ---
@@ -130,19 +147,31 @@ while [ "$i" -lt "$TOTAL" ]; do
         NAME="$(echo "$ENTRY" | jq -r '.unicityName // ""')"
         NPUB="$(echo "$ENTRY" | jq -r '.npub // ""')"
         CAPS="$(echo "$ENTRY" | jq -c '.capabilities // []')"
-        AUTHZJSON="$(jq -nc --arg name "$NAME" --argjson caps "$CAPS" \
-          '{role:"agent", status:"authorized", unicityName:$name, capabilities:$caps, classified:true}')"
-        enqueue_workitem "$FROM" "$TS" "$BODY" "$TYPE" "$GROUP" "$NAME" "$NPUB" "$CAPS"
+        AUTHZJSON="$(jq -nc --arg name "$NAME" --argjson caps "$CAPS" --arg skill "$REQ_SKILL" \
+          '{role:"agent", status:"authorized", unicityName:$name, capabilities:$caps, requestedSkill:$skill, classified:true}')"
+        enqueue_workitem "$FROM" "$TS" "$DISPLAY_BODY" "$TYPE" "$GROUP" "$NAME" "$NPUB" "$CAPS" "$REQ_SKILL"
         ;;
       denied)
         AUTHZJSON='{"role":"agent","status":"denied","classified":true}'
         ;;
       *)  # pending | unknown | peer → queue for owner authorization, act on nothing
-        bash "$REGISTRY" upsert-pending --pubkey "$FROM" --name "$FROMNAME" \
-          --intro "$BODY" --type "$TYPE" --group "$GROUP" >/dev/null 2>&1 || true
+        # Impersonation guard: a message CLAIMING a name already tied to a DIFFERENT
+        # pubkey is a possible impersonation. We surface the discrepancy to the owner and
+        # keep it pending — the claimed name never grants anything; only the pubkey does.
+        SUSPECT=""
+        if [ -n "$CLAIMED_NAME" ]; then
+          SUSPECT="$(bash "$REGISTRY" find-name "$CLAIMED_NAME" 2>/dev/null \
+            | jq -r --arg me "$FROM" '[ .[] | select(.pubkey != $me) ] | (first.pubkey // "")' 2>/dev/null || echo "")"
+        fi
+        EXTRA=()
+        [ -n "$REQ_SKILL" ] && EXTRA+=(--skill "$REQ_SKILL")
+        [ -n "$SUSPECT" ] && EXTRA+=(--suspect-of "$SUSPECT")
+        bash "$REGISTRY" upsert-pending --pubkey "$FROM" --name "$CLAIMED_NAME" \
+          --intro "$DISPLAY_BODY" --type "$TYPE" --group "$GROUP" \
+          ${EXTRA[@]+"${EXTRA[@]}"} >/dev/null 2>&1 || true
         NAME2="$(bash "$REGISTRY" get "$FROM" 2>/dev/null | jq -r '.unicityName // ""' 2>/dev/null || echo "")"
-        AUTHZJSON="$(jq -nc --arg name "$NAME2" \
-          '{role:"agent", status:"pending", unicityName:$name, classified:true}')"
+        AUTHZJSON="$(jq -nc --arg name "$NAME2" --arg suspect "$SUSPECT" \
+          '{role:"agent", status:"pending", unicityName:$name, impersonationSuspect:($suspect!=""), classified:true}')"
         ;;
     esac
   fi

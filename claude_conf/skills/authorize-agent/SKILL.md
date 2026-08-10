@@ -50,6 +50,10 @@ Run `bash "$CLAUDE_PROJECT_DIR/.claude/hooks/agent-registry.sh" caps` for the li
    If it prints `ERR: no registry entry matches …`, the agent has not contacted us (or
    the name is wrong) — do NOT invent an entry; ask the caller for the exact npub.
    If it prints `ERR:unknown-capability:<x>`, re-prompt with valid capabilities.
+   If it prints `ERR: '<name>' is ambiguous … possible impersonation`, the name is
+   claimed by more than one pubkey — **do not guess**. Run `/list-agents` to show the
+   competing pubkeys (one may be flagged `impersonationSuspect`), confirm with the caller
+   which pubkey is genuine (verify out-of-band), and authorize by that exact pubkey/npub.
 
 3. On success it echoes the updated entry. Confirm to the caller:
    ```

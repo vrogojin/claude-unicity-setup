@@ -94,6 +94,10 @@ _ar_read() {  # _ar_read [jq-opts...] <jq-filter>  — filter is the LAST argume
 # --- Lookup: resolve a free-form query → the pubkey KEY of the matching entry ----
 # Matches (in order): exact key, exact npub, exact unicityName (case-insensitive),
 # unique short hex-prefix. Prints the key on stdout, or nothing (exit 1) if no/ambiguous.
+# Prints the resolved pubkey key, or the sentinel "__AMBIGUOUS__" when a NAME (or hex
+# prefix) matches more than one distinct pubkey — so name-based authorize/deny refuses
+# rather than acting on the wrong (possibly impersonating) key. Exact key/npub always win
+# and are unique.
 _ar_resolve_key() {
   local q="$1"
   [ -n "$q" ] || return 1
@@ -103,12 +107,20 @@ _ar_resolve_key() {
     | ($q | ascii_downcase) as $ql
     | ( [ $a | keys[] | select(. == $q) ]
         + [ $a | to_entries[] | select(.value.npub == $q) | .key ]
-        + [ $a | to_entries[] | select((.value.unicityName // "" | ascii_downcase) == $ql) | .key ]
-      ) as $exact
-    | if ($exact | length) > 0 then ($exact | first)
+      ) as $idmatch
+    | if ($idmatch | length) > 0 then ($idmatch | first)
       else
-        ( [ $a | keys[] | select(startswith($q)) ] ) as $pre
-        | if ($pre | length) == 1 then ($pre | first) else empty end
+        ( [ $a | to_entries[]
+            | select((.value.unicityName // "" | ascii_downcase) == $ql and $ql != "") | .key ]
+          | unique ) as $named
+        | if   ($named | length) == 1 then $named[0]
+          elif ($named | length) >  1 then "__AMBIGUOUS__"
+          else
+            ( [ $a | keys[] | select(startswith($q)) ] | unique ) as $pre
+            | if   ($pre | length) == 1 then $pre[0]
+              elif ($pre | length) >  1 then "__AMBIGUOUS__"
+              else empty end
+          end
       end
   ' "$AGENT_REGISTRY_FILE" 2>/dev/null | head -1
 }
@@ -117,14 +129,14 @@ _ar_resolve_key() {
 # registry_status <query> : echoes authorized|pending|denied|unknown
 registry_status() {
   local key; key="$(_ar_resolve_key "$1")"
-  if [ -z "$key" ]; then echo "unknown"; return 0; fi
+  if [ -z "$key" ] || [ "$key" = "__AMBIGUOUS__" ]; then echo "unknown"; return 0; fi
   _ar_read -r --arg k "$key" '.agents[$k].status // "unknown"'
 }
 
 # registry_has_cap <query> <capability> : exit 0 iff authorized AND cap granted
 registry_has_cap() {
   local key; key="$(_ar_resolve_key "$1")"
-  [ -n "$key" ] || return 1
+  [ -n "$key" ] && [ "$key" != "__AMBIGUOUS__" ] || return 1
   local ok
   ok="$(_ar_read -r --arg k "$key" --arg c "$2" \
     '(.agents[$k] | select(.status=="authorized") | .capabilities // [] | index($c)) // empty')"
@@ -160,6 +172,7 @@ _ar_cli() {
 
     get)
       local key; key="$(_ar_resolve_key "${1:-}")"
+      [ "$key" = "__AMBIGUOUS__" ] && { echo "ERR: '${1:-}' is ambiguous (matches multiple pubkeys) — pass the exact pubkey or npub" >&2; echo '{}'; return 1; }
       [ -n "$key" ] || { echo '{}'; return 1; }
       _ar_read --arg k "$key" '.agents[$k]'
       ;;
@@ -181,24 +194,40 @@ _ar_cli() {
           | { name: (.value.unicityName // ""), status: .value.status,
               capabilities: (.value.capabilities // []),
               npub: (.value.npub // ""), pubkey: .key,
+              did: ("did:nostr:" + .key),
               intro: (.value.intro // ""), firstContact: (.value.firstContact // ""),
+              requestedSkill: (.value.requestedSkill // ""),
+              impersonationSuspect: (.value.impersonationSuspect // false),
+              impersonationOf: (.value.impersonationOf // ""),
               firstSeen: .value.firstSeen, lastSeen: (.value.lastSeen // ""),
               note: (.value.note // "") } ]'
+      ;;
+
+    # find-name <name> → JSON array of {pubkey,status,npub} whose claimed name matches
+    # (case-insensitive). Used to detect a name claimed by a DIFFERENT pubkey.
+    find-name)
+      _ar_read --arg n "${1:-}" '
+        ($n | ascii_downcase) as $nl
+        | [ .agents | to_entries[]
+            | select((.value.unicityName // "" | ascii_downcase) == $nl and $nl != "")
+            | { pubkey: .key, status: .value.status, npub: (.value.npub // "") } ]'
       ;;
 
     upsert-pending)
       # Create a pending entry for an unknown sender, or refresh lastSeen on an
       # existing one. NEVER changes an authorized/denied status (idempotent, safe
       # to call on every inbound message).
-      local pubkey="" npub="" name="" intro="" mtype="" group=""
+      local pubkey="" npub="" name="" intro="" mtype="" group="" suspect="" skill=""
       while [ $# -gt 0 ]; do
         case "$1" in
-          --pubkey) pubkey="${2:-}"; shift 2;;
-          --npub)   npub="${2:-}"; shift 2;;
-          --name)   name="${2:-}"; shift 2;;
-          --intro)  intro="${2:-}"; shift 2;;
-          --type)   mtype="${2:-}"; shift 2;;
-          --group)  group="${2:-}"; shift 2;;
+          --pubkey)     pubkey="${2:-}"; shift 2;;
+          --npub)       npub="${2:-}"; shift 2;;
+          --name)       name="${2:-}"; shift 2;;
+          --intro)      intro="${2:-}"; shift 2;;
+          --type)       mtype="${2:-}"; shift 2;;
+          --group)      group="${2:-}"; shift 2;;
+          --suspect-of) suspect="${2:-}"; shift 2;;   # pubkey this sender may be impersonating
+          --skill)      skill="${2:-}"; shift 2;;      # A2A skill/capability the sender asked for
           *) shift;;
         esac
       done
@@ -216,9 +245,12 @@ _ar_cli() {
             | (if (.unicityName // "") == "" then .unicityName = $name else . end)
             | (if (.intro // "")  == "" then .intro = $intro else . end)
             | (if (.status // "pending") == "pending" then .status = "pending" else . end)
+            | (if $skill   != "" then .requestedSkill = $skill else . end)
+            | (if $suspect != "" then (.impersonationSuspect = true | .impersonationOf = $suspect) else . end)
           )
       ' --arg k "$pubkey" --arg npub "$npub" --arg name "$name" \
-        --arg intro "$intro" --arg mtype "$mtype" --arg now "$(_ar_now)" \
+        --arg intro "$intro" --arg mtype "$mtype" --arg suspect "$suspect" --arg skill "$skill" \
+        --arg now "$(_ar_now)" \
         && registry_status "$pubkey"
       ;;
 
@@ -228,6 +260,7 @@ _ar_cli() {
       if [ $# -gt 0 ] && [ "${1:-}" != "--note" ]; then caps="$1"; shift || true; fi
       [ "${1:-}" = "--note" ] && { note="${2:-}"; shift 2 || true; }
       local key; key="$(_ar_resolve_key "$q")"
+      [ "$key" = "__AMBIGUOUS__" ] && { echo "ERR: '$q' is ambiguous (matches multiple pubkeys — possible impersonation) — authorize by the exact pubkey or npub, not the name" >&2; return 1; }
       [ -n "$key" ] || { echo "ERR: no registry entry matches '$q' (must have made contact first, or pass its exact pubkey/npub)" >&2; return 1; }
       local vcaps; vcaps="$(_ar_validate_caps "$caps")" || return 1
       # shellcheck disable=SC2206
@@ -247,6 +280,7 @@ _ar_cli() {
       local note=""
       [ "${1:-}" = "--note" ] && { note="${2:-}"; shift 2 || true; }
       local key; key="$(_ar_resolve_key "$q")"
+      [ "$key" = "__AMBIGUOUS__" ] && { echo "ERR: '$q' is ambiguous (matches multiple pubkeys) — deny by the exact pubkey or npub" >&2; return 1; }
       [ -n "$key" ] || { echo "ERR: no registry entry matches '$q'" >&2; return 1; }
       _ar_write '
         .updated_at=$now
@@ -260,6 +294,7 @@ _ar_cli() {
 
     set-name)  # set-name <query> <name>  (label a peer, e.g. before outbound first-contact)
       local key; key="$(_ar_resolve_key "${1:-}")"
+      [ "$key" = "__AMBIGUOUS__" ] && { echo "ERR: '${1:-}' is ambiguous — pass the exact pubkey or npub" >&2; return 1; }
       [ -n "$key" ] || { echo "ERR: no match for '${1:-}'" >&2; return 1; }
       _ar_write '.updated_at=$now | .agents[$k].unicityName=$name' \
         --arg k "$key" --arg name "${2:-}" --arg now "$(_ar_now)"

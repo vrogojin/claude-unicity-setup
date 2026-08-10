@@ -30,7 +30,17 @@ sphere-sdk daemon (`on-dm.sh` / `on-group-message.sh`) or the poll fallback
 remote cannot spoof — the encrypted DM is signed by it. A `unicityName` is a *claimed*
 label (taken from the sender's own intro text, or assigned by the owner) and is **never**
 the security boundary. A lookup may use a name, an npub, a pubkey, or a short hex prefix,
-but authorization is always recorded against the pubkey.
+but authorization is always recorded against the pubkey. The canonical identifier maps
+cleanly to a DID: **Unicity name → npub → `did:nostr:<pubkey>`** (and, later, a signed
+Agent Card).
+
+**Impersonation guard.** Because the claimed name is not identity, a message that claims
+a name already tied to a **different** pubkey is treated as **unknown/pending** and the
+discrepancy is surfaced to the owner (`impersonationSuspect` + `impersonationOf` in the
+registry, and a prominent ⚠ warning in the Stop gate). The claimed name grants nothing;
+only the signing pubkey does. Correspondingly, `/authorize-agent` and `/deny-agent`
+**refuse an ambiguous name** (one that matches multiple pubkeys) and require the exact
+pubkey/npub — so the owner can never accidentally authorize the impersonator.
 
 > **Contract note.** The daemon delivers the sender's **pubkey**, not a resolved
 > unicity name (`from_name` is only filled in for the owner), and `resolve-nametag` in
@@ -66,11 +76,16 @@ tree is already gitignored in a deployed project. Template:
       "decidedAt": "<ISO>",                  // when the owner authorized/denied
       "intro": "their first-contact self-description",
       "firstContact": "dm|group",
+      "requestedSkill": "read-status",       // A2A skill they asked for (→ capability)
+      "impersonationSuspect": false,         // true if the claimed name is tied to another pubkey
+      "impersonationOf": "<pubkey-hex>",     // the pubkey that legitimately holds that name
       "note": "free text"
     }
   }
 }
 ```
+
+The derived DID for any entry is `did:nostr:<pubkey>` (surfaced in `list`/work items).
 
 **Status semantics** (default-deny):
 
@@ -204,7 +219,29 @@ work item it:
 
 ---
 
-## 7. Security posture
+## 7. Interop: A2A-over-Nostr envelope
+
+The chosen interop direction is the **A2A (Agent2Agent) schema carried over our Nostr
+transport** ("A2A-over-Nostr"), keeping MCP for tool/context. The classifier is
+envelope-aware **leniently and without a bespoke schema**: if an inbound body is a JSON
+object it extracts, best-effort, a claimed agent name, a requested skill, and a
+human-readable message; plain-text bodies just fall through as the intro. Mapping:
+
+| A2A concept | Field(s) read | Used for |
+|-------------|---------------|----------|
+| agent identity | signing **pubkey** (never the payload) → `did:nostr:<pubkey>` | the registry key |
+| agent card name | `from` / `agentCard.name` / `agent.name` / `name` | *claimed* `unicityName` (display only; impersonation-checked) |
+| skill / capability | `skill` / `capability` / `skillId` / `method` | `requestedSkill` → mapped onto our capability enum at the gate |
+| message / task | `message.text` / `message` / `task.text` / `task` / `text` | the human-readable intro / work-item body |
+
+This keeps the envelope future-proof: when the full A2A binding + signed Agent Cards
+land, the same fields carry more structure without reworking the authorization model.
+The **skill→capability gate** is the join point — an authorized peer's requested skill is
+matched against its granted capabilities by the capability-scoped processor.
+
+---
+
+## 8. Security posture
 
 - **Default-deny everywhere.** No registry entry ⇒ unknown ⇒ pending ⇒ never acted upon.
   Only `authorized` + the specific capability clears the gate.
@@ -221,7 +258,7 @@ work item it:
 
 ---
 
-## 8. Files
+## 9. Files
 
 | Path | Role |
 |------|------|

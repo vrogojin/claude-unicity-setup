@@ -42,6 +42,10 @@ here.
      ```bash
      bash "$CLAUDE_PROJECT_DIR/.claude/hooks/agent-registry.sh" get "<from_pubkey>" | jq -c '.capabilities'
      ```
+   - If the work item carries a `requestedSkill` (from the A2A envelope), it must be one
+     of the granted capabilities — that is the **skill→capability gate**. If the
+     requested skill is not granted, skip the item with a refusal naming the missing
+     capability (do not silently widen scope).
 
 3. Spawn a capability-scoped processor with the Agent tool (`subagent_type: general-purpose`).
    Use a prompt built from this template, substituting the real values. The processor

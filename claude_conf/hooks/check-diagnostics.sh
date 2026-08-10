@@ -139,6 +139,12 @@ if [ -f "$AUTHZ_PENDING" ]; then
       "  • " + (if (.name // "") != "" then .name else (.pubkey[0:12] + "…") end)
       + " (" + (.firstContact // "?") + " · pubkey " + (.pubkey[0:16]) + "…)\n"
       + "    says: \"" + ((.intro // "") | gsub("[\n\r]";" ") | .[0:200]) + "\""
+      + (if (.requestedSkill // "") != "" then "\n    requested skill: " + .requestedSkill else "" end)
+      + (if (.impersonationSuspect // false)
+         then "\n    ⚠ IMPERSONATION RISK: claims the name \"" + (.name // "")
+              + "\" which is already tied to a DIFFERENT pubkey (" + ((.impersonationOf // "")[0:16])
+              + "…). The signing pubkey is the real identity — verify out-of-band before authorizing."
+         else "" end)
     ' "$AUTHZ_PENDING" 2>/dev/null)
     AUTHZ_MSG="${PCOUNT} unknown agent(s) are requesting to coordinate and need your authorization decision:\n${DETAILS}\n\nAuthorize:  /authorize-agent <name-or-npub> <cap,cap,...>\nDeny:       /deny-agent <name-or-npub>\nCapabilities: ${CAPS_LIST}\nNothing from these agents is acted upon until you decide."
     jq -n --arg reason "$AUTHZ_MSG" '{"decision":"block","reason":$reason}'
