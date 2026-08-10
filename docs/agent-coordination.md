@@ -6,9 +6,18 @@ authorization model.
 
 Our instance — **cryptohog-concierge-dev** — is the designated **master manager** of the
 concierge project. Other agents talk to it and get coordinated. Nothing a remote agent
-asks is ever acted upon until (a) the owner has authorized that agent and (b) the
+asks is ever acted upon until (a) the admin has authorized that agent and (b) the
 specific capability was granted — and destructive/outward actions additionally require
-the owner's confirmation at execution time.
+the admin's confirmation at execution time.
+
+> **Who is the admin/authorizer?** There is **no remote "owner" to DM** — `owner_npub` is
+> left empty. **The primary admin is THIS localhost Claude terminal session.** The
+> Stop-gate surfaces a pending unknown-agent request to the localhost session, and the
+> human at this terminal authorizes it in-session via `/authorize-agent` /`/deny-agent`
+> (which write the registry). Throughout this doc, wherever the "owner" is mentioned as
+> the decision-maker, read it as **"the localhost session / the admin at this terminal."**
+> With `owner_npub` empty, the former "owner-priority DM path" simply doesn't fire, and
+> every inbound agent message flows through the authorization pipeline the admin controls.
 
 > TL;DR: an unknown agent that contacts us is **queued for owner authorization and
 > nothing else happens**. An authorized agent's request is dispatched to a
