@@ -21,6 +21,11 @@ Custom slash commands for managing parallel agent workflows across the Unicity e
 | `/authorize-agent <name-or-npub> <caps>` | Authorize a remote agent + grant capabilities |
 | `/deny-agent <name-or-npub>` | Deny a remote agent (its messages are dropped) |
 | `/process-agent-requests` | Dispatch queued authorized requests to capability-scoped processors |
+| `/team-form <goal> <member-npubs…>` | Found a goal-scoped team + invite peers (Contract-Net coordinator) |
+| `/team-work [teamId]` | Run the team loop — auction/award/bid/execute/review; drains team events |
+| `/team-status [teamId]` | Render team ledgers, coordinator lease/epoch, invitations, knowledge cards |
+| `/team-publish [teamId] <fact>` | Distill + broadcast a knowledge card to the team |
+| `/team-dissolve <teamId>` | Retire a team with a retrospective |
 
 ## Usage
 
@@ -120,8 +125,13 @@ Systematically reviews work against task file, runs verification, and prepares m
 │   └── SKILL.md           # /authorize-agent command
 ├── deny-agent/
 │   └── SKILL.md           # /deny-agent command
-└── process-agent-requests/
-    └── SKILL.md           # /process-agent-requests — capability-scoped dispatch
+├── process-agent-requests/
+│   └── SKILL.md           # /process-agent-requests — capability-scoped dispatch
+├── team-form/            # /team-form — found a team + invite peers (Contract-Net)
+├── team-work/            # /team-work — run the team loop (auction/award/bid/execute/review)
+├── team-status/          # /team-status — render team ledgers + lease/epoch + knowledge
+├── team-publish/         # /team-publish — distill + broadcast a knowledge card
+└── team-dissolve/        # /team-dissolve — retire a team with a retrospective
 ```
 
 ## Agent Coordination Skills

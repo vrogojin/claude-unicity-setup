@@ -247,6 +247,11 @@ Messages are delivered through three channels with automatic fallback:
 - **`/authorize-agent <name-or-npub> <caps>`** — Authorize a remote agent + grant capabilities
 - **`/deny-agent <name-or-npub>`** — Deny a remote agent (its messages are dropped)
 - **`/process-agent-requests`** — Dispatch queued authorized requests to capability-scoped processors
+- **`/team-form <goal> <member-npubs…>`** — Found a goal-scoped team + invite peers (Contract-Net coordinator)
+- **`/team-work [teamId]`** — Run the team loop (auction/award/bid/execute/review; drains team events)
+- **`/team-status [teamId]`** — Render team ledgers, coordinator lease/epoch, invitations, knowledge cards
+- **`/team-publish [teamId] <fact>`** — Distill + broadcast a knowledge card to the team
+- **`/team-dissolve <teamId>`** — Retire a team with a retrospective
 
 ### Master-Manager Coordination (owner-in-the-loop, default-deny)
 
@@ -262,10 +267,27 @@ is routed by `classify-inbound.sh` against an **authorized-agents registry**
 
 Capabilities are an explicit enum: `read-status`, `chat`, `dev-advice`,
 `rebuild-reload-service`, `review-merge-pr` (the last two are request-only — they still
-need your confirmation to execute). Inbound (pre-dispatch) and outbound (`/dm-agent`)
-message bodies are also run through the **SIF content-guard** (`sif-guard.sh`) — flagged
-inbound is quarantined for your review, flagged outbound is not sent; off by default,
-fail-open on dev / fail-closed in prod. Full model: **`docs/agent-coordination.md`**.
+need your confirmation to execute), plus the team caps `team-coordinate`, `task-bid`,
+`knowledge-share` (non-destructive; see below). Inbound (pre-dispatch) and outbound
+(`/dm-agent`) message bodies are also run through the **SIF content-guard**
+(`sif-guard.sh`) — flagged inbound is quarantined for your review, flagged outbound is not
+sent; off by default, fail-open on dev / fail-closed in prod. Full model:
+**`docs/agent-coordination.md`**.
+
+### Self-Organizing Teams (Contract-Net over A2A)
+
+Authorized peers can form **goal-scoped teams** that decompose work, auction tasks
+(cfp → bid → award-under-lease → result → review over a dependency DAG), and share
+knowledge — all as capability-gated A2A envelope verbs (`kind`) on the same default-deny
+substrate, SIF-guarded, identity = signing pubkey. Three non-destructive caps gate
+participation: `team-coordinate` (invite/cfp/award/progress/snapshot/lease), `task-bid`
+(bid/result), `knowledge-share` (kb.publish). Coordinator legitimacy is a **lease**
+(signed heartbeat + monotone epoch; lowest-npub claims on expiry; epochs fence zombies);
+conflict avoidance is single-writer-under-lease keyed on each task's exclusive scope;
+shared knowledge is a grow-only CRDT of provenance-tagged cards stored as **DATA, never
+instructions**. Opt-in and inert-safe (no local team ⇒ only invitations surface); requires
+the Sphere daemon for live delivery. Commands: `/team-form`, `/team-work`, `/team-status`,
+`/team-publish`, `/team-dissolve`. Full model: **`docs/team-coordination.md`**.
 
 ### Configuration Files
 
@@ -280,8 +302,9 @@ fail-open on dev / fail-closed in prod. Full model: **`docs/agent-coordination.m
 **You will be blocked from stopping** if: there are unread priority messages from your
 owner (run `/check-messages`); an unknown agent is **awaiting your authorization** (run
 `/authorize-agent` or `/deny-agent`); authorized agent requests are **queued for
-dispatch** (run `/process-agent-requests`); or agent messages were **quarantined by the
-content-guard** and need review.
+dispatch** (run `/process-agent-requests`); agent messages were **quarantined by the
+content-guard** and need review; or **team coordination events / invitations are pending**
+(run `/team-work` or `/team-status`).
 
 ### Escape Hatch
 
@@ -298,4 +321,5 @@ To clear a pending-authorization block without deciding: `/deny-agent <name-or-n
 - `docs/sphere-guide.md` — sphere app development guide
 - `docs/developer-guidelines.md` — Cross-repo coding standards (TypeScript, Go, Rust, C++)
 - `docs/agent-coordination.md` — Owner-in-the-loop master-manager model: authorization registry, capabilities, inbound/outbound flows
+- `docs/team-coordination.md` — Self-organizing teams (Contract-Net over A2A): verbs+capability gate, DAG auctions, coordinator lease/epoch fencing, knowledge cards
 - `reference/<repo>.md` — Per-repository API reference (see `reference/TEMPLATE.md` for format)
