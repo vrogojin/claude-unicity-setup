@@ -123,10 +123,19 @@ An explicit, extensible enum (defined in `agent-registry.sh`, `caps` subcommand)
 | `dev-advice` | receive development/design guidance | read |
 | `rebuild-reload-service` | request a service rebuild/reload | **destructive** |
 | `review-merge-pr` | request a PR review/merge | **outward** |
+| `team-coordinate` | participate in team coordination (invite/cfp/award/progress/snapshot/lease) | team |
+| `task-bid` | bid on and deliver team tasks (bid/result) | team |
+| `knowledge-share` | publish/receive team knowledge cards (kb.publish) | team |
 
 Destructive/outward capabilities (`AGENT_CAPS_DESTRUCTIVE`) are **request-only**: holding
 the capability lets an agent *ask*; the actual rebuild/merge still goes through normal
 owner-confirmation. Extend the enum by editing `AGENT_CAPABILITIES` (and this table).
+
+The three **team** capabilities power the self-organizing team protocol (Contract-Net over
+A2A). They are **non-destructive** — they let an authorized peer *participate*; the actual
+work a team task drives still runs through the capability-scoped processor + owner
+confirmation, so a team award can never itself trigger a rebuild/merge/send unattended.
+Full model: [`team-coordination.md`](team-coordination.md).
 
 ---
 
