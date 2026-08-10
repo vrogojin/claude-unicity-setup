@@ -188,4 +188,37 @@ if [ -d "$Q_DIR" ]; then
   fi
 fi
 
+# --- Team-coordination events pending (Contract-Net over A2A) -------------------
+# Queued team verbs (cfp/bid/award/progress/result/lease/kb) an authorized teammate sent,
+# plus any team invitation awaiting a join decision. Opt-in: surfaced, never auto-run.
+TE_DIR="$STATE_DIR/agent-team-events"
+TEAM_LIB="$DIAG_HOOK_DIR/team-coord.sh"
+TE_QUEUED=0
+if [ -d "$TE_DIR" ]; then
+  for f in "$TE_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    [ "$(jq -r '.status // "queued"' "$f" 2>/dev/null)" = "queued" ] && TE_QUEUED=$((TE_QUEUED+1))
+  done
+fi
+INV_COUNT=0
+if [ -f "$TEAM_LIB" ]; then
+  INV_COUNT="$(bash "$TEAM_LIB" invites 2>/dev/null | jq 'length' 2>/dev/null || echo 0)"
+  [ -n "$INV_COUNT" ] || INV_COUNT=0
+fi
+if { [ "$TE_QUEUED" -gt 0 ] 2>/dev/null; } || { [ "$INV_COUNT" -gt 0 ] 2>/dev/null; }; then
+  TE_DETAILS=""
+  if [ -d "$TE_DIR" ] && [ "$TE_QUEUED" -gt 0 ] 2>/dev/null; then
+    TE_DETAILS=$(for f in "$TE_DIR"/*.json; do [ -e "$f" ] || continue
+      [ "$(jq -r '.status // "queued"' "$f" 2>/dev/null)" = "queued" ] || continue
+      jq -r '"  • " + .kind + " · team " + (.team // "?") + (if (.task // "")!="" then " · task " + .task else "" end)
+             + " · from " + (if (.unicityName // "")!="" then .unicityName else (.from_pubkey[0:12] + "…") end)' "$f" 2>/dev/null
+    done)
+  fi
+  TE_MSG="Team coordination: ${TE_QUEUED} pending team event(s)"
+  [ "$INV_COUNT" -gt 0 ] 2>/dev/null && TE_MSG="$TE_MSG + ${INV_COUNT} team invitation(s) awaiting a join decision"
+  TE_MSG="$TE_MSG:\n${TE_DETAILS}\n\nRun /team-work to process them (record bids, award tasks, execute an award, review results, adopt heartbeats) or /team-status to review. Invitations are joined only when you choose to. Nothing here has been acted on."
+  jq -n --arg reason "$TE_MSG" '{"decision":"block","reason":$reason}'
+  exit 0
+fi
+
 exit 0

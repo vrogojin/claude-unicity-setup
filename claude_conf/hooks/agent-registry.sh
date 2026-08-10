@@ -29,7 +29,14 @@ set -uo pipefail
 # Extend here (and in docs/agent-coordination.md). Each capability is a single
 # lowercase token. Destructive/outward capabilities are additionally listed in
 # AGENT_CAPS_DESTRUCTIVE so enforcement layers can require owner-confirmation.
-AGENT_CAPABILITIES="read-status chat dev-advice rebuild-reload-service review-merge-pr"
+#
+# team-coordinate / task-bid / knowledge-share power the self-organizing team protocol
+# (Contract-Net over A2A — see docs/team-coordination.md). They are NON-destructive: they
+# let an authorized peer PARTICIPATE (invite/cfp/award/progress/snapshot/lease → coordinate;
+# bid/result → task-bid; kb.publish → knowledge-share). The actual work a team task drives
+# still passes through the normal capability-scoped processor + owner-confirmation, so a
+# team award can never itself trigger a rebuild/merge unattended.
+AGENT_CAPABILITIES="read-status chat dev-advice rebuild-reload-service review-merge-pr team-coordinate task-bid knowledge-share"
 AGENT_CAPS_DESTRUCTIVE="rebuild-reload-service review-merge-pr"
 
 # --- Registry path resolution ----------------------------------------------------

@@ -29,6 +29,9 @@ HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo .
 # Source the registry helpers (its CLI is guarded, so sourcing only defines funcs).
 . "$HOOK_DIR/agent-registry.sh" 2>/dev/null || true
 REGISTRY="$HOOK_DIR/agent-registry.sh"
+# Source the team-coordination engine (guarded CLI → sourcing only defines funcs). Provides
+# team_is_verb / team_verb_cap / team_enqueue_event / team_exists for routing team A2A verbs.
+. "$HOOK_DIR/team-coord.sh" 2>/dev/null || true
 
 STATE_FILE="$STATE_DIR/agent-messages.json"
 PENDING_FILE="$STATE_DIR/agent-authz-pending.json"
@@ -142,12 +145,19 @@ while [ "$i" -lt "$TOTAL" ]; do
   # The claimed name is display/intent only — NEVER an identity (that is the pubkey).
   CLAIMED_NAME="$FROMNAME"
   REQ_SKILL=""
+  ENV_KIND=""
+  ENV_TEAM=""
   DISPLAY_BODY="$BODY"
   if echo "$BODY" | jq -e 'type=="object"' >/dev/null 2>&1; then
-    ENV_NAME="$(echo "$BODY" | jq -r '(.from // .agentCard.name // .agent.name // .name // "") | tostring' 2>/dev/null)"
+    ENV_NAME="$(echo "$BODY" | jq -r '(.fromNpub // null) as $np | (.from // .agentCard.name // .agent.name // .name // "") | tostring' 2>/dev/null)"
     REQ_SKILL="$(echo "$BODY" | jq -r '(.skill // .capability // .skillId // .method // "") | tostring' 2>/dev/null)"
+    # Team-coordination envelope verb (kind) — routed capability-gated to the team queue.
+    ENV_KIND="$(echo "$BODY" | jq -r '(.kind // "") | tostring' 2>/dev/null)"
+    ENV_TEAM="$(echo "$BODY" | jq -r '(.team // "") | tostring' 2>/dev/null)"
     ENV_MSG="$(echo "$BODY" | jq -r '(.message.text // .message // .task.text // .task // .text // "") | if type=="object" then tojson else tostring end' 2>/dev/null)"
     [ "$REQ_SKILL" = "null" ] && REQ_SKILL=""
+    [ "$ENV_KIND" = "null" ] && ENV_KIND=""
+    [ "$ENV_TEAM" = "null" ] && ENV_TEAM=""
     { [ -z "$CLAIMED_NAME" ] && [ -n "$ENV_NAME" ] && [ "$ENV_NAME" != "null" ]; } && CLAIMED_NAME="$ENV_NAME"
     { [ -n "$ENV_MSG" ] && [ "$ENV_MSG" != "null" ]; } && DISPLAY_BODY="$ENV_MSG"
   fi
@@ -168,25 +178,61 @@ while [ "$i" -lt "$TOTAL" ]; do
         NAME="$(echo "$ENTRY" | jq -r '.unicityName // ""')"
         NPUB="$(echo "$ENTRY" | jq -r '.npub // ""')"
         CAPS="$(echo "$ENTRY" | jq -c '.capabilities // []')"
-        # Content-guard (SIF) BEFORE dispatch — mirror the concierge backend's fail-closed
-        # ingestion guard. A flagged (or fail-closed guard-error) body is QUARANTINED and
-        # never dispatched; a clean body is queued for the capability-scoped processor.
-        SIF_Q=0
-        if [ -f "$SIF_GUARD" ]; then
-          # NB: sif-guard exits 10 on quarantine (0 on pass). Capture stdout via $() —
-          # which ignores the exit code — and do NOT chain `|| echo` (a non-zero exit is
-          # the quarantine signal, not a failure, and would corrupt the captured JSON).
-          SIF_OUT="$(printf '%s' "$DISPLAY_BODY" | bash "$SIF_GUARD" check --direction inbound --principal "$FROM" --source agent-comms 2>/dev/null)"
-          [ -n "$SIF_OUT" ] || SIF_OUT='{}'
-          [ "$(echo "$SIF_OUT" | jq -r '.decision // "pass"' 2>/dev/null)" = "quarantine" ] && SIF_Q=1
-        fi
-        if [ "$SIF_Q" = "1" ]; then
-          quarantine_message "$FROM" "$TS" "$DISPLAY_BODY" "$TYPE" "$GROUP" "$NAME" "$NPUB" "$SIF_OUT"
+
+        # --- Team-coordination verb? Route to the team-event queue (capability-gated) ---
+        # A team A2A envelope (kind ∈ team.*/task.*/coord.*/kb.publish) is handled by the
+        # team engine, NOT the 1:1 request dispatcher. Same three guards apply: the SENDER
+        # must hold the capability this verb requires (default-deny), SIF-clean, and — to
+        # stay opt-in/inert — we only act on an INVITE or an event for a team we belong to.
+        if [ -n "$ENV_KIND" ] && type team_is_verb >/dev/null 2>&1 && team_is_verb "$ENV_KIND"; then
+          REQ_CAP="$(team_verb_cap "$ENV_KIND")"
+          if echo "$CAPS" | jq -e --arg c "$REQ_CAP" 'index($c)' >/dev/null 2>&1; then
+            if [ "$ENV_KIND" = "team.invite" ] || { type team_exists >/dev/null 2>&1 && team_exists "$ENV_TEAM"; }; then
+              SIF_Q=0
+              if [ -f "$SIF_GUARD" ]; then
+                SIF_OUT="$(printf '%s' "$BODY" | bash "$SIF_GUARD" check --direction inbound --principal "$FROM" --source agent-comms 2>/dev/null)"
+                [ -n "$SIF_OUT" ] || SIF_OUT='{}'
+                [ "$(echo "$SIF_OUT" | jq -r '.decision // "pass"' 2>/dev/null)" = "quarantine" ] && SIF_Q=1
+              fi
+              if [ "$SIF_Q" = "1" ]; then
+                quarantine_message "$FROM" "$TS" "$BODY" "$TYPE" "$GROUP" "$NAME" "$NPUB" "${SIF_OUT:-{}}"
+              else
+                team_enqueue_event "$FROM" "$TS" "$BODY" "$NPUB" "$NAME" >/dev/null 2>&1 || true
+              fi
+              AUTHZJSON="$(jq -nc --arg name "$NAME" --arg kind "$ENV_KIND" --arg team "$ENV_TEAM" --argjson q "$SIF_Q" \
+                '{role:"agent", status:"authorized", unicityName:$name, teamVerb:$kind, team:$team, sifQuarantined:($q==1), classified:true}')"
+            else
+              # Authorized + cap, but a non-invite verb for a team we are not in → inert-drop.
+              AUTHZJSON="$(jq -nc --arg name "$NAME" --arg kind "$ENV_KIND" --arg team "$ENV_TEAM" \
+                '{role:"agent", status:"authorized", unicityName:$name, teamVerb:$kind, team:$team, teamUnknown:true, classified:true}')"
+            fi
+          else
+            # Authorized but NOT granted the capability this team verb needs → default-deny.
+            AUTHZJSON="$(jq -nc --arg name "$NAME" --arg kind "$ENV_KIND" --arg cap "$REQ_CAP" \
+              '{role:"agent", status:"authorized", unicityName:$name, teamVerb:$kind, capMissing:$cap, classified:true}')"
+          fi
         else
-          enqueue_workitem "$FROM" "$TS" "$DISPLAY_BODY" "$TYPE" "$GROUP" "$NAME" "$NPUB" "$CAPS" "$REQ_SKILL"
+          # --- Non-team message: existing 1:1 capability-scoped request path (unchanged) ---
+          # Content-guard (SIF) BEFORE dispatch — mirror the concierge backend's fail-closed
+          # ingestion guard. A flagged (or fail-closed guard-error) body is QUARANTINED and
+          # never dispatched; a clean body is queued for the capability-scoped processor.
+          SIF_Q=0
+          if [ -f "$SIF_GUARD" ]; then
+            # NB: sif-guard exits 10 on quarantine (0 on pass). Capture stdout via $() —
+            # which ignores the exit code — and do NOT chain `|| echo` (a non-zero exit is
+            # the quarantine signal, not a failure, and would corrupt the captured JSON).
+            SIF_OUT="$(printf '%s' "$DISPLAY_BODY" | bash "$SIF_GUARD" check --direction inbound --principal "$FROM" --source agent-comms 2>/dev/null)"
+            [ -n "$SIF_OUT" ] || SIF_OUT='{}'
+            [ "$(echo "$SIF_OUT" | jq -r '.decision // "pass"' 2>/dev/null)" = "quarantine" ] && SIF_Q=1
+          fi
+          if [ "$SIF_Q" = "1" ]; then
+            quarantine_message "$FROM" "$TS" "$DISPLAY_BODY" "$TYPE" "$GROUP" "$NAME" "$NPUB" "$SIF_OUT"
+          else
+            enqueue_workitem "$FROM" "$TS" "$DISPLAY_BODY" "$TYPE" "$GROUP" "$NAME" "$NPUB" "$CAPS" "$REQ_SKILL"
+          fi
+          AUTHZJSON="$(jq -nc --arg name "$NAME" --argjson caps "$CAPS" --arg skill "$REQ_SKILL" --argjson q "$SIF_Q" \
+            '{role:"agent", status:"authorized", unicityName:$name, capabilities:$caps, requestedSkill:$skill, sifQuarantined:($q==1), classified:true}')"
         fi
-        AUTHZJSON="$(jq -nc --arg name "$NAME" --argjson caps "$CAPS" --arg skill "$REQ_SKILL" --argjson q "$SIF_Q" \
-          '{role:"agent", status:"authorized", unicityName:$name, capabilities:$caps, requestedSkill:$skill, sifQuarantined:($q==1), classified:true}')"
         ;;
       denied)
         AUTHZJSON='{"role":"agent","status":"denied","classified":true}'
