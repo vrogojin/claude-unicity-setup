@@ -32,11 +32,21 @@ Concierge side, a build, or a redeploy, you **consult the coordinator** and it d
 ### Coordinator coordinates (fill these in — current values)
 | | |
 |---|---|
-| Coordinator npub | `npub1wqetnv9cs5tnd6s7rl377nhpc9y0v29c4fzrztwmt68vgc3eg36scagk80` |
-| Coordinator name | `cryptohog-concierge-dev` |
+| Coordinator **nametag** | `concierge-coord` — *preferred*: address it by name, resolved to the npub below via the Sphere SDK (global + authenticated) |
+| Coordinator npub | `npub1wqetnv9cs5tnd6s7rl377nhpc9y0v29c4fzrztwmt68vgc3eg36scagk80` — the fallback / first‑boot value the nametag resolves to |
 | Relay | `wss://nostr-relay.testnet.unicity.network` |
 | Framework repo | `git@github.com:vrogojin/claude-unicity-setup.git` |
 | App repo (mobile front) | `git@github.com:unicity-concierge/concierge-app.git` |
+
+> **Addressing the coordinator by nametag.** The coordinator has registered the Unicity
+> nametag **`concierge-coord`**, so anywhere a `<coordinator-npub>` is expected you can pass
+> **`concierge-coord`** instead — `/consult-coordinator concierge-coord "…"`, `remote-coord.sh
+> emit … --to concierge-coord`, etc. The nametag resolves to the coordinator's npub globally
+> and authenticated (a signed Sphere binding event on the relay), and the resolved mapping is
+> cached in your agent registry so later lookups stay local. The **npub is always the
+> fallback** — it keeps working unchanged, and is the value to use on first boot before you
+> have resolved the name (or pre-record it with `setup.sh`'s optional coordinator step). To
+> re‑resolve manually: `node lib/sphere-helper.mjs resolve-nametag concierge-coord`.
 
 ---
 
@@ -210,17 +220,17 @@ node lib/sphere-daemon.mjs start --project <proj> --live &   # start live channe
 node lib/sphere-daemon.mjs status --project <proj>           # is it running?
 cat <proj>/.claude/agent/identity.json | jq -r .npub         # your npub
 
-# in your Claude session (skills)
+# in your Claude session (skills) — pass the nametag `concierge-coord` or the coord npub
 /recall-prior-work <keywords>                 # research before claiming
-/consult-coordinator <coord-npub> "<intent>"  # broadcast + claim + consult
+/consult-coordinator concierge-coord "<intent>"  # broadcast + claim + consult (nametag or npub)
 /authorize-agent <coord-npub> consult,claim-area,knowledge-share   # accept its advisories
 
-# raw engine (if you prefer)
+# raw engine (if you prefer) — --to accepts a nametag OR an npub/hex
 RC=.claude/hooks/remote-coord.sh
 bash $RC intent-open --subject "…" --area "repo:path" --window-mins 30
 bash $RC area-upsert --area <id> --scope "repo:path" --holder <your-npub> --side local --status active
-bash $RC consult-open --to <coord-npub> --intent "…" --areas "…" --changes "…" --questions "…"
-bash $RC emit "$(bash $RC envelope <kind> --payload '…')" --to <coord-npub>
+bash $RC consult-open --to concierge-coord --intent "…" --areas "…" --changes "…" --questions "…"
+bash $RC emit "$(bash $RC envelope <kind> --payload '…')" --to concierge-coord
 ```
 
 ---
