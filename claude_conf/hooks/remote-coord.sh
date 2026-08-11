@@ -212,13 +212,16 @@ rc_enqueue_event() {
 # made work: "I intend to work on X — conflicts?" / "I changed CRM API Y — please
 # apply the matching backend changes". side:remote = they opened it with us (we are
 # the coordinator); side:local = we opened it with a remote coordinator.
-rc_consult_open() {  # --to <npub> --intent I [--areas csv --repos csv --changes J --questions J --urgency u]
+rc_consult_open() {  # --to <npub|nametag> --intent I [--areas csv --repos csv --changes J --questions J --urgency u]
   local to="" intent="" areas="" repos="" changes='[]' questions='[]' urgency="normal"
   while [ $# -gt 0 ]; do case "$1" in
     --to) to="$2"; shift 2;; --intent) intent="$2"; shift 2;; --areas) areas="$2"; shift 2;;
     --repos) repos="$2"; shift 2;; --changes) changes="$2"; shift 2;;
     --questions) questions="$2"; shift 2;; --urgency) urgency="$2"; shift 2;; *) shift;; esac; done
-  [ -n "$to" ] && [ -n "$intent" ] || { echo "ERR: --to <npub> and --intent required" >&2; return 1; }
+  [ -n "$to" ] && [ -n "$intent" ] || { echo "ERR: --to <npub|nametag> and --intent required" >&2; return 1; }
+  # Accept a nametag as the target: resolve (+cache) to an npub so the stored thread and
+  # every later emit reference the canonical key. An npub/hex passes through unchanged.
+  to="$(rc_resolve_target "${to#@}")" || { echo "ERR: could not resolve --to target" >&2; return 1; }
   echo "$changes"   | jq -e . >/dev/null 2>&1 || changes='[]'
   echo "$questions" | jq -e . >/dev/null 2>&1 || questions='[]'
   local cid; cid="c$(printf '%s%s%s' "$to" "$intent" "$(rc_now)" | sha1sum | cut -c1-10)"
@@ -642,6 +645,49 @@ rc_envelope() {
 # rc_emit <envelope-json> --to <npub> | --to-all-peers
 # SIF egress-guard + send. Most peer verbs are 1:1; work.intent ("who's-on-this?")
 # fans out to every AUTHORIZED registry peer via --to-all-peers. Honors TEAM_DRY_RUN=1.
+# rc_resolve_target <target> → an npub for a --to value.
+# An npub (npub1…) or a raw 64-hex pubkey passes through UNCHANGED (send-dm handles both).
+# Anything else is treated as a Unicity NAMETAG: resolve it to an npub, checking the
+# local agent-registry CACHE first (a prior nametag→npub is stored as a peer, resolvable
+# by unicityName) and only hitting the network via `sphere-helper resolve-nametag` on a
+# miss — then caching the nametag↔npub in the registry so later lookups stay local.
+# Prints the npub on stdout; empty + non-zero exit when a nametag does not resolve.
+rc_resolve_target() {
+  local target="${1:-}"
+  [ -n "$target" ] || { echo "ERR: empty target" >&2; return 1; }
+  # Already an npub or a 32-byte hex pubkey → nothing to resolve.
+  case "$target" in
+    npub1*) printf '%s' "$target"; return 0;;
+  esac
+  if printf '%s' "$target" | grep -Eiq '^[0-9a-f]{64}$'; then printf '%s' "$target"; return 0; fi
+
+  # Nametag path. Cache hit? (registry resolves a peer by its unicityName.)
+  local cached
+  cached="$(bash "$RC_REGISTRY" get "$target" 2>/dev/null | jq -r '.npub // ""' 2>/dev/null || echo "")"
+  case "$cached" in
+    npub1*) printf '%s' "$cached"; return 0;;
+  esac
+
+  # Miss → resolve on the network via the sphere-helper.
+  local helper=""; type _tc_sphere_helper >/dev/null 2>&1 && helper="$(_tc_sphere_helper)"
+  [ -n "$helper" ] || { echo "ERR: sphere-helper not found — cannot resolve nametag '$target'" >&2; return 1; }
+  local out npub hex
+  out="$(node "$helper" resolve-nametag "$target" 2>/dev/null || true)"
+  npub="$(printf '%s' "$out" | jq -r '.npub // ""' 2>/dev/null || echo "")"
+  hex="$(printf '%s' "$out" | jq -r '.hex // ""' 2>/dev/null || echo "")"
+  case "$npub" in
+    npub1*) ;;
+    *) echo "ERR: nametag '$target' did not resolve to an npub" >&2; return 1;;
+  esac
+  # Cache nametag↔npub for future local lookups (best-effort; never blocks the send).
+  if printf '%s' "$hex" | grep -Eiq '^[0-9a-f]{64}$'; then
+    bash "$RC_REGISTRY" upsert-peer --npub "$npub" --pubkey "$hex" --name "$target" >/dev/null 2>&1 || true
+  else
+    bash "$RC_REGISTRY" upsert-peer --npub "$npub" --name "$target" >/dev/null 2>&1 || true
+  fi
+  printf '%s' "$npub"
+}
+
 rc_emit() {
   local env="$1"; shift
   local to="" all=0
@@ -653,8 +699,11 @@ rc_emit() {
       < <(bash "$RC_REGISTRY" list authorized 2>/dev/null | jq -r '.[].npub // empty' 2>/dev/null)
     [ "${#recips[@]}" -gt 0 ] || { echo "WARN: no authorized peers to broadcast to" >&2; return 0; }
   else
-    [ -n "$to" ] || { echo "ERR: --to <npub> (or --to-all-peers) required" >&2; return 1; }
-    recips=("$to")
+    [ -n "$to" ] || { echo "ERR: --to <npub|nametag> (or --to-all-peers) required" >&2; return 1; }
+    # Accept a nametag (or @nametag) as well as an npub/hex: resolve+cache → npub.
+    local resolved; resolved="$(rc_resolve_target "${to#@}")" \
+      || { echo "ERR: could not resolve recipient '$to' (not an npub/hex, and nametag resolution failed)" >&2; return 1; }
+    recips=("$resolved")
   fi
   local kind; kind="$(jq -r '.kind' <<<"$env")"
   local helper=""; type _tc_sphere_helper >/dev/null 2>&1 && helper="$(_tc_sphere_helper)"
@@ -977,7 +1026,7 @@ remote-coord.sh — remote-agent coordination engine (consults + advisory work-a
 claims + who's-on-this broadcasts + split negotiation + conflict reconciliation, over A2A).
 Commands:
   root | self | verb-cap <kind> | is-verb <kind>
-  consult-open --to <npub> --intent I [--areas csv --repos csv --changes J --questions J --urgency u]
+  consult-open --to <npub|nametag> --intent I [--areas csv --repos csv --changes J --questions J --urgency u]
   consult-list [status] | consult-get <cid>
   advise <cid> --advisory TEXT [--conflicts JSON] [--commit "desc|scope"]...
   commit-done <cmid> [note] | commitments
@@ -994,7 +1043,7 @@ Commands:
   conflict-scan <repo-dir> <branchA> <branchB>
   edge-add <from> duplicates|supersedes|blocks|conflicts-with <to> [note] | edges [filter]
   peers | envelope <kind> [--consult C --area A --payload JSON]
-  emit <env-json> --to <npub> | --to-all-peers
+  emit <env-json> --to <npub|nametag> | --to-all-peers   (nametag → npub via sphere-helper, cached in registry)
   ingest <event-json|file|-> | events | event-done <id>
   enqueue-event <from_pubkey> <ts> <envelope-json> [npub] [name]
   render

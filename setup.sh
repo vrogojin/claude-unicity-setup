@@ -487,6 +487,41 @@ fi
 ok "Owner: $OWNER_NAMETAG${OWNER_NPUB:+ ($OWNER_NPUB)}"
 
 # ============================================================
+# Phase 3b: Coordinator (optional) — pre-record its nametag → npub
+# ============================================================
+# If this instance is a TEAMMATE joining a coordination circle, pre-recording the
+# coordinator's Unicity nametag lets you address it by name from the first boot
+# (e.g. `/consult-coordinator concierge-coord …`), resolving to its npub locally via
+# the agent-registry cache instead of a network lookup. Entirely optional and
+# backward compatible: leave the nametag empty to skip.
+COORD_NAMETAG=$(prompt_input "Coordinator nametag to pre-record (empty to skip)" "")
+COORD_NAMETAG="${COORD_NAMETAG#@}"  # strip leading @ if present
+COORD_NPUB=""
+if [ -n "$COORD_NAMETAG" ]; then
+  COORD_NPUB=$(prompt_input "Coordinator npub (leave empty to resolve '$COORD_NAMETAG' now)" "")
+  REGISTRY_SH="$CLAUDE_DIR/hooks/agent-registry.sh"
+  HELPER_MJS="$SCRIPT_DIR/lib/sphere-helper.mjs"
+  if [ "$DRY_RUN" = "true" ]; then
+    info "[dry-run] Pre-record coordinator '$COORD_NAMETAG'${COORD_NPUB:+ ($COORD_NPUB)} in agent registry"
+  else
+    # No npub given → resolve the nametag on the network (best-effort).
+    if [ -z "$COORD_NPUB" ] && [ -f "$HELPER_MJS" ] && command -v node >/dev/null 2>&1; then
+      COORD_NPUB=$(node "$HELPER_MJS" resolve-nametag "$COORD_NAMETAG" 2>/dev/null | jq -r '.npub // ""' 2>/dev/null || echo "")
+    fi
+    if [ -n "$COORD_NPUB" ] && [ -f "$REGISTRY_SH" ]; then
+      bash "$REGISTRY_SH" ensure >/dev/null 2>&1 || true
+      if bash "$REGISTRY_SH" upsert-peer --npub "$COORD_NPUB" --name "$COORD_NAMETAG" >/dev/null 2>&1; then
+        ok "Pre-recorded coordinator: $COORD_NAMETAG → $COORD_NPUB"
+      else
+        info "Could not pre-record coordinator in registry — the agent will resolve '$COORD_NAMETAG' at runtime."
+      fi
+    else
+      info "Coordinator '$COORD_NAMETAG' not resolved now — the agent will resolve it at runtime when first addressed."
+    fi
+  fi
+fi
+
+# ============================================================
 # Phase 4: Network environment
 # ============================================================
 echo ""
