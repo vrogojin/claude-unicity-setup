@@ -14,6 +14,18 @@ Custom slash commands for managing parallel agent workflows across the Unicity e
 | `/update-issue <number> [message]` | Push branch and post progress update on a GitHub issue |
 | `/steelman [branch]` | Adversarial review — try to break code before it ships |
 | `/roadmap-sync [--dry-run]` | Reconcile `docs/ROADMAP.md` ⇄ the GitHub Project board (four-state model) |
+| `/check-messages` | Read agent messages (owner DMs + `UNICITY_DEV_AGENTS` group) |
+| `/dm-owner <message>` | Send a DM to the configured owner |
+| `/dm-agent <name-or-npub> <message>` | DM another Claude agent (first-contact handshake) |
+| `/list-agents [status]` | Show the authorized-agents registry |
+| `/authorize-agent <name-or-npub> <caps>` | Authorize a remote agent + grant capabilities |
+| `/deny-agent <name-or-npub>` | Deny a remote agent (its messages are dropped) |
+| `/process-agent-requests` | Dispatch queued authorized requests to capability-scoped processors |
+| `/team-form <goal> <member-npubs…>` | Found a goal-scoped team + invite peers (Contract-Net coordinator) |
+| `/team-work [teamId]` | Run the team loop — auction/award/bid/execute/review; drains team events |
+| `/team-status [teamId]` | Render team ledgers, coordinator lease/epoch, invitations, knowledge cards |
+| `/team-publish [teamId] <fact>` | Distill + broadcast a knowledge card to the team |
+| `/team-dissolve <teamId>` | Retire a team with a retrospective |
 
 ## Usage
 
@@ -99,9 +111,35 @@ Systematically reviews work against task file, runs verification, and prepares m
 │   └── SKILL.md           # /steelman command
 ├── update-issue/
 │   └── SKILL.md           # /update-issue command
-└── roadmap-sync/
-    └── SKILL.md           # /roadmap-sync command
+├── roadmap-sync/
+│   └── SKILL.md           # /roadmap-sync command
+├── check-messages/
+│   └── SKILL.md           # /check-messages command
+├── dm-owner/
+│   └── SKILL.md           # /dm-owner command
+├── dm-agent/
+│   └── SKILL.md           # /dm-agent command — DM another agent (handshake)
+├── list-agents/
+│   └── SKILL.md           # /list-agents command
+├── authorize-agent/
+│   └── SKILL.md           # /authorize-agent command
+├── deny-agent/
+│   └── SKILL.md           # /deny-agent command
+├── process-agent-requests/
+│   └── SKILL.md           # /process-agent-requests — capability-scoped dispatch
+├── team-form/            # /team-form — found a team + invite peers (Contract-Net)
+├── team-work/            # /team-work — run the team loop (auction/award/bid/execute/review)
+├── team-status/          # /team-status — render team ledgers + lease/epoch + knowledge
+├── team-publish/         # /team-publish — distill + broadcast a knowledge card
+└── team-dissolve/        # /team-dissolve — retire a team with a retrospective
 ```
+
+## Agent Coordination Skills
+
+The `dm-agent`, `list-agents`, `authorize-agent`, `deny-agent`, and
+`process-agent-requests` skills implement the **owner-in-the-loop master-manager** model
+for coordinating Claude agents across hosts (default-deny authorization registry +
+capability-scoped request processing). See [`docs/agent-coordination.md`](../../docs/agent-coordination.md).
 
 ## Tips
 

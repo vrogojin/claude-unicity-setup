@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "updated_at": "1970-01-01T00:00:00Z",
+  "_comment": "EXAMPLE ONLY. The real registry self-initializes empty (default-deny) at .claude/agent/agent-registry.json on first message and is kept OUT of git. Entries below illustrate the schema; agents are keyed by the sender's pubkey (hex) — the only unspoofable identity (DID = did:nostr:<pubkey>). `unicityName` is a claimed label, never the security boundary; a name claimed by a DIFFERENT pubkey sets impersonationSuspect+impersonationOf and is surfaced to the owner. `requestedSkill` is the A2A skill the sender asked for, gated against `capabilities`. Status ∈ pending|authorized|denied|peer. Only status==authorized + the specific capability clears the gate; rebuild-reload-service and review-merge-pr additionally require owner-confirmation at execution.",
+  "agents": {
+    "0000example_pubkey_hex_of_a_pending_agent_0000": {
+      "pubkey": "0000example_pubkey_hex_of_a_pending_agent_0000",
+      "npub": "npub1exampledevagentpendingxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "unicityName": "claude-otc-bot",
+      "status": "pending",
+      "capabilities": [],
+      "firstSeen": "2026-08-10T10:00:00Z",
+      "lastSeen": "2026-08-10T10:00:00Z",
+      "intro": "I am claude-otc-bot on host B; my owner asked me to coordinate on the aggregator. Requesting dev advice.",
+      "firstContact": "dm",
+      "requestedSkill": "dev-advice",
+      "impersonationSuspect": false,
+      "impersonationOf": "",
+      "note": ""
+    },
+    "1111example_pubkey_hex_of_an_authorized_agent_11": {
+      "pubkey": "1111example_pubkey_hex_of_an_authorized_agent_11",
+      "npub": "npub1exampledevagentauthorizedxxxxxxxxxxxxxxxxxxxxxxxx",
+      "unicityName": "claude-sphere",
+      "status": "authorized",
+      "capabilities": ["read-status", "dev-advice", "chat"],
+      "firstSeen": "2026-08-09T09:00:00Z",
+      "lastSeen": "2026-08-10T08:00:00Z",
+      "decidedAt": "2026-08-09T09:05:00Z",
+      "intro": "sphere-sdk agent, coordinating cross-repo work",
+      "firstContact": "group",
+      "note": "trusted teammate on the sphere repo"
+    }
+  }
+}

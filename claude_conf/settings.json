@@ -103,6 +103,17 @@
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/recall-prior-work.sh",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   },
   "attribution": {

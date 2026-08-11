@@ -58,8 +58,18 @@ claude_conf/
 │   ├── roadmap-sync/          # /roadmap-sync — reconcile docs/ROADMAP.md ⇄ GitHub Project board
 │   ├── update-deps/           # /update-deps — update upstream deps, adapt code, build, test
 │   ├── check-messages/        # /check-messages — read and display agent messages
-│   └── dm-owner/              # /dm-owner — send DM to configured owner
-├── agent/                     # Agent identity and config (created by setup.sh, gitignored)
+│   ├── dm-owner/              # /dm-owner — send DM to configured owner
+│   ├── dm-agent/              # /dm-agent — DM another agent (first-contact handshake)
+│   ├── list-agents/           # /list-agents — show the authorized-agents registry
+│   ├── authorize-agent/       # /authorize-agent — grant a remote agent capabilities
+│   ├── deny-agent/            # /deny-agent — deny a remote agent
+│   ├── process-agent-requests/ # /process-agent-requests — dispatch to capability-scoped processors
+│   ├── team-form/            # /team-form — found a goal-scoped team + invite peers (Contract-Net)
+│   ├── team-work/            # /team-work — run the team loop (auction/award/bid/execute/review)
+│   ├── team-status/          # /team-status — render team ledgers, lease/epoch, knowledge cards
+│   ├── team-publish/         # /team-publish — distill + broadcast a knowledge card
+│   └── team-dissolve/        # /team-dissolve — retire a team with a retrospective
+├── agent/                     # Agent identity, config, and authorized-agents registry (gitignored)
 ├── templates/                 # Seed files setup.sh copies into targets (ROADMAP.md skeleton, roadmap memory record)
 ├── reference/                 # Per-repository API reference docs (loaded on demand)
 └── docs/                      # Architecture docs, guides, design decisions
@@ -104,6 +114,25 @@ The skills support a parallel agent development workflow:
 6. `/task-status` — check overall progress
 7. `/check-messages` — read agent messages (group + DMs)
 8. `/dm-owner <message>` — send a DM to the configured owner
+
+### Cross-Host Agent Coordination (master manager)
+
+This instance (**cryptohog-concierge-dev**) is the **master manager** of the concierge
+project. Agents on other hosts coordinate through it under an owner-in-the-loop,
+**default-deny** model: unknown agents are queued for your authorization and never acted
+upon; authorized agents' requests are dispatched to subagents scoped to their granted
+capabilities. Owner commands: `/list-agents`, `/authorize-agent <name-or-npub> <caps>`,
+`/deny-agent <name-or-npub>`, `/dm-agent <name-or-npub> <message>`,
+`/process-agent-requests`. Full model: [`docs/agent-coordination.md`](docs/agent-coordination.md).
+
+**Self-organizing teams (Contract-Net over A2A).** Authorized peers can form goal-scoped
+teams that decompose work, auction tasks (cfp → bid → award-under-lease → result → review),
+and share knowledge — all as capability-gated A2A verbs on the same default-deny substrate.
+Three new non-destructive capabilities gate participation: `team-coordinate`, `task-bid`,
+`knowledge-share`. Commands: `/team-form <goal> <member-npubs…>`, `/team-work [teamId]`,
+`/team-status [teamId]`, `/team-publish [teamId] <fact>`, `/team-dissolve <teamId>`.
+Opt-in and inert-safe (no local team ⇒ only invitations surface); requires the Sphere
+daemon for live delivery. Full model: [`docs/team-coordination.md`](docs/team-coordination.md).
 
 ## Editing Configuration
 

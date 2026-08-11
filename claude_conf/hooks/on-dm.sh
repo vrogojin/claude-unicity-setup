@@ -38,9 +38,15 @@ if [ -f "$CONFIG_FILE" ]; then
   fi
 fi
 
-# Determine priority (owner messages are priority)
+# Determine priority (owner messages are priority).
+# Honor a priority flag already computed upstream by our trusted poll helper
+# (check-messages sets .priority by comparing hex pubkeys — the daemon delivers that
+# shape). Raw Nostr events carry no .priority, so this can't be spoofed by a sender.
 IS_PRIORITY=false
-if [ -n "$OWNER_NPUB" ] && [ "$SENDER" = "$OWNER_NPUB" ]; then
+INCOMING_PRIORITY=$(echo "$MSG_JSON" | jq -r '.priority // empty' 2>/dev/null)
+if [ "$INCOMING_PRIORITY" = "true" ]; then
+  IS_PRIORITY=true
+elif [ -n "$OWNER_NPUB" ] && [ "$SENDER" = "$OWNER_NPUB" ]; then
   IS_PRIORITY=true
 fi
 
@@ -89,6 +95,12 @@ if [ -f "$HOOK_DIR/notify.sh" ]; then
   else
     notify "Unicity Agent: DM" "From ${FROM_NAME:-$SENDER}: ${BODY:0:100}" "normal"
   fi
+fi
+
+# Route the just-appended message through the authorization classifier (DEFAULT-DENY).
+# Guarded so a classifier failure can never break this daemon hook.
+if [ -f "$HOOK_DIR/classify-inbound.sh" ]; then
+  bash "$HOOK_DIR/classify-inbound.sh" >/dev/null 2>&1 || true
 fi
 
 exit 0

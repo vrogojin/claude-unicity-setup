@@ -120,4 +120,143 @@ if [ -f "$MSG_STATE" ]; then
   fi
 fi
 
+# --- Inbound agent authorization gate (owner-in-the-loop, DEFAULT-DENY) ---------
+# Master-manager coordination: unknown agents that have made contact must be
+# authorized (or denied) by the owner before anything they ask is acted upon.
+DIAG_HOOK_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo .)"
+# Refresh the pending surface from the registry so /authorize-agent · /deny-agent
+# decisions clear the gate immediately (also classifies any not-yet-routed messages).
+if [ -f "$DIAG_HOOK_DIR/classify-inbound.sh" ]; then
+  bash "$DIAG_HOOK_DIR/classify-inbound.sh" >/dev/null 2>&1 || true
+fi
+AUTHZ_PENDING="$STATE_DIR/agent-authz-pending.json"
+if [ -f "$AUTHZ_PENDING" ]; then
+  PCOUNT=$(jq -r '.count // 0' "$AUTHZ_PENDING" 2>/dev/null)
+  if [ "$PCOUNT" -gt 0 ] 2>/dev/null && [ "$PCOUNT" != "0" ]; then
+    CAPS_LIST=$(bash "$DIAG_HOOK_DIR/agent-registry.sh" caps 2>/dev/null || echo "")
+    DETAILS=$(jq -r '
+      .pending[] |
+      "  • " + (if (.name // "") != "" then .name else (.pubkey[0:12] + "…") end)
+      + " (" + (.firstContact // "?") + " · pubkey " + (.pubkey[0:16]) + "…)\n"
+      + "    says: \"" + ((.intro // "") | gsub("[\n\r]";" ") | .[0:200]) + "\""
+      + (if (.requestedSkill // "") != "" then "\n    requested skill: " + .requestedSkill else "" end)
+      + (if (.impersonationSuspect // false)
+         then "\n    ⚠ IMPERSONATION RISK: claims the name \"" + (.name // "")
+              + "\" which is already tied to a DIFFERENT pubkey (" + ((.impersonationOf // "")[0:16])
+              + "…). The signing pubkey is the real identity — verify out-of-band before authorizing."
+         else "" end)
+    ' "$AUTHZ_PENDING" 2>/dev/null)
+    AUTHZ_MSG="${PCOUNT} unknown agent(s) are requesting to coordinate and need your authorization decision:\n${DETAILS}\n\nAuthorize:  /authorize-agent <name-or-npub> <cap,cap,...>\nDeny:       /deny-agent <name-or-npub>\nCapabilities: ${CAPS_LIST}\nNothing from these agents is acted upon until you decide."
+    jq -n --arg reason "$AUTHZ_MSG" '{"decision":"block","reason":$reason}'
+    exit 0
+  fi
+fi
+
+# --- Authorized agent requests queued for capability-scoped dispatch -----------
+WI_DIR="$STATE_DIR/agent-workitems"
+if [ -d "$WI_DIR" ]; then
+  QUEUED=0
+  for f in "$WI_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    [ "$(jq -r '.status // "queued"' "$f" 2>/dev/null)" = "queued" ] && QUEUED=$((QUEUED+1))
+  done
+  if [ "$QUEUED" -gt 0 ] 2>/dev/null; then
+    WI_MSG="${QUEUED} authorized agent request(s) are queued for dispatch. Run /process-agent-requests to hand each to a capability-scoped processor (a subagent constrained to that sender's granted capabilities). Requests outside the grant are refused and reported; destructive/outward actions still require your confirmation."
+    jq -n --arg reason "$WI_MSG" '{"decision":"block","reason":$reason}'
+    exit 0
+  fi
+fi
+
+# --- Content-guard (SIF) quarantined agent messages awaiting owner review ------
+Q_DIR="$STATE_DIR/agent-quarantine"
+if [ -d "$Q_DIR" ]; then
+  QN=0
+  for f in "$Q_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    [ "$(jq -r '.status // "quarantined"' "$f" 2>/dev/null)" = "quarantined" ] && QN=$((QN+1))
+  done
+  if [ "$QN" -gt 0 ] 2>/dev/null; then
+    Q_DETAILS=$(for f in "$Q_DIR"/*.json; do [ -e "$f" ] || continue
+      [ "$(jq -r '.status // "quarantined"' "$f" 2>/dev/null)" = "quarantined" ] || continue
+      jq -r '"  • " + (if (.unicityName // "") != "" then .unicityName else (.from_pubkey[0:12] + "…") end)
+             + " — reasons: " + (((.sif.reasons // []) | join(", ")) | if . == "" then "(unspecified)" else . end)
+             + "\n    body: \"" + ((.body // "") | gsub("[\n\r]";" ") | .[0:160]) + "\""' "$f" 2>/dev/null
+    done)
+    Q_MSG="${QN} authorized agent message(s) were QUARANTINED by the content-guard (SIF) and NOT processed:\n${Q_DETAILS}\n\nReview them under ${Q_DIR}. If a message is safe, handle it manually; otherwise leave it quarantined (and consider /deny-agent for a repeat offender). Escape hatch: rm -f \"${Q_DIR}\"/*.json"
+    jq -n --arg reason "$Q_MSG" '{"decision":"block","reason":$reason}'
+    exit 0
+  fi
+fi
+
+# --- Team-coordination events pending (Contract-Net over A2A) -------------------
+# Queued team verbs (cfp/bid/award/progress/result/lease/kb) an authorized teammate sent,
+# plus any team invitation awaiting a join decision. Opt-in: surfaced, never auto-run.
+TE_DIR="$STATE_DIR/agent-team-events"
+TEAM_LIB="$DIAG_HOOK_DIR/team-coord.sh"
+TE_QUEUED=0
+if [ -d "$TE_DIR" ]; then
+  for f in "$TE_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    [ "$(jq -r '.status // "queued"' "$f" 2>/dev/null)" = "queued" ] && TE_QUEUED=$((TE_QUEUED+1))
+  done
+fi
+INV_COUNT=0
+if [ -f "$TEAM_LIB" ]; then
+  INV_COUNT="$(bash "$TEAM_LIB" invites 2>/dev/null | jq 'length' 2>/dev/null || echo 0)"
+  [ -n "$INV_COUNT" ] || INV_COUNT=0
+fi
+if { [ "$TE_QUEUED" -gt 0 ] 2>/dev/null; } || { [ "$INV_COUNT" -gt 0 ] 2>/dev/null; }; then
+  TE_DETAILS=""
+  if [ -d "$TE_DIR" ] && [ "$TE_QUEUED" -gt 0 ] 2>/dev/null; then
+    TE_DETAILS=$(for f in "$TE_DIR"/*.json; do [ -e "$f" ] || continue
+      [ "$(jq -r '.status // "queued"' "$f" 2>/dev/null)" = "queued" ] || continue
+      jq -r '"  • " + .kind + " · team " + (.team // "?") + (if (.task // "")!="" then " · task " + .task else "" end)
+             + " · from " + (if (.unicityName // "")!="" then .unicityName else (.from_pubkey[0:12] + "…") end)' "$f" 2>/dev/null
+    done)
+  fi
+  TE_MSG="Team coordination: ${TE_QUEUED} pending team event(s)"
+  [ "$INV_COUNT" -gt 0 ] 2>/dev/null && TE_MSG="$TE_MSG + ${INV_COUNT} team invitation(s) awaiting a join decision"
+  TE_MSG="$TE_MSG:\n${TE_DETAILS}\n\nRun /team-work to process them (record bids, award tasks, execute an award, review results, adopt heartbeats) or /team-status to review. Invitations are joined only when you choose to. Nothing here has been acted on."
+  jq -n --arg reason "$TE_MSG" '{"decision":"block","reason":$reason}'
+  exit 0
+fi
+
+# --- Remote-agent coordination: peer events / consults / conflicts / commitments ----
+# Queued peer events an authorized autonomous agent sent, open consults awaiting our
+# advisory, who's-on-this broadcasts awaiting our honest reply, split proposals,
+# OPEN CONFLICTS awaiting reconciliation (ladder: clean → auto-merge → ai-resolve →
+# re-plan), and change-commitments WE made but have not applied yet. Drained by
+# /coordinator-advise (or /consult-coordinator for threads we opened). Never auto-run.
+CE_DIR="$STATE_DIR/agent-consult-events"
+RC_LIB="$DIAG_HOOK_DIR/remote-coord.sh"
+CE_QUEUED=0
+if [ -d "$CE_DIR" ]; then
+  for f in "$CE_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    [ "$(jq -r '.status // "queued"' "$f" 2>/dev/null)" = "queued" ] && CE_QUEUED=$((CE_QUEUED+1))
+  done
+fi
+RC_OPEN=0; RC_INT=0; RC_SPL=0; RC_CONF=0; RC_PEND=0
+if [ -f "$RC_LIB" ]; then
+  RC_OPEN="$(bash "$RC_LIB" consult-list open 2>/dev/null | jq 'length' 2>/dev/null || echo 0)"
+  RC_INT="$(bash "$RC_LIB" intents 2>/dev/null | jq '[.[] | select(.side=="remote" and .status=="awaiting-reply")] | length' 2>/dev/null || echo 0)"
+  RC_SPL="$(bash "$RC_LIB" splits 2>/dev/null | jq '[.[] | select(.status=="proposed")] | length' 2>/dev/null || echo 0)"
+  RC_CONF="$(bash "$RC_LIB" conflicts 2>/dev/null | jq '[.[] | select(.status=="open")] | length' 2>/dev/null || echo 0)"
+  RC_PEND="$(bash "$RC_LIB" commitments 2>/dev/null | jq '[.[] | select(.status=="pending")] | length' 2>/dev/null || echo 0)"
+  [ -n "$RC_OPEN" ] || RC_OPEN=0; [ -n "$RC_INT" ] || RC_INT=0; [ -n "$RC_SPL" ] || RC_SPL=0
+  [ -n "$RC_CONF" ] || RC_CONF=0; [ -n "$RC_PEND" ] || RC_PEND=0
+fi
+if [ "$((CE_QUEUED + RC_OPEN + RC_INT + RC_SPL + RC_CONF + RC_PEND))" -gt 0 ] 2>/dev/null; then
+  RC_MSG="Remote-agent coordination pending:"
+  [ "$CE_QUEUED" -gt 0 ] 2>/dev/null && RC_MSG="$RC_MSG ${CE_QUEUED} queued peer event(s);"
+  [ "$RC_OPEN" -gt 0 ] 2>/dev/null && RC_MSG="$RC_MSG ${RC_OPEN} open consult(s) awaiting an advisory;"
+  [ "$RC_INT" -gt 0 ] 2>/dev/null && RC_MSG="$RC_MSG ${RC_INT} who's-on-this broadcast(s) awaiting our reply;"
+  [ "$RC_SPL" -gt 0 ] 2>/dev/null && RC_MSG="$RC_MSG ${RC_SPL} split proposal(s) to review;"
+  [ "$RC_CONF" -gt 0 ] 2>/dev/null && RC_MSG="$RC_MSG ${RC_CONF} open conflict(s) awaiting reconciliation;"
+  [ "$RC_PEND" -gt 0 ] 2>/dev/null && RC_MSG="$RC_MSG ${RC_PEND} change-commitment(s) we promised but have not applied;"
+  RC_MSG="$RC_MSG Run /coordinator-advise to process them (reply, ack overlaps, arbitrate splits, reconcile conflicts, work off commitments). Nothing has been acted on."
+  jq -n --arg reason "$RC_MSG" '{"decision":"block","reason":$reason}'
+  exit 0
+fi
+
 exit 0

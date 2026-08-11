@@ -102,4 +102,10 @@ if [ -f "$HOOK_DIR/notify.sh" ]; then
   fi
 fi
 
+# Route the just-appended message through the authorization classifier (DEFAULT-DENY).
+# Guarded so a classifier failure can never break this daemon hook.
+if [ -f "$HOOK_DIR/classify-inbound.sh" ]; then
+  bash "$HOOK_DIR/classify-inbound.sh" >/dev/null 2>&1 || true
+fi
+
 exit 0

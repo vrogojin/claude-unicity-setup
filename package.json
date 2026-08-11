@@ -1,0 +1,15 @@
+{
+  "name": "claude-unicity-setup",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Nostr/Sphere comms daemon + helper for Claude Code agents (identity, DM/group listening, hook dispatch).",
+  "type": "module",
+  "bin": {
+    "sphere-daemon": "lib/sphere-daemon.mjs",
+    "sphere-helper": "lib/sphere-helper.mjs"
+  },
+  "dependencies": {
+    "@unicitylabs/sphere-sdk": "0.14.3",
+    "@unicitylabs/nostr-js-sdk": "0.6.0"
+  }
+}

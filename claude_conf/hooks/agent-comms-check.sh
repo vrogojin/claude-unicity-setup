@@ -88,6 +88,11 @@ MERGED=$(echo "$CURRENT" | jq \
 
 echo "$MERGED" > "$STATE_FILE"
 
+# --- Route newly-merged messages through the authorization classifier (DEFAULT-DENY) ---
+if [ -f "$HOOK_DIR/classify-inbound.sh" ]; then
+  bash "$HOOK_DIR/classify-inbound.sh" >/dev/null 2>&1 || true
+fi
+
 # --- Notify ---
 PRIORITY_NEW=$(echo "$POLL_RESULT" | jq '[.messages[] | select(.priority == true)] | length' 2>/dev/null || echo 0)
 
