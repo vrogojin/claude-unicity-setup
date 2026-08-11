@@ -25,7 +25,7 @@ AGENT_DIR="$CLAUDE_PROJECT_DIR/.claude/agent"
 
 DEFAULT_CAPS="team-coordinate,task-bid,knowledge-share,self-directed,consult,claim-area"
 
-npub=""; name=""; caps="$DEFAULT_CAPS"; note=""
+npub=""; nametag=""; name=""; caps="$DEFAULT_CAPS"; note=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --name) name="${2:-}"; shift 2;;
@@ -33,10 +33,27 @@ while [ $# -gt 0 ]; do
     --note) note="${2:-}"; shift 2;;
     npub1*) npub="$1"; shift;;
     -h|--help) grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    # A bare Unicity nametag (lowercase alnum / - / _) is accepted and resolved to an npub
+    # via the Sphere SDK, so you can authorize a teammate by the NAME they gave you.
+    [a-z0-9]*) nametag="$1"; shift;;
     *) echo "onboard-teammate: unknown arg '$1'" >&2; exit 2;;
   esac
 done
-[ -n "$name" ] || { echo "ERR: --name <name> required" >&2; exit 2; }
+[ -n "$name" ] || name="$nametag"
+[ -n "$name" ] || { echo "ERR: --name <name> required (or pass a nametag)" >&2; exit 2; }
+
+# If given a nametag instead of an npub, resolve it -> npub via the Sphere SDK.
+if [ -z "$npub" ] && [ -n "$nametag" ]; then
+  HELPER="$(command -v sphere-helper.mjs 2>/dev/null || true)"
+  [ -n "$HELPER" ] || for p in /home/vrogojin/claude_unicity_setup/lib/sphere-helper.mjs "$HOME"/claude*unicity*setup/lib/sphere-helper.mjs; do
+    [ -f "$p" ] && { HELPER="$p"; break; }; done
+  [ -n "$HELPER" ] || { echo "ERR: sphere-helper.mjs not found to resolve nametag '$nametag'" >&2; exit 1; }
+  echo "== Resolving nametag '$nametag' -> npub via the Sphere SDK ..."
+  npub="$(node "$HELPER" resolve-nametag "$nametag" 2>/dev/null | jq -r '.npub // empty' 2>/dev/null)"
+  [ -n "$npub" ] || { echo "ERR: nametag '$nametag' did not resolve (registered? sphere-helper working?)" >&2; exit 1; }
+  echo "   -> $npub"
+fi
+[ -n "$npub" ] || { echo "ERR: pass the teammate's npub OR their Unicity nametag" >&2; exit 2; }
 
 # Our coordinator identity + relay, to embed in the invite.
 OUR_NPUB="$(CLAUDE_PROJECT_DIR="$CLAUDE_PROJECT_DIR" bash "$RC" self 2>/dev/null | sed -n 's/.*npub=\([^ ]*\).*/\1/p')"
