@@ -726,10 +726,23 @@ rc_ingest() {  # <event-json-or-file-or-->  (event = the queued wrapper OR a raw
         && echo "ADVISORY received on $cid" || echo "ADVISORY for unknown consult $cid — noted"
       rc_render >/dev/null 2>&1 || true;;
     consult.ack)
-      _rc_consult_patch "$cid" '.status="closed" | .ack=($p + {at:$now})' \
-        --argjson p "$payload" --arg now "$(rc_now)" >/dev/null 2>&1
-      rc_render >/dev/null 2>&1 || true
-      echo "ACK on $cid";;
+      # Dual duty: closes a consult thread (by .consult/cid) AND — when the payload
+      # carries a sid — accepts a split we proposed (the lead protocol: recipients
+      # reply to split.propose via consult.ack). Acceptance applies the partition.
+      local acksid; acksid="$(jq -r '.sid // ""' <<<"$payload")"
+      if [ -n "$acksid" ]; then
+        _rc_split_patch "$acksid" '.status="agreed" | .agreedAt=$now | .agreeNote=($p.note // "")' \
+          --arg now "$(rc_now)" --argjson p "$payload" >/dev/null 2>&1
+        _rc_split_apply "$acksid"
+        rc_render >/dev/null 2>&1 || true
+        echo "SPLIT accepted via consult.ack: $acksid — per-part advisory claims recorded"
+      fi
+      if [ -n "$cid" ]; then
+        _rc_consult_patch "$cid" '.status="closed" | .ack=($p + {at:$now})' \
+          --argjson p "$payload" --arg now "$(rc_now)" >/dev/null 2>&1
+        rc_render >/dev/null 2>&1 || true
+        echo "ACK on $cid"
+      fi;;
     consult.commit_done)
       _rc_consult_patch "$cid" '.commitments = ((.commitments // []) | map(if .cmid==($p.cmid // "") then (.status="applied") else . end))' \
         --argjson p "$payload" >/dev/null 2>&1
@@ -796,23 +809,26 @@ rc_ingest() {  # <event-json-or-file-or-->  (event = the queued wrapper OR a raw
       _rc_write "$(_rc_splits_file)" '
         .splits = ((.splits // []) | map(select(.sid != $sid)))
         | .splits += [{sid:$sid, side:"remote", peerNpub:$from, peerName:$name,
-            about:($p.about // ""), partition:($p.partition // []),
+            subject:($p.subject // ""), about:($p.about // ""), partition:($p.partition // []),
             parallelVersions:($p.parallelVersions // false), note:($p.note // ""),
             status:"proposed", receivedAt:$now}]' \
         --arg sid "$sid" --arg from "$from_npub" --arg name "$from_name" \
         --argjson p "$payload" --arg now "$(rc_now)"
       rc_render >/dev/null 2>&1 || true
       if [ "$(jq -r '.parallelVersions // false' <<<"$payload")" = "true" ]; then
-        echo "SPLIT proposal $sid from $from_npub: acknowledged PARALLEL-VERSIONS run — agree via 'split-agree $sid' if intended"
+        echo "SPLIT proposal $sid from $from_npub: acknowledged PARALLEL-VERSIONS run on '$(jq -r '.subject // .about // "?"' <<<"$payload")' — agree via 'split-agree $sid' if intended"
       else
-        echo "SPLIT proposal $sid from $from_npub: partition of $(jq -r '.about // "?"' <<<"$payload") — review + 'split-agree $sid' (or counter-propose); escalate to admins only if a judgment call is needed"
+        echo "SPLIT proposal $sid from $from_npub: partition of '$(jq -r '.subject // .about // "?"' <<<"$payload")' — review + 'split-agree $sid' (accept, records per-part claims) or counter with another split-propose; escalate to admins only if a judgment call is needed"
       fi;;
     split.agree)
+      # Peer accepted OUR proposal → the agreed partition becomes real awareness
+      # state: each part auto-creates that owner's advisory area claim.
       local sid; sid="$(jq -r '.sid // ""' <<<"$payload")"
       _rc_split_patch "$sid" '.status="agreed" | .agreedAt=$now | .agreeNote=($p.note // "")' \
         --arg now "$(rc_now)" --argjson p "$payload" >/dev/null 2>&1
+      _rc_split_apply "$sid"
       rc_render >/dev/null 2>&1 || true
-      echo "SPLIT agreed: $sid — proceed on your slice";;
+      echo "SPLIT agreed: $sid — per-part advisory claims recorded; proceed on your slice";;
     conflict.open)
       local kid; kid="$(jq -r '.kid // ""' <<<"$payload")"; [ -n "$kid" ] || kid="k-$mid"
       _rc_write "$(_rc_conflicts_file)" '
@@ -856,7 +872,7 @@ rc_render() {
     printf '\n## Work-intent broadcasts (who'"'"'s-on-this?)\n\n'
     _rc_intents | jq -r '.[] | "- \(.iid) [\(.side)] **\(.status)** — \(.subject // .intent // "")\(if (.approach // "") != "" then " · approach: " + .approach else "" end) · scope: \((.scope // [])|join(", ")) · replies: \((.responses // [])|length) (\((.responses // []) | map(select(.onIt==true)) | length) on it)"' 2>/dev/null
     printf '\n## Split negotiations\n\n'
-    _rc_splits | jq -r '.[] | "- \(.sid) [\(.side)] **\(.status)** — about \(.about)\(if .parallelVersions then " · PARALLEL-VERSIONS" else "" end) · slices: \((.partition // [])|length)"' 2>/dev/null
+    _rc_splits | jq -r '.[] | "- \(.sid) [\(.side)] **\(.status)** — \(.subject // .about // "")\(if .parallelVersions then " · PARALLEL-VERSIONS" else "" end) · slices: \((.partition // []) | map((.owner|.[0:12]) + "→" + .slice) | join(", "))"' 2>/dev/null
     printf '\n## Open conflicts (reconciliation ladder: clean → auto-merge → ai-resolve → re-plan)\n\n'
     _rc_conflicts | jq -r '.[] | "- \(.kid) **\(.status)** @ \(.stage) — \((.paths // [])|join(", ")) · parties: \((.parties // [])|join(", "))"' 2>/dev/null
     printf '\n## Our pending change-commitments\n\n'
@@ -893,6 +909,7 @@ _rc_cli() {
     intent-open) rc_intent_open "$@";;
     intents) _rc_intents; echo;;
     intent-result) rc_intent_result "${1:-}"; echo;;
+    intent-check) rc_intent_check "${1:-}"; echo;;
     split-propose) rc_split_propose "$@";;
     split-agree) rc_split_agree "$@";;
     splits) _rc_splits; echo;;
@@ -925,12 +942,14 @@ Commands:
   consult-list [status] | consult-get <cid>
   advise <cid> --advisory TEXT [--conflicts JSON] [--commit "desc|scope"]...
   commit-done <cmid> [note] | commitments
-  intent-open --intent I --scope csv [--window-mins M] | intents | intent-result <iid>
+  intent-open --subject S --area csv [--approach A] [--deadline ISO | --window-mins M]
+  intents | intent-result <iid> | intent-check <scope-csv>
   area-upsert --area ID --scope csv --holder npub [--name --side --status --ttl-hours --note]
   areas [status] | area-check <scope-csv> | area-ack <areaId> [advice]
   area-heartbeat <areaId> [--ttl-hours H] | area-release <areaId> | reap
-  split-propose --to <npub> --about <iid|areaId> --partition JSON [--parallel-versions] [--note T]
-  split-agree <sid> [note] | splits
+  split-propose --subject S --parts 'npub=slice-desc|scope' [--parts ...] \
+                [--about <iid|areaId>] [--parallel-versions] [--note T] [--emit]
+  split-agree <sid> [note] | splits     (accept also arrives as consult.ack{sid})
   conflict-open --paths csv --parties csv [--about --note] | conflicts
   conflict-resolve <kid> --stage clean|auto-merge|ai-resolve|re-plan [--resolution T] [--open]
   conflict-scan <repo-dir> <branchA> <branchB>

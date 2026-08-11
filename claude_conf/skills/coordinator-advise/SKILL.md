@@ -67,14 +67,18 @@ split or sequencing; the peer decides for their side.
 
 ### 3. Arbitrate splits + acknowledge parallel versions
 
-Review `split.propose` records: a **partition** should be genuinely disjoint (check
-the slices against the claim map and against each other); a **parallelVersions**
-proposal is legitimate when trying competing approaches is the point — both proceed
-knowingly, and someone (usually us, as integrator) later judges which version wins.
-Agree with `bash "$RC" emit "$(bash "$RC" split-agree <sid> "note")" --to <peerNpub>`,
-or counter-propose. Peers normally settle this autonomously; **pull the admin in only
-for judgment calls** (which approach wins, how to divide) — that escalation is
-optional, not required.
+Review `split.propose` records: a **partition** (`parts`: owner + slice + scope)
+should be genuinely disjoint — check the slices against the claim map and against
+each other; a **parallelVersions** proposal is legitimate when trying competing
+approaches is the point — both proceed knowingly, and someone (usually us, as
+integrator) later judges which version wins. Accept with
+`bash "$RC" emit "$(bash "$RC" split-agree <sid> "note")" --to <peerNpub>` (a
+`consult.ack` carrying the `sid` also counts as acceptance), or counter with your own
+`split-propose`. **Acceptance auto-creates each owner's advisory area claim from the
+partition** (skipped for parallel-versions), so the who-is-working-where map stays
+current without extra steps. Peers normally settle this autonomously; **pull the
+admin in only for judgment calls** (which approach wins, how to divide) — unresolved
+proposals stay on the Stop gate until settled.
 
 ### 4. Reconcile conflicts (the integrator role — reconcile, don't prevent)
 

@@ -66,14 +66,14 @@ an authorized sender lacking the capability is refused (`capMissing`).
 | Verb (`kind`) | Cap | Direction | Meaning |
 |---|---|---|---|
 | `peer.announce` | `self-directed` | remote → coord | standing "I am autonomously working on…" (initiative map) |
-| `work.intent` | `claim-area` | any → **all peers** | "is anyone already working on X?" — live who's-on-this broadcast (reply window) |
-| `work.status` | `claim-area` | peer → asker | honest reply: `onIt` true/false + context |
+| `work.intent` | `claim-area` | any → **all peers** | "is anyone already working on X?" — live who's-on-this broadcast: `{subject, scope[] (area), approach, windowUntil (deadline, mirrors a CFP window)}` |
+| `work.status` | `claim-area` | peer → asker | honest reply: `onIt` true/false + context; receivers also see their own overlapping claims AND live intents surfaced on ingest |
 | `area.claim` | `claim-area` | any → coord/peers | register an **advisory** claim {scope[], note} — active immediately, no grant needed |
 | `area.ack` | `claim-area` | coord → claimant | overlap NOTICE + coordination advice (information, never permission) |
 | `area.heartbeat` | `claim-area` | claimant → coord | renew the claim's liveness lease |
 | `area.release` | `claim-area` | claimant → coord | done; claim released |
-| `split.propose` | `claim-area` | peer ↔ peer | partition overlapping work into disjoint slices — or flag `parallelVersions` (deliberate competing approaches) |
-| `split.agree` | `claim-area` | peer ↔ peer | accept the partition / acknowledge the parallel run |
+| `split.propose` | `claim-area` | proposer → **all part owners** | partition overlapping work into disjoint slices `partition[]: {owner, slice, scope}` (CLI: repeatable `--parts 'npub=slice-desc\|scope'`) — or flag `parallelVersions` (deliberate competing approaches; no partition) |
+| `split.agree` | `claim-area` | peer ↔ peer | accept the partition / acknowledge the parallel run — a `consult.ack` carrying the `sid` also counts; **acceptance auto-creates each owner's advisory area claim** from the partition; counter-proposals are just another `split.propose` |
 | `consult.request` | `consult` | remote → coord | "I intend to work on X — conflicts?" / "I changed Y — please apply matching changes" |
 | `consult.advise` | `consult` | coord → remote | holistic advisory: conflicts, prior work, gotchas + change-**commitments** |
 | `consult.ack` | `consult` | remote → coord | advisory received; thread closed |
@@ -110,12 +110,18 @@ expires without heartbeats. It grants nothing and forbids nothing.
 
 **Rung 2 — negotiation (when overlap is real).** Two legitimate outcomes:
 - **Split the work** — `split.propose` partitions the feature/bug into disjoint
-  slices, each owned by one party; `split.agree` settles it. Peers negotiate this
-  **autonomously**; escalate to the human admins only when a judgment call is needed
-  (which approach wins, how to divide) — an optional branch, not a requirement.
+  slices (`--parts 'npub=slice-desc|scope'`, fan-out to every part owner);
+  `split.agree` — or a `consult.ack` carrying the `sid` — settles it, and the agreed
+  partition **auto-creates each owner's advisory area claim**, keeping the
+  who-is-working-where map current. A counter-offer is simply another
+  `split.propose`. Peers negotiate **autonomously**; escalate to the human admins
+  only when a judgment call is needed (which approach wins, how to divide) — an
+  optional branch, not a requirement. Unresolved proposals sit on the Stop gate.
 - **Deliberate parallel versions** — trying different approaches to the same thing is
-  allowed and useful; `split.propose --parallel-versions` announces it so both proceed
-  knowingly (the integrator later judges which version lands).
+  allowed and useful; `split.propose --parallel-versions` (with `--approach` tags on
+  the intents) announces it so both proceed knowingly — the decision is recorded, no
+  partition or claims are created, and the integrator later judges which version
+  lands.
 
 **Rung 3 — reconciliation (conflicts still happen; they get merged, not blamed).**
 Mechanical detection: `conflict-scan` lists paths BOTH branches touched since their

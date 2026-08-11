@@ -52,32 +52,42 @@ dry-run. Let `RC="$CLAUDE_PROJECT_DIR/.claude/hooks/remote-coord.sh"`.
       agent finds it (in a team: `/team-publish`; always record graph edges you
       discovered: `bash "$RC" edge-add "feature:X" duplicates "PR#123"`).
 
-   b. **Broadcast "who's-on-this?"** to ALL peers and wait the window:
+   b. **Broadcast "who's-on-this?"** to ALL peers and wait the window (`--deadline`
+      mirrors a CFP reply window; `--approach` tags your angle for the
+      parallel-versions case):
       ```bash
-      IID="$(bash "$RC" intent-open --intent "rework CRM invite flow" \
-         --scope "unicity-crm:src/invites,concierge-backend:backend/src/crm" --window-mins 30)"
+      IID="$(bash "$RC" intent-open --subject "rework CRM invite flow" \
+         --area "unicity-crm:src/invites,concierge-backend:backend/src/crm" \
+         --approach "event-sourced" --window-mins 30)"
       bash "$RC" emit "$(bash "$RC" envelope work.intent \
-         --payload "$(bash "$RC" intents | jq -c --arg i "$IID" '.[] | select(.iid==$i) | {iid, intent, scope, windowUntil}')")" \
+         --payload "$(bash "$RC" intents | jq -c --arg i "$IID" '.[] | select(.iid==$i) | {iid, subject, approach, scope, windowUntil}')")" \
          --to-all-peers
       ```
       After the window (drain step 1 again, then `bash "$RC" intent-result "$IID"`):
       - **`clear-to-claim`** (nobody responded / no overlap) → proceed to step 3.
       - **`coordinate-or-split`** (a peer IS on it) → do NOT silently duplicate.
-        Either negotiate a **subtask partition** — each party owns a disjoint slice:
+        Either negotiate a **subtask partition** — each `--parts` entry is one
+        non-overlapping slice `npub=slice-desc|scope`; `--emit` fans the proposal out
+        to every non-self part owner:
         ```bash
-        bash "$RC" emit "$(bash "$RC" split-propose --to <peerNpub> --about "$IID" \
-           --partition "$(jq -nc '[{owner:"<peerNpub>", scope:"src/invites/ui"},
-                                   {owner:"<selfNpub>", scope:"src/invites/api"}]')" \
-           --note "you take UI, I take API")" --to <peerNpub>
+        bash "$RC" split-propose --subject "CRM invite rework" --about "$IID" \
+           --parts "<peerNpub>=UI slice|unicity-crm:src/invites/ui" \
+           --parts "<selfNpub>=API slice|unicity-crm:src/invites/api" \
+           --note "you take UI, I take API" --emit
         ```
-        …or, if trying *different approaches to the same thing* is the point, announce
-        a deliberate parallel run with `--parallel-versions` (both proceed knowingly).
-        Wait for `split.agree` before treating the partition as settled. Resolution is
-        normally fully autonomous between the peers; **escalate to the human admins
-        only when a judgment call is needed** (which approach wins, how to divide).
+        …or, if trying *different approaches to the same thing* is the point, propose
+        with `--parallel-versions` instead of `--parts` (both proceed knowingly; no
+        partition recorded). Peers accept via `split.agree` or a `consult.ack`
+        carrying the `sid` — **an accepted partition auto-creates each owner's
+        advisory area claim**, so step 3 may already be done for your slice. They can
+        also counter with another `split-propose`. Resolution is normally fully
+        autonomous between the peers; **escalate to the human admins only when a
+        judgment call is needed** (which approach wins, how to divide) — unresolved
+        proposals sit on the Stop gate until settled.
 
-3. **Register an advisory claim** for the slice you'll work (awareness, NOT a lock —
-   it never forbids anyone's parallel work, and you need no grant to proceed):
+3. **Register an advisory claim** for the slice you'll work — unless an agreed split
+   already created it for you in 2b (awareness, NOT a lock — it never forbids
+   anyone's parallel work, and you need no grant to proceed):
    ```bash
    bash "$RC" area-upsert --area crm-invite-api --scope "unicity-crm:src/invites/api" \
       --holder "<selfNpub>" --side local --status active
