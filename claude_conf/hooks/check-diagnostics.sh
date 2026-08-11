@@ -221,4 +221,42 @@ if { [ "$TE_QUEUED" -gt 0 ] 2>/dev/null; } || { [ "$INV_COUNT" -gt 0 ] 2>/dev/nu
   exit 0
 fi
 
+# --- Remote-agent coordination: peer events / consults / conflicts / commitments ----
+# Queued peer events an authorized autonomous agent sent, open consults awaiting our
+# advisory, who's-on-this broadcasts awaiting our honest reply, split proposals,
+# OPEN CONFLICTS awaiting reconciliation (ladder: clean → auto-merge → ai-resolve →
+# re-plan), and change-commitments WE made but have not applied yet. Drained by
+# /coordinator-advise (or /consult-coordinator for threads we opened). Never auto-run.
+CE_DIR="$STATE_DIR/agent-consult-events"
+RC_LIB="$DIAG_HOOK_DIR/remote-coord.sh"
+CE_QUEUED=0
+if [ -d "$CE_DIR" ]; then
+  for f in "$CE_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    [ "$(jq -r '.status // "queued"' "$f" 2>/dev/null)" = "queued" ] && CE_QUEUED=$((CE_QUEUED+1))
+  done
+fi
+RC_OPEN=0; RC_INT=0; RC_SPL=0; RC_CONF=0; RC_PEND=0
+if [ -f "$RC_LIB" ]; then
+  RC_OPEN="$(bash "$RC_LIB" consult-list open 2>/dev/null | jq 'length' 2>/dev/null || echo 0)"
+  RC_INT="$(bash "$RC_LIB" intents 2>/dev/null | jq '[.[] | select(.side=="remote" and .status=="awaiting-reply")] | length' 2>/dev/null || echo 0)"
+  RC_SPL="$(bash "$RC_LIB" splits 2>/dev/null | jq '[.[] | select(.status=="proposed")] | length' 2>/dev/null || echo 0)"
+  RC_CONF="$(bash "$RC_LIB" conflicts 2>/dev/null | jq '[.[] | select(.status=="open")] | length' 2>/dev/null || echo 0)"
+  RC_PEND="$(bash "$RC_LIB" commitments 2>/dev/null | jq '[.[] | select(.status=="pending")] | length' 2>/dev/null || echo 0)"
+  [ -n "$RC_OPEN" ] || RC_OPEN=0; [ -n "$RC_INT" ] || RC_INT=0; [ -n "$RC_SPL" ] || RC_SPL=0
+  [ -n "$RC_CONF" ] || RC_CONF=0; [ -n "$RC_PEND" ] || RC_PEND=0
+fi
+if [ "$((CE_QUEUED + RC_OPEN + RC_INT + RC_SPL + RC_CONF + RC_PEND))" -gt 0 ] 2>/dev/null; then
+  RC_MSG="Remote-agent coordination pending:"
+  [ "$CE_QUEUED" -gt 0 ] 2>/dev/null && RC_MSG="$RC_MSG ${CE_QUEUED} queued peer event(s);"
+  [ "$RC_OPEN" -gt 0 ] 2>/dev/null && RC_MSG="$RC_MSG ${RC_OPEN} open consult(s) awaiting an advisory;"
+  [ "$RC_INT" -gt 0 ] 2>/dev/null && RC_MSG="$RC_MSG ${RC_INT} who's-on-this broadcast(s) awaiting our reply;"
+  [ "$RC_SPL" -gt 0 ] 2>/dev/null && RC_MSG="$RC_MSG ${RC_SPL} split proposal(s) to review;"
+  [ "$RC_CONF" -gt 0 ] 2>/dev/null && RC_MSG="$RC_MSG ${RC_CONF} open conflict(s) awaiting reconciliation;"
+  [ "$RC_PEND" -gt 0 ] 2>/dev/null && RC_MSG="$RC_MSG ${RC_PEND} change-commitment(s) we promised but have not applied;"
+  RC_MSG="$RC_MSG Run /coordinator-advise to process them (reply, ack overlaps, arbitrate splits, reconcile conflicts, work off commitments). Nothing has been acted on."
+  jq -n --arg reason "$RC_MSG" '{"decision":"block","reason":$reason}'
+  exit 0
+fi
+
 exit 0

@@ -32,6 +32,11 @@ REGISTRY="$HOOK_DIR/agent-registry.sh"
 # Source the team-coordination engine (guarded CLI → sourcing only defines funcs). Provides
 # team_is_verb / team_verb_cap / team_enqueue_event / team_exists for routing team A2A verbs.
 . "$HOOK_DIR/team-coord.sh" 2>/dev/null || true
+# Source the remote-agent coordination engine (guarded CLI → sourcing only defines funcs).
+# Provides rc_is_verb / rc_verb_cap / rc_enqueue_event for routing peer A2A verbs
+# (peer.announce, consult.*, work.*, area.*, split.*, conflict.*) — autonomous remote
+# agents coordinating with our coordinator.
+. "$HOOK_DIR/remote-coord.sh" 2>/dev/null || true
 
 STATE_FILE="$STATE_DIR/agent-messages.json"
 PENDING_FILE="$STATE_DIR/agent-authz-pending.json"
@@ -210,6 +215,34 @@ while [ "$i" -lt "$TOTAL" ]; do
             # Authorized but NOT granted the capability this team verb needs → default-deny.
             AUTHZJSON="$(jq -nc --arg name "$NAME" --arg kind "$ENV_KIND" --arg cap "$REQ_CAP" \
               '{role:"agent", status:"authorized", unicityName:$name, teamVerb:$kind, capMissing:$cap, classified:true}')"
+          fi
+        elif [ -n "$ENV_KIND" ] && type rc_is_verb >/dev/null 2>&1 && rc_is_verb "$ENV_KIND"; then
+          # --- Remote-agent coordination verb? Route to the consult-event queue ---------
+          # Peer verbs (peer.announce / consult.* / work.* / area.* / split.* /
+          # conflict.*) come from AUTONOMOUS remote agents, not team members — so there
+          # is NO team-membership gate. Everything else holds: the SENDER must hold the
+          # capability this verb requires in OUR registry (default-deny) and the body
+          # must be SIF-clean. Ingest only RECORDS; decisions (advise/ack/split/
+          # reconcile/commit) are made by /coordinator-advise with the admin in the loop.
+          REQ_CAP="$(rc_verb_cap "$ENV_KIND")"
+          if echo "$CAPS" | jq -e --arg c "$REQ_CAP" 'index($c)' >/dev/null 2>&1; then
+            SIF_Q=0
+            if [ -f "$SIF_GUARD" ]; then
+              SIF_OUT="$(printf '%s' "$BODY" | bash "$SIF_GUARD" check --direction inbound --principal "$FROM" --source agent-comms 2>/dev/null)"
+              [ -n "$SIF_OUT" ] || SIF_OUT='{}'
+              [ "$(echo "$SIF_OUT" | jq -r '.decision // "pass"' 2>/dev/null)" = "quarantine" ] && SIF_Q=1
+            fi
+            if [ "$SIF_Q" = "1" ]; then
+              quarantine_message "$FROM" "$TS" "$BODY" "$TYPE" "$GROUP" "$NAME" "$NPUB" "${SIF_OUT:-{}}"
+            else
+              rc_enqueue_event "$FROM" "$TS" "$BODY" "$NPUB" "$NAME" >/dev/null 2>&1 || true
+            fi
+            AUTHZJSON="$(jq -nc --arg name "$NAME" --arg kind "$ENV_KIND" --argjson q "$SIF_Q" \
+              '{role:"agent", status:"authorized", unicityName:$name, peerVerb:$kind, sifQuarantined:($q==1), classified:true}')"
+          else
+            # Authorized but NOT granted the capability this peer verb needs → default-deny.
+            AUTHZJSON="$(jq -nc --arg name "$NAME" --arg kind "$ENV_KIND" --arg cap "$REQ_CAP" \
+              '{role:"agent", status:"authorized", unicityName:$name, peerVerb:$kind, capMissing:$cap, classified:true}')"
           fi
         else
           # --- Non-team message: existing 1:1 capability-scoped request path (unchanged) ---

@@ -36,7 +36,17 @@ set -uo pipefail
 # bid/result → task-bid; kb.publish → knowledge-share). The actual work a team task drives
 # still passes through the normal capability-scoped processor + owner-confirmation, so a
 # team award can never itself trigger a rebuild/merge unattended.
-AGENT_CAPABILITIES="read-status chat dev-advice rebuild-reload-service review-merge-pr team-coordinate task-bid knowledge-share"
+#
+# self-directed / consult / claim-area power the REMOTE-AGENT coordination protocol
+# (autonomous peers coordinating with our coordinator — see
+# docs/team-coordination-remote-agents.md). Also NON-destructive: announce initiatives →
+# self-directed; consult threads + conflict reconciliation (request/advise/ack/
+# commit_done, conflict.open/resolve) → consult; the awareness/claim/negotiate fabric
+# (work.intent/status who's-on-this broadcasts, ADVISORY area claims/acks/heartbeats,
+# split.propose/agree partitions) → claim-area. Claims are soft — they never forbid
+# parallel work — and a consult can ASK us to apply matching changes on our side, but
+# applying them still runs the normal local workflow with admin confirmation.
+AGENT_CAPABILITIES="read-status chat dev-advice rebuild-reload-service review-merge-pr team-coordinate task-bid knowledge-share self-directed consult claim-area"
 AGENT_CAPS_DESTRUCTIVE="rebuild-reload-service review-merge-pr"
 
 # --- Registry path resolution ----------------------------------------------------
