@@ -42,6 +42,7 @@ STATE_FILE="$STATE_DIR/agent-messages.json"
 PENDING_FILE="$STATE_DIR/agent-authz-pending.json"
 WORKITEMS_DIR="$STATE_DIR/agent-workitems"
 QUARANTINE_DIR="$STATE_DIR/agent-quarantine"
+DEFERRED_DIR="$STATE_DIR/agent-deferred"
 SIF_GUARD="$HOOK_DIR/sif-guard.sh"
 LOCK="$STATE_FILE.classify.lock"
 mkdir -p "$WORKITEMS_DIR" "$QUARANTINE_DIR" 2>/dev/null || true
@@ -113,6 +114,35 @@ quarantine_message() {  # args: from ts body type group name npub sif_verdict_js
      && mv "$qf.tmp.$$" "$qf" 2>/dev/null || rm -f "$qf.tmp.$$" 2>/dev/null || true
 }
 
+# Stash a first-contact / cap-missing COORDINATION envelope so a later `authorize` can
+# REPLAY it instead of losing the peer's opening message (peer authorization chicken-and-
+# egg — issue #14). Keyed by sender pubkey hex; the raw envelope body is preserved so
+# agent-registry.sh → remote-coord.sh replay-deferred can re-enqueue it by kind. Only
+# coordination verbs are stashed (a plain DM has no replay path); dedup by event id.
+stash_deferred() {  # from ts body npub name kind eventid
+  local from="$1" ts="$2" body="$3" npub="$4" name="$5" kind="$6" eid="$7"
+  [ -n "$from" ] && [ "$from" != "unknown" ] || return 0
+  local d="$DEFERRED_DIR/$from"
+  mkdir -p "$d" 2>/dev/null || return 0
+  [ -n "$eid" ] || eid="$(printf '%s|%s|%s' "$from" "$ts" "$body" | sha1sum 2>/dev/null | cut -c1-16)"
+  [ -n "$eid" ] || return 0
+  local df="$d/$eid.json"
+  [ -f "$df" ] && return 0
+  jq -nc --arg from "$from" --arg ts "$ts" --arg body "$body" --arg npub "$npub" \
+     --arg name "$name" --arg kind "$kind" --arg now "$(now_iso)" \
+     '{from_pubkey:$from, receivedAt:$ts, body:$body, npub:$npub, unicityName:$name,
+       kind:$kind, deferredAt:$now}' > "$df.tmp.$$" 2>/dev/null \
+     && mv "$df.tmp.$$" "$df" 2>/dev/null || rm -f "$df.tmp.$$" 2>/dev/null || true
+}
+
+# Is this envelope kind a coordination verb (team OR peer) we know how to replay later?
+is_coord_verb() {  # kind
+  local k="$1"; [ -n "$k" ] || return 1
+  { type team_is_verb >/dev/null 2>&1 && team_is_verb "$k"; } && return 0
+  { type rc_is_verb   >/dev/null 2>&1 && rc_is_verb   "$k"; } && return 0
+  return 1
+}
+
 # Nothing to scan yet — still refresh the surface (reflects registry edits) and exit.
 if [ ! -f "$STATE_FILE" ]; then
   rebuild_pending_surface
@@ -138,6 +168,7 @@ while [ "$i" -lt "$TOTAL" ]; do
   FROM="$(echo "$MSG" | jq -r '.from // ""')"
   FROMNAME="$(echo "$MSG" | jq -r '.from_name // ""')"
   BODY="$(echo "$MSG" | jq -r '.body // ""')"
+  MSGID="$(echo "$MSG" | jq -r '.id // ""')"
   TS="$(echo "$MSG" | jq -r '.timestamp // ""')"
   TYPE="$(echo "$MSG" | jq -r '.type // ""')"
   GROUP="$(echo "$MSG" | jq -r '.group.name // ""')"
@@ -152,17 +183,22 @@ while [ "$i" -lt "$TOTAL" ]; do
   REQ_SKILL=""
   ENV_KIND=""
   ENV_TEAM=""
+  ENV_NPUB=""
   DISPLAY_BODY="$BODY"
   if echo "$BODY" | jq -e 'type=="object"' >/dev/null 2>&1; then
-    ENV_NAME="$(echo "$BODY" | jq -r '(.fromNpub // null) as $np | (.from // .agentCard.name // .agent.name // .name // "") | tostring' 2>/dev/null)"
+    ENV_NAME="$(echo "$BODY" | jq -r '(.from // .agentCard.name // .agent.name // .name // "") | tostring' 2>/dev/null)"
     REQ_SKILL="$(echo "$BODY" | jq -r '(.skill // .capability // .skillId // .method // "") | tostring' 2>/dev/null)"
     # Team-coordination envelope verb (kind) — routed capability-gated to the team queue.
     ENV_KIND="$(echo "$BODY" | jq -r '(.kind // "") | tostring' 2>/dev/null)"
     ENV_TEAM="$(echo "$BODY" | jq -r '(.team // "") | tostring' 2>/dev/null)"
+    # A self-declared npub in the envelope — display/hint only (identity is the pubkey);
+    # used to seed a pending/deferred entry so a later authorize can key it correctly.
+    ENV_NPUB="$(echo "$BODY" | jq -r '(.fromNpub // "") | tostring' 2>/dev/null)"
     ENV_MSG="$(echo "$BODY" | jq -r '(.message.text // .message // .task.text // .task // .text // "") | if type=="object" then tojson else tostring end' 2>/dev/null)"
     [ "$REQ_SKILL" = "null" ] && REQ_SKILL=""
     [ "$ENV_KIND" = "null" ] && ENV_KIND=""
     [ "$ENV_TEAM" = "null" ] && ENV_TEAM=""
+    [ "$ENV_NPUB" = "null" ] && ENV_NPUB=""
     { [ -z "$CLAIMED_NAME" ] && [ -n "$ENV_NAME" ] && [ "$ENV_NAME" != "null" ]; } && CLAIMED_NAME="$ENV_NAME"
     { [ -n "$ENV_MSG" ] && [ "$ENV_MSG" != "null" ]; } && DISPLAY_BODY="$ENV_MSG"
   fi
@@ -213,8 +249,10 @@ while [ "$i" -lt "$TOTAL" ]; do
             fi
           else
             # Authorized but NOT granted the capability this team verb needs → default-deny.
+            # Stash the envelope so granting the missing cap later replays it (issue #14).
+            stash_deferred "$FROM" "$TS" "$BODY" "$NPUB" "$NAME" "$ENV_KIND" "$MSGID"
             AUTHZJSON="$(jq -nc --arg name "$NAME" --arg kind "$ENV_KIND" --arg cap "$REQ_CAP" \
-              '{role:"agent", status:"authorized", unicityName:$name, teamVerb:$kind, capMissing:$cap, classified:true}')"
+              '{role:"agent", status:"authorized", unicityName:$name, teamVerb:$kind, capMissing:$cap, deferred:true, classified:true}')"
           fi
         elif [ -n "$ENV_KIND" ] && type rc_is_verb >/dev/null 2>&1 && rc_is_verb "$ENV_KIND"; then
           # --- Remote-agent coordination verb? Route to the consult-event queue ---------
@@ -241,8 +279,10 @@ while [ "$i" -lt "$TOTAL" ]; do
               '{role:"agent", status:"authorized", unicityName:$name, peerVerb:$kind, sifQuarantined:($q==1), classified:true}')"
           else
             # Authorized but NOT granted the capability this peer verb needs → default-deny.
+            # Stash the envelope so granting the missing cap later replays it (issue #14).
+            stash_deferred "$FROM" "$TS" "$BODY" "$NPUB" "$NAME" "$ENV_KIND" "$MSGID"
             AUTHZJSON="$(jq -nc --arg name "$NAME" --arg kind "$ENV_KIND" --arg cap "$REQ_CAP" \
-              '{role:"agent", status:"authorized", unicityName:$name, peerVerb:$kind, capMissing:$cap, classified:true}')"
+              '{role:"agent", status:"authorized", unicityName:$name, peerVerb:$kind, capMissing:$cap, deferred:true, classified:true}')"
           fi
         else
           # --- Non-team message: existing 1:1 capability-scoped request path (unchanged) ---
@@ -282,12 +322,21 @@ while [ "$i" -lt "$TOTAL" ]; do
         EXTRA=()
         [ -n "$REQ_SKILL" ] && EXTRA+=(--skill "$REQ_SKILL")
         [ -n "$SUSPECT" ] && EXTRA+=(--suspect-of "$SUSPECT")
+        [ -n "$ENV_NPUB" ] && EXTRA+=(--npub "$ENV_NPUB")
         bash "$REGISTRY" upsert-pending --pubkey "$FROM" --name "$CLAIMED_NAME" \
           --intro "$DISPLAY_BODY" --type "$TYPE" --group "$GROUP" \
           ${EXTRA[@]+"${EXTRA[@]}"} >/dev/null 2>&1 || true
+        # First-contact chicken-and-egg (issue #14): a pending sender's opening COORDINATION
+        # envelope would otherwise be dropped. Stash it (keyed by hex) so `authorize <sender>`
+        # replays it — no manual re-send needed. Only coordination verbs have a replay path.
+        DEFERRED=false
+        if is_coord_verb "$ENV_KIND"; then
+          stash_deferred "$FROM" "$TS" "$BODY" "$ENV_NPUB" "$CLAIMED_NAME" "$ENV_KIND" "$MSGID"
+          DEFERRED=true
+        fi
         NAME2="$(bash "$REGISTRY" get "$FROM" 2>/dev/null | jq -r '.unicityName // ""' 2>/dev/null || echo "")"
-        AUTHZJSON="$(jq -nc --arg name "$NAME2" --arg suspect "$SUSPECT" \
-          '{role:"agent", status:"pending", unicityName:$name, impersonationSuspect:($suspect!=""), classified:true}')"
+        AUTHZJSON="$(jq -nc --arg name "$NAME2" --arg suspect "$SUSPECT" --argjson deferred "$DEFERRED" \
+          '{role:"agent", status:"pending", unicityName:$name, impersonationSuspect:($suspect!=""), deferred:$deferred, classified:true}')"
         ;;
     esac
   fi

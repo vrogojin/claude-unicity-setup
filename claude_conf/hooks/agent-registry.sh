@@ -176,6 +176,55 @@ _ar_validate_caps() {  # prints validated space-joined caps; errors on unknown
   printf '%s' "${out[*]:-}"
 }
 
+# --- npub → hex, self-contained (for pre-authorize-by-npub) ----------------------
+# Decode a bech32 npub → 32-byte x-only pubkey hex WITHOUT the Nostr SDK (ESM import
+# of the SDK only resolves when sphere-helper.mjs sits inside the setup repo, which is
+# not the case in the concierge session). A pure decoder here means `authorize <npub>`
+# works everywhere. Prints lowercase hex on success; empty + non-zero on anything that
+# is not a structurally valid npub.
+_ar_npub_to_hex() {
+  local npub="$1" hex=""
+  case "$npub" in npub1*) ;; *) return 1;; esac
+  command -v node >/dev/null 2>&1 || return 1
+  hex="$(printf '%s' "$npub" | node -e '
+    const CH="qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
+      s=s.trim().toLowerCase();
+      const pos=s.lastIndexOf("1");
+      if(pos<1){process.exit(1);}
+      const hrp=s.slice(0,pos), data=s.slice(pos+1);
+      if(hrp!=="npub"){process.exit(1);}
+      const vals=[];for(const c of data){const i=CH.indexOf(c);if(i<0)process.exit(1);vals.push(i);}
+      if(vals.length<7)process.exit(1);
+      const d5=vals.slice(0,-6);              // drop the 6-char bech32 checksum
+      let acc=0,bits=0;const out=[];
+      for(const v of d5){acc=(acc<<5)|v;bits+=5;while(bits>=8){bits-=8;out.push((acc>>bits)&0xff);}}
+      if(out.length!==32)process.exit(1);
+      process.stdout.write(Buffer.from(out).toString("hex"));
+    });
+  ' 2>/dev/null || true)"
+  printf '%s' "$hex" | grep -qiE '^[0-9a-f]{64}$' || return 1
+  printf '%s' "$hex" | tr 'A-F' 'a-f'
+}
+
+# --- Deferred-envelope replay (peer authorization chicken-and-egg) ----------------
+# A peer's FIRST coordination envelope arrives before it is authorized, so classify-
+# inbound.sh stashes it under <STATE_DIR>/agent-deferred/<hex>/. On a successful grant
+# we hand the hex to remote-coord.sh, which re-enqueues each stashed envelope by kind
+# (peer verb → consult queue, team verb → team queue) and clears the stash. remote-
+# coord.sh sources both engines, so it owns the replay; we only trigger it. Best-effort
+# and silent on absence — never breaks an authorize.
+_ar_replay_deferred_for() {  # <hex>
+  local hex="$1"
+  [ -n "$hex" ] || return 0
+  local self_dir rc
+  self_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
+  rc="$self_dir/remote-coord.sh"
+  [ -f "$rc" ] || return 0
+  local n; n="$(bash "$rc" replay-deferred "$hex" 2>/dev/null || echo 0)"
+  [ "${n:-0}" != "0" ] && echo "replayed ${n} deferred envelope(s) for ${hex}" >&2 || true
+}
+
 # ================================================================================
 # CLI dispatch (only when executed directly, not when sourced)
 # ================================================================================
@@ -278,7 +327,23 @@ _ar_cli() {
       [ "${1:-}" = "--note" ] && { note="${2:-}"; shift 2 || true; }
       local key; key="$(_ar_resolve_key "$q")"
       [ "$key" = "__AMBIGUOUS__" ] && { echo "ERR: '$q' is ambiguous (matches multiple pubkeys — possible impersonation) — authorize by the exact pubkey or npub, not the name" >&2; return 1; }
-      [ -n "$key" ] || { echo "ERR: no registry entry matches '$q' (must have made contact first, or pass its exact pubkey/npub)" >&2; return 1; }
+      # PRE-AUTHORIZE-BY-NPUB: no existing entry, but the query is an npub → decode it to
+      # the pubkey hex and authorize that key directly (seeding a fresh entry). Lets the
+      # owner grant a peer BEFORE its first message ever arrives. Invalid npub → hard error,
+      # never a bogus write. A non-npub with no match keeps the original must-make-contact error.
+      local preauth_npub=""
+      if [ -z "$key" ]; then
+        case "$q" in
+          npub1*)
+            key="$(_ar_npub_to_hex "$q")" \
+              || { echo "ERR: '$q' is not a decodable npub — pass a valid npub or the exact pubkey hex" >&2; return 1; }
+            preauth_npub="$q"
+            ;;
+          *)
+            echo "ERR: no registry entry matches '$q' (must have made contact first, or pass its exact pubkey/npub)" >&2; return 1
+            ;;
+        esac
+      fi
       local vcaps; vcaps="$(_ar_validate_caps "$caps")" || return 1
       # shellcheck disable=SC2206
       local capsjson; capsjson="$(printf '%s\n' $vcaps | jq -R . | jq -sc .)"
@@ -286,10 +351,13 @@ _ar_cli() {
         .updated_at=$now
         | .agents[$k].status="authorized"
         | .agents[$k].capabilities=$caps
+        | .agents[$k].pubkey=$k
+        | (if $pnpub != "" and ((.agents[$k].npub // "") == "") then .agents[$k].npub=$pnpub else . end)
+        | (if (.agents[$k].firstSeen // "") == "" then .agents[$k].firstSeen=$now else . end)
         | .agents[$k].decidedAt=$now
         | (if $note != "" then .agents[$k].note=$note else . end)
-      ' --arg k "$key" --argjson caps "$capsjson" --arg note "$note" --arg now "$(_ar_now)" \
-        && _ar_read --arg k "$key" '.agents[$k]'
+      ' --arg k "$key" --argjson caps "$capsjson" --arg note "$note" --arg pnpub "$preauth_npub" --arg now "$(_ar_now)" \
+        && { _ar_read --arg k "$key" '.agents[$k]'; _ar_replay_deferred_for "$key"; }
       ;;
 
     deny)  # deny <query> [--note <text>]

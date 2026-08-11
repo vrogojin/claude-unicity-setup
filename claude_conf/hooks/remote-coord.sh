@@ -720,8 +720,11 @@ rc_ingest() {  # <event-json-or-file-or-->  (event = the queued wrapper OR a raw
       rc_render >/dev/null 2>&1 || true
       echo "CONSULT opened: $cid from $from_npub — advise via /coordinator-advise";;
     consult.advise)
-      # A coordinator answered a consult WE opened.
-      _rc_consult_patch "$cid" '.status="advised" | .advisory=($p + {at:$now})' \
+      # A coordinator answered a consult WE opened. The wire payload carries the
+      # advisory text under key `advisory`; store it ALSO under `.advisory.text` so
+      # readers match the coordinator-side shape (rc_advise writes `.advisory.text`).
+      # Keeps `.advisory.advisory` too for back-compat. See consult.advise field-name fix.
+      _rc_consult_patch "$cid" '.status="advised" | .advisory=($p + {text:($p.text // $p.advisory // ""), at:$now})' \
         --argjson p "$payload" --arg now "$(rc_now)" >/dev/null 2>&1 \
         && echo "ADVISORY received on $cid" || echo "ADVISORY for unknown consult $cid — noted"
       rc_render >/dev/null 2>&1 || true;;
@@ -884,6 +887,41 @@ rc_render() {
 }
 
 # ============================================================================
+# Deferred-envelope replay (peer authorization chicken-and-egg — issue #14)
+# ============================================================================
+# classify-inbound.sh stashes a peer's FIRST coordination envelope (arriving before the
+# sender is authorized) under <STATE_DIR>/agent-deferred/<hex>/<eventid>.json. When the
+# owner later authorizes that hex, agent-registry.sh calls us here to REPLAY the stash:
+# re-enqueue each envelope by kind onto the right queue (peer verb → consult queue via
+# rc_enqueue_event, team verb → team queue via team_enqueue_event — both sourced by this
+# module), then delete the stash so nothing double-dispatches. Prints the replay count.
+# Idempotent: the enqueue functions dedup by envelope id, and files are removed after.
+rc_replay_deferred() {  # <hex>
+  local hex="$1"
+  [ -n "$hex" ] || { echo "ERR: hex required" >&2; return 1; }
+  local d="$STATE_DIR/agent-deferred/$hex"
+  [ -d "$d" ] || { printf '0\n'; return 0; }
+  local n=0 f env kind ts npub name
+  for f in "$d"/*.json; do
+    [ -e "$f" ] || continue
+    env="$(jq -r '.body // ""' "$f" 2>/dev/null)"
+    ts="$(jq -r '.receivedAt // ""' "$f" 2>/dev/null)"
+    npub="$(jq -r '.npub // ""' "$f" 2>/dev/null)"
+    name="$(jq -r '.unicityName // ""' "$f" 2>/dev/null)"
+    kind="$(printf '%s' "$env" | jq -r '.kind // ""' 2>/dev/null)"
+    [ -n "$kind" ] && [ "$kind" != "null" ] || kind="$(jq -r '.kind // ""' "$f" 2>/dev/null)"
+    if rc_is_verb "$kind"; then
+      rc_enqueue_event "$hex" "$ts" "$env" "$npub" "$name" >/dev/null 2>&1 && n=$((n+1))
+    elif type team_is_verb >/dev/null 2>&1 && team_is_verb "$kind"; then
+      team_enqueue_event "$hex" "$ts" "$env" "$npub" "$name" >/dev/null 2>&1 && n=$((n+1))
+    fi
+    rm -f "$f" 2>/dev/null || true
+  done
+  rmdir "$d" 2>/dev/null || true
+  printf '%s\n' "$n"
+}
+
+# ============================================================================
 # CLI dispatch (only when executed directly, not sourced)
 # ============================================================================
 _rc_cli() {
@@ -923,6 +961,7 @@ _rc_cli() {
     envelope) rc_envelope "$@";;
     emit) rc_emit "$@";;
     ingest) rc_ingest "${1:--}";;
+    replay-deferred) rc_replay_deferred "${1:-}";;
     events)  # list queued consult events
       _rc_ensure_dir "$CONSULT_EVENTS_DIR"
       local out='[]' f
