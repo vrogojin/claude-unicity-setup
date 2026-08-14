@@ -21,6 +21,9 @@ CONFIG_FILE="$CLAUDE_PROJECT_DIR/.claude/agent/config.json"
 . "$(cd "$(dirname "$0")" 2>/dev/null && pwd)/state-dir.sh" 2>/dev/null || STATE_DIR="/tmp/claude"
 STATE_FILE="$STATE_DIR/agent-messages.json"
 COOLDOWN_FILE="$STATE_DIR/agent-comms-last-poll"
+# Timestamp of the last SUCCESSFUL poll (messages actually fetched), used as the lookback
+# floor so a gap longer than the cooldown can't silently drop inbound messages.
+LAST_OK_FILE="$STATE_DIR/agent-comms-last-ok"
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 mkdir -p "$STATE_DIR"
@@ -73,14 +76,33 @@ fi
 # @unicitylabs/sphere-sdk even when invoked from outside the clone (mirrors sphere-daemon.mjs).
 HELPER_NODE_PATH="$(cd "$(dirname "$HELPER")/.." 2>/dev/null && pwd)/node_modules:${NODE_PATH:-}"
 
-# --- Calculate since timestamp (10 minutes ago) ---
+# --- Calculate since timestamp ---
+# Look back to the LAST SUCCESSFUL poll, not a fixed NOW-600. The cooldown (600s) can be
+# exceeded by an arbitrary gap between Bash tool calls; a fixed 10-min window can't cover its
+# own gap, so anything that arrived in the interim would be dropped. Bound the lookback to a
+# sane max (24h) so a very stale marker doesn't request an enormous window. Fall back to
+# NOW-600 when there is no prior successful poll.
+MAX_LOOKBACK=86400
 SINCE=$(( NOW - 600 ))
+if [ -f "$LAST_OK_FILE" ]; then
+  LAST_OK=$(cat "$LAST_OK_FILE" 2>/dev/null || echo 0)
+  case "$LAST_OK" in ''|*[!0-9]*) LAST_OK=0 ;; esac
+  if [ "$LAST_OK" -gt 0 ]; then
+    SINCE="$LAST_OK"
+    [ $(( NOW - SINCE )) -gt "$MAX_LOOKBACK" ] && SINCE=$(( NOW - MAX_LOOKBACK ))
+  fi
+fi
 
 # --- Poll for messages ---
 POLL_RESULT=$(NODE_PATH="$HELPER_NODE_PATH" node "$HELPER" check-messages \
   --identity "$IDENTITY_FILE" \
   --config "$CONFIG_FILE" \
   --since "$SINCE" 2>/dev/null || echo '{"messages":[]}')
+
+# Record this successful poll as the next lookback floor (the helper returned parseable JSON).
+if echo "$POLL_RESULT" | jq -e '.messages' >/dev/null 2>&1; then
+  echo "$NOW" > "$LAST_OK_FILE" 2>/dev/null || true
+fi
 
 NEW_COUNT=$(echo "$POLL_RESULT" | jq '.messages | length' 2>/dev/null || echo 0)
 
