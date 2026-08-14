@@ -708,15 +708,33 @@ rc_emit() {
   local kind; kind="$(jq -r '.kind' <<<"$env")"
   local helper=""; type _tc_sphere_helper >/dev/null 2>&1 && helper="$(_tc_sphere_helper)"
   local ident=""; type team_identity_path >/dev/null 2>&1 && ident="$(team_identity_path)"
+  # Point NODE_PATH at the framework clone's node_modules (helper dir → ../node_modules) so
+  # the transport helper loads @unicitylabs/sphere-sdk even when invoked from outside the
+  # clone (mirrors sphere-daemon.mjs).
+  local nodepath=""; [ -n "$helper" ] && nodepath="$(cd "$(dirname "$helper")/.." 2>/dev/null && pwd)/node_modules:${NODE_PATH:-}"
+  # Transport preflight: a MISSING helper or identity must FAIL LOUD — never masquerade as a
+  # successful DRY-RUN. Folding "no transport" into the DRY-RUN branch made a fresh peer's
+  # every consult/claim/intent silently vanish while reporting success (#20). Only an explicit
+  # TEAM_DRY_RUN=1 suppresses real sending.
+  if [ "${TEAM_DRY_RUN:-0}" != "1" ]; then
+    if [ -z "$helper" ]; then
+      echo "ERROR(rc_emit): sphere-helper.mjs not found — '$kind' NOT sent to any recipient. Set \$TEAM_SPHERE_HELPER or record transport.helper_path in the agent config (re-run setup.sh)." >&2
+      return 3
+    fi
+    if [ ! -f "$ident" ]; then
+      echo "ERROR(rc_emit): identity file '${ident:-unset}' missing — '$kind' NOT sent. Re-run setup.sh to mint the agent identity." >&2
+      return 3
+    fi
+  fi
   local n rc=0
   for n in "${recips[@]}"; do
     if [ -f "$RC_SIF" ]; then
       local dec; dec="$(printf '%s' "$env" | bash "$RC_SIF" check --direction outbound --principal "$n" --source agent-comms 2>/dev/null | jq -r '.decision // "pass"' 2>/dev/null || echo pass)"
       [ "$dec" = "quarantine" ] && { echo "BLOCKED(sif) → $n : $kind" >&2; rc=1; continue; }
     fi
-    if [ "${TEAM_DRY_RUN:-0}" = "1" ] || [ -z "$helper" ] || [ ! -f "$ident" ]; then
+    if [ "${TEAM_DRY_RUN:-0}" = "1" ]; then
       printf 'DRY-RUN send → %s : %s\n' "$n" "$kind"
-    elif node "$helper" send-dm "$n" "$env" --identity "$ident" >/dev/null 2>&1; then
+    elif NODE_PATH="$nodepath" node "$helper" send-dm "$n" "$env" --identity "$ident" >/dev/null 2>&1; then
       printf 'sent → %s : %s\n' "$n" "$kind"
     else
       printf 'FAILED send → %s : %s\n' "$n" "$kind" >&2; rc=1

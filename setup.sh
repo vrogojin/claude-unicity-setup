@@ -686,6 +686,7 @@ else
     --arg group_name "$GROUP_NAME" \
     --arg group_id "$GROUP_ID" \
     --arg relay "$RELAY_URL" \
+    --arg helper_path "$SCRIPT_DIR/lib/sphere-helper.mjs" \
     --argjson dep_enabled "$DEP_TRACKING_ENABLED" \
     --argjson selected_deps "$DEPS_JSON" \
     '{
@@ -698,6 +699,9 @@ else
         id: $group_id,
         relays: [$relay]
       },
+      transport: {
+        helper_path: $helper_path
+      },
       dep_tracking: {
         enabled: $dep_enabled,
         selected_deps: $selected_deps
@@ -705,6 +709,11 @@ else
     }' > "$CONFIG_FILE"
 fi
 ok "Wrote agent/config.json"
+
+# Record the transport helper path as an env var too (mirrors the CLAUDE_NOTIFY_URL write
+# below), so the hooks resolve it even if config.json is read before jq is available. The
+# helper MUST stay under the clone ($SCRIPT_DIR) — it loads @unicitylabs/sphere-sdk from the
+# clone's node_modules; copying it into .claude/ would find the file but break the sdk import.
 
 # --- agent/daemon.json ---
 DAEMON_FILE="$CLAUDE_DIR/agent/daemon.json"
@@ -730,12 +739,14 @@ else
 fi
 ok "Wrote agent/daemon.json"
 
-# --- Update settings.json: CLAUDE_NOTIFY_URL ---
+# --- Update settings.json: CLAUDE_NOTIFY_URL + TEAM_SPHERE_HELPER ---
 SETTINGS_FILE="$CLAUDE_DIR/settings.json"
 if [ -f "$SETTINGS_FILE" ] && [ "$DRY_RUN" != "true" ]; then
-  jq --arg url "$NOTIFY_URL" '.env.CLAUDE_NOTIFY_URL = $url' "$SETTINGS_FILE" > "$SETTINGS_FILE.tmp" \
+  jq --arg url "$NOTIFY_URL" --arg helper "$SCRIPT_DIR/lib/sphere-helper.mjs" \
+     '.env.CLAUDE_NOTIFY_URL = $url | .env.TEAM_SPHERE_HELPER = $helper' \
+     "$SETTINGS_FILE" > "$SETTINGS_FILE.tmp" \
     && mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
-  ok "Updated CLAUDE_NOTIFY_URL in settings.json"
+  ok "Updated CLAUDE_NOTIFY_URL + TEAM_SPHERE_HELPER in settings.json"
 fi
 
 # ============================================================
@@ -800,9 +811,66 @@ else
 fi
 
 # ============================================================
+# Phase 9.5: Transport preflight
+# A fresh peer whose transport helper or identity is unresolved would SILENTLY dry-run every
+# outbound coordination message (it looks connected; replies never come). Verify here, loudly,
+# so it's caught at install — not on the first dropped consult. No network calls.
+# ============================================================
+PREFLIGHT_OK=true
+if [ "$DRY_RUN" != "true" ]; then
+  echo ""
+  info "Preflight: verifying transport is actually usable…"
+
+  # (a) identity present with an npub
+  if [ -f "$CLAUDE_DIR/agent/identity.json" ] && \
+     [ -n "$(jq -r '.npub // empty' "$CLAUDE_DIR/agent/identity.json" 2>/dev/null)" ]; then
+    ok "  identity ok ($CLAUDE_DIR/agent/identity.json)"
+  else
+    warn "  identity MISSING or has no npub — outbound coordination will fail"
+    PREFLIGHT_OK=false
+  fi
+
+  # (b) transport helper is present at the recorded path (stays under the clone for sdk resolution)
+  PF_HELPER="$SCRIPT_DIR/lib/sphere-helper.mjs"
+  if [ -f "$PF_HELPER" ]; then
+    ok "  transport helper ok ($PF_HELPER)"
+  else
+    warn "  transport helper MISSING at $PF_HELPER"
+    PREFLIGHT_OK=false
+  fi
+
+  # (c) the transport SDK resolves the SAME way the helper resolves it at runtime — a natural
+  # node_modules walk from the helper's own directory (no NODE_PATH, no network). This catches
+  # the "npm install never ran" / helper-in-wrong-location case reliably. (A bare
+  # import('@unicitylabs/sphere-sdk') from here would false-fail — the package's ESM exports
+  # only resolve for an importer that sits under the clone.)
+  if [ -f "$PF_HELPER" ]; then
+    if ( cd "$(dirname "$PF_HELPER")" && node -e "require.resolve('@unicitylabs/sphere-sdk')" ) >/dev/null 2>&1; then
+      ok "  @unicitylabs/sphere-sdk resolves ok"
+    else
+      warn "  @unicitylabs/sphere-sdk NOT resolvable from $(dirname "$PF_HELPER") — run: (cd \"$SCRIPT_DIR\" && npm install)"
+      PREFLIGHT_OK=false
+    fi
+  fi
+fi
+
+# ============================================================
 # Phase 10: Summary
 # ============================================================
 echo ""
+if [ "$PREFLIGHT_OK" != "true" ]; then
+  echo "============================================"
+  echo "  Setup INCOMPLETE — transport preflight FAILED"
+  echo "============================================"
+  echo ""
+  echo "  The framework is installed but the message transport is NOT usable."
+  echo "  If you proceed, your outbound coordination messages will fail LOUDLY"
+  echo "  (they will NOT silently vanish — that bug is fixed), but you cannot"
+  echo "  coordinate until the item(s) flagged above are resolved."
+  echo "  Most common fix:  (cd \"$SCRIPT_DIR\" && npm install)   then re-run setup.sh"
+  echo ""
+  exit 1
+fi
 echo "============================================"
 echo "  Setup Complete"
 echo "============================================"
@@ -819,6 +887,7 @@ echo "  Config dir:      $CLAUDE_DIR/"
 echo "  Identity:        $CLAUDE_DIR/agent/identity.json"
 echo "  Roadmap:         $TARGET_DIR/docs/ROADMAP.md (⇄ Project board — run /roadmap-sync)"
 echo ""
-info "To start the message daemon:"
-info "  node $SCRIPT_DIR/lib/sphere-daemon.mjs start --project $TARGET_DIR &"
+info "To start the message daemon (run from the clone so the transport helper resolves):"
+info "  node $SCRIPT_DIR/lib/sphere-daemon.mjs start --project $TARGET_DIR --live &"
+info "  # --live = sub-second push; polls every 5s as fallback (default)."
 echo ""

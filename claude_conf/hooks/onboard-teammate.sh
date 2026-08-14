@@ -80,15 +80,23 @@ Relay: $RELAY
 On your machine (one time):
   1. git clone git@github.com:vrogojin/claude-unicity-setup.git && cd claude-unicity-setup
   2. ./setup.sh <path-to-your-concierge-checkout>
-       # installs sphere-sdk, MINTS your Nostr identity, writes .claude/agent + hooks + skills
-       # → note the "npub" it prints; send it back to the coordinator if you haven't already
-  3. node lib/sphere-daemon.mjs start --project <path-to-your-concierge-checkout> --live &
-       # --live = sub-second push transport (falls back to polling automatically)
+       # installs sphere-sdk, MINTS your Nostr identity, writes .claude/agent + hooks + skills,
+       # records the transport helper path, and runs a PREFLIGHT (identity + transport).
+       # It must end with "Setup Complete" — if the preflight FAILS, stop and fix it; a broken
+       # transport makes your outbound coordination messages silently vanish.
+  3. SEND YOUR npub BACK to the coordinator (the "npub" setup.sh printed) so it can authorize
+       you, if you have not already. Nothing routes until your npub is authorized.
+  4. node lib/sphere-daemon.mjs start --project <path-to-your-concierge-checkout> --live &
+       # --live = sub-second push transport; polls every 5s as fallback (default). Runs from
+       # the CLONE dir so the transport helper + node_modules resolve.
 
 Then, in your Claude Code session on that project:
-  /consult-coordinator ${OUR_NPUB:-<coordinator-npub>} "what I intend to work on"
+  /consult-coordinator ${OUR_NAME:-concierge-coord} "what I intend to work on"
      # research-before-claim → who's-on-this broadcast → advisory claim →
      # consult the coordinator for any matching changes on the concierge side.
+  # VERIFY the send worked: you should see "sent → …", NOT "DRY-RUN send" or "ERROR(...)".
+  #   DRY-RUN  → you set TEAM_DRY_RUN=1 (unset it to really send).
+  #   ERROR    → transport/identity unresolved: re-run setup.sh (its preflight pinpoints it).
 
 You're already authorized (${caps}); your first message will route straight
 through — no waiting. Work freely, even in parallel on shared files; the
