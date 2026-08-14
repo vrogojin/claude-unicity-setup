@@ -491,7 +491,10 @@ rc_split_propose() {  # --subject S --parts 'npub=slice-desc|scope' [--parts ...
     while IFS= read -r o; do
       [ -n "$o" ] && [ "$o" != "$me" ] || continue
       case " ${sent[*]:-} " in *" $o "*) continue;; esac
-      rc_emit "$env" --to "$o"; sent+=("$o")
+      # Only count a recipient as sent when rc_emit actually succeeded — it now returns
+      # non-zero on a missing transport / send failure (#20), so an unconditional sent+=()
+      # would mislabel a dropped split.propose as delivered.
+      if rc_emit "$env" --to "$o"; then sent+=("$o"); else echo "WARN(split.propose): emit FAILED → $o (not counted as sent)" >&2; fi
     done < <(jq -r '.[].owner' <<<"$partition")
     printf '%s\n' "$env"
   else

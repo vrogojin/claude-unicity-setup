@@ -508,15 +508,25 @@ if [ -n "$COORD_NAMETAG" ]; then
     if [ -z "$COORD_NPUB" ] && [ -f "$HELPER_MJS" ] && command -v node >/dev/null 2>&1; then
       COORD_NPUB=$(node "$HELPER_MJS" resolve-nametag "$COORD_NAMETAG" 2>/dev/null | jq -r '.npub // ""' 2>/dev/null || echo "")
     fi
-    if [ -n "$COORD_NPUB" ] && [ -f "$REGISTRY_SH" ]; then
+    if [ -z "$COORD_NPUB" ]; then
+      # Nametag given but no npub (none supplied and network-resolve came up empty). Say so
+      # explicitly rather than calling upsert-peer with an empty --npub (which recorded nothing).
+      warn "Coordinator '$COORD_NAMETAG' could not be resolved to an npub now (no npub given and network lookup failed)."
+      warn "  The agent will resolve '$COORD_NAMETAG' at runtime, OR re-run and supply its npub to pre-record it."
+    elif [ -f "$REGISTRY_SH" ]; then
       bash "$REGISTRY_SH" ensure >/dev/null 2>&1 || true
-      if bash "$REGISTRY_SH" upsert-peer --npub "$COORD_NPUB" --name "$COORD_NAMETAG" >/dev/null 2>&1; then
-        ok "Pre-recorded coordinator: $COORD_NAMETAG → $COORD_NPUB"
+      bash "$REGISTRY_SH" upsert-peer --npub "$COORD_NPUB" --name "$COORD_NAMETAG" >/dev/null 2>&1 || true
+      # VERIFY the record actually landed (the pre-record used to silently no-op) — query by
+      # npub and confirm a non-empty pubkey came back before claiming success.
+      COORD_REC="$(bash "$REGISTRY_SH" get "$COORD_NPUB" 2>/dev/null || echo '')"
+      if [ -n "$COORD_REC" ] && [ -n "$(printf '%s' "$COORD_REC" | jq -r '.pubkey // ""' 2>/dev/null)" ]; then
+        ok "Pre-recorded coordinator: $COORD_NAMETAG → $COORD_NPUB (registry entry verified)"
       else
-        info "Could not pre-record coordinator in registry — the agent will resolve '$COORD_NAMETAG' at runtime."
+        warn "Pre-record of coordinator '$COORD_NAMETAG' did NOT land in the registry — 'authorize/consult $COORD_NAMETAG' by name will fail until it does."
+        warn "  Fix: bash '$REGISTRY_SH' upsert-peer --npub '$COORD_NPUB' --name '$COORD_NAMETAG'   (then re-run 'get $COORD_NPUB' to confirm)"
       fi
     else
-      info "Coordinator '$COORD_NAMETAG' not resolved now — the agent will resolve it at runtime when first addressed."
+      warn "Registry hook not found at '$REGISTRY_SH' — cannot pre-record coordinator '$COORD_NAMETAG'."
     fi
   fi
 fi
@@ -686,6 +696,7 @@ else
     --arg group_name "$GROUP_NAME" \
     --arg group_id "$GROUP_ID" \
     --arg relay "$RELAY_URL" \
+    --arg network "$NETWORK" \
     --arg helper_path "$SCRIPT_DIR/lib/sphere-helper.mjs" \
     --argjson dep_enabled "$DEP_TRACKING_ENABLED" \
     --argjson selected_deps "$DEPS_JSON" \
@@ -694,6 +705,7 @@ else
       owner_npub: $owner_npub,
       owner_nametag: $owner_nametag,
       notification_url: $notification_url,
+      network: $network,
       group: {
         name: $group_name,
         id: $group_id,
@@ -888,6 +900,8 @@ echo "  Identity:        $CLAUDE_DIR/agent/identity.json"
 echo "  Roadmap:         $TARGET_DIR/docs/ROADMAP.md (⇄ Project board — run /roadmap-sync)"
 echo ""
 info "To start the message daemon (run from the clone so the transport helper resolves):"
-info "  node $SCRIPT_DIR/lib/sphere-daemon.mjs start --project $TARGET_DIR --live &"
+info "  nohup node $SCRIPT_DIR/lib/sphere-daemon.mjs start --project $TARGET_DIR --live >/tmp/sphere-daemon.log 2>&1 &"
 info "  # --live = sub-second push; polls every 5s as fallback (default)."
+info "  # The daemon runs in the FOREGROUND; a bare '… &' dies with your shell. Use nohup"
+info "  #   (above) or a systemd --user unit for durability across logout/session-end."
 echo ""

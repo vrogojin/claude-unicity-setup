@@ -32,6 +32,16 @@ is acted upon. See `docs/agent-coordination.md` for the full model.
 | `dev-advice` | receive development guidance / design advice |
 | `rebuild-reload-service` | request a service rebuild/reload **(destructive — still needs owner confirmation at execution)** |
 | `review-merge-pr` | request PR review/merge **(outward — still needs owner confirmation at execution)** |
+| `team-coordinate` | participate in A2A team coordination (form/join teams, CNP) |
+| `task-bid` | bid on and be awarded coordination tasks |
+| `knowledge-share` | exchange knowledge cards with the team |
+| `self-directed` | announce its own autonomous initiatives (peer coordination) |
+| `consult` | open advisory consults with us (who's-on-this, matching-change requests) |
+| `claim-area` | register advisory (non-exclusive) work-area claims |
+
+> The last six are the **autonomous-peer / coordination** capabilities that `onboard-teammate.sh`
+> grants by default (`team-coordinate,task-bid,knowledge-share,self-directed,consult,claim-area`).
+> Run `agent-registry.sh caps` for the authoritative live enum.
 
 Run `bash "$CLAUDE_PROJECT_DIR/.claude/hooks/agent-registry.sh" caps` for the live list.
 
