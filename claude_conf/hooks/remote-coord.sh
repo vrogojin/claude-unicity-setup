@@ -711,7 +711,7 @@ rc_emit() {
   # Point NODE_PATH at the framework clone's node_modules (helper dir → ../node_modules) so
   # the transport helper loads @unicitylabs/sphere-sdk even when invoked from outside the
   # clone (mirrors sphere-daemon.mjs).
-  local nodepath=""; [ -n "$helper" ] && nodepath="$(cd "$(dirname "$helper")/.." 2>/dev/null && pwd)/node_modules"
+  local nodepath=""; [ -n "$helper" ] && nodepath="$(cd "$(dirname "$helper")/.." 2>/dev/null && pwd)/node_modules:${NODE_PATH:-}"
   # Transport preflight: a MISSING helper or identity must FAIL LOUD — never masquerade as a
   # successful DRY-RUN. Folding "no transport" into the DRY-RUN branch made a fresh peer's
   # every consult/claim/intent silently vanish while reporting success (#20). Only an explicit

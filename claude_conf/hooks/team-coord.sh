@@ -516,7 +516,7 @@ team_emit() {
   # Point NODE_PATH at the framework clone's node_modules (helper dir → ../node_modules) so
   # the transport helper can load @unicitylabs/sphere-sdk even when invoked from outside the
   # clone (mirrors sphere-daemon.mjs, which sets NODE_PATH the same way).
-  local nodepath=""; [ -n "$helper" ] && nodepath="$(cd "$(dirname "$helper")/.." 2>/dev/null && pwd)/node_modules"
+  local nodepath=""; [ -n "$helper" ] && nodepath="$(cd "$(dirname "$helper")/.." 2>/dev/null && pwd)/node_modules:${NODE_PATH:-}"
   # Transport preflight: a MISSING helper or identity must FAIL LOUD — never masquerade as a
   # successful DRY-RUN. Only an explicit TEAM_DRY_RUN=1 suppresses real sending. A fresh peer
   # whose helper is unresolved otherwise "sends" every verb into the void (#20).

@@ -71,7 +71,7 @@ fi
 
 # NODE_PATH → the clone's node_modules (helper dir → ../node_modules) so the helper loads
 # @unicitylabs/sphere-sdk even when invoked from outside the clone (mirrors sphere-daemon.mjs).
-HELPER_NODE_PATH="$(cd "$(dirname "$HELPER")/.." 2>/dev/null && pwd)/node_modules"
+HELPER_NODE_PATH="$(cd "$(dirname "$HELPER")/.." 2>/dev/null && pwd)/node_modules:${NODE_PATH:-}"
 
 # --- Calculate since timestamp (10 minutes ago) ---
 SINCE=$(( NOW - 600 ))
