@@ -86,9 +86,11 @@ On your machine (one time):
        # transport makes your outbound coordination messages silently vanish.
   3. SEND YOUR npub BACK to the coordinator (the "npub" setup.sh printed) so it can authorize
        you, if you have not already. Nothing routes until your npub is authorized.
-  4. node lib/sphere-daemon.mjs start --project <path-to-your-concierge-checkout> --live &
+  4. nohup node lib/sphere-daemon.mjs start --project <path-to-your-concierge-checkout> --live >/tmp/sphere-daemon.log 2>&1 &
        # --live = sub-second push transport; polls every 5s as fallback (default). Runs from
-       # the CLONE dir so the transport helper + node_modules resolve.
+       # the CLONE dir so the transport helper + node_modules resolve. The daemon is
+       # foreground — a bare '… &' dies with your shell, so use nohup (above) or a systemd
+       # --user unit for durability.
 
 Then, in your Claude Code session on that project:
   /consult-coordinator ${OUR_NAME:-concierge-coord} "what I intend to work on"
