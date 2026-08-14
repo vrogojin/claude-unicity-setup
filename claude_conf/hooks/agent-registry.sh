@@ -257,7 +257,9 @@ _ar_cli() {
       _ar_read --arg s "${1:-}" '
         [ .agents | to_entries[]
           | select($s == "" or .value.status == $s)
-          | { name: (.value.unicityName // ""), status: .value.status,
+          | { name: (if (.value.unicityName // "") != "" then .value.unicityName
+                     else ((.value.note // "") | if startswith("teammate: ") then ltrimstr("teammate: ") else "" end) end),
+              status: .value.status,
               capabilities: (.value.capabilities // []),
               npub: (.value.npub // ""), pubkey: .key,
               did: ("did:nostr:" + .key),
@@ -397,7 +399,13 @@ _ar_cli() {
           *) shift;;
         esac
       done
-      # Key by pubkey if known, else by npub (best-effort until the reply arrives hex-keyed).
+      # Prefer the pubkey HEX as the registry key so this record MERGES onto any entry
+      # `authorize` created (it keys by hex via _ar_npub_to_hex). Deriving the hex from a
+      # bare --npub avoids a duplicate {pubkey:"",status:"peer"} record beside the real one.
+      if [ -z "$pubkey" ] && [ -n "$npub" ]; then
+        pubkey="$(_ar_npub_to_hex "$npub" 2>/dev/null || true)"
+      fi
+      # Key by pubkey hex when known (derived or given), else fall back to the npub string.
       local key="${pubkey:-$npub}"
       [ -n "$key" ] || { echo "ERR: --npub or --pubkey required" >&2; return 1; }
       _ar_write '
@@ -407,6 +415,7 @@ _ar_cli() {
               pubkey:$pk, npub:$npub, unicityName:$name, status:"peer",
               capabilities:[], firstSeen:$now, intro:"", note:"outbound-initiated" })
             | .lastSeen=$now
+            | (if (.pubkey // "") == "" then .pubkey=$pk else . end)
             | (if (.npub // "") == "" then .npub=$npub else . end)
             | (if (.unicityName // "") == "" then .unicityName=$name else . end) )
       ' --arg k "$key" --arg pk "$pubkey" --arg npub "$npub" --arg name "$name" --arg now "$(_ar_now)" \
