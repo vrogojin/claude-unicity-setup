@@ -54,6 +54,17 @@ _tk_run_helper() {
   NODE_PATH="$np" node "$helper" "$@"
 }
 
+# Like _tk_run_helper, but feeds $1 to the helper on STDIN (the rest are argv). Used for
+# ticket-sign/ticket-verify, whose input (payload / signed event) embeds the ticket SECRET —
+# it must NEVER land on argv where `ps` / /proc/<pid>/cmdline could leak it.
+_tk_run_helper_stdin() {  # <stdin-data> <helper-args...>
+  local data="$1"; shift
+  local helper; helper="$(_tk_helper)"
+  [ -n "$helper" ] || { _tk_err "sphere-helper.mjs not resolvable (set \$TEAM_SPHERE_HELPER or re-run setup.sh)"; return 3; }
+  local np; np="$(cd "$(dirname "$helper")/.." 2>/dev/null && pwd)/node_modules:${NODE_PATH:-}"
+  printf '%s' "$data" | NODE_PATH="$np" node "$helper" "$@"
+}
+
 # Convert a duration like 30m / 24h / 7d (or bare seconds) to epoch-seconds-from-now.
 _tk_ttl_to_exp() {
   local ttl="${1:-24h}" now n u; now="$(_tk_now_epoch)"
@@ -146,7 +157,7 @@ tk_issue() {
 
   # Sign the kind-30777 event over the payload.
   local event
-  event="$(_tk_run_helper ticket-sign --identity "$(_tk_identity)" "$payload")" || { _tk_err "ticket-sign failed"; return 1; }
+  event="$(_tk_run_helper_stdin "$payload" ticket-sign --identity "$(_tk_identity)")" || { _tk_err "ticket-sign failed"; return 1; }
 
   # Record HASH-ONLY (never the secret) in the pending ledger, under flock.
   _rc_write "$(_tk_tickets_file)" '
@@ -181,17 +192,28 @@ _tk_decode() {  # <ticket-string>
 # REDEEM  (redeemer side; the whole flow, works PRE-daemon via its own poll)
 # ════════════════════════════════════════════════════════════════════════════════════
 tk_redeem() {
-  local ticket="" yes=0 timeout=120
+  local ticket="" ticketFile="" yes=0 timeout=120
   while [ $# -gt 0 ]; do case "$1" in
     --yes) yes=1; shift;; --timeout) timeout="$2"; shift 2;;
+    --ticket-file) ticketFile="$2"; shift 2;;
     -*) shift;; *) [ -z "$ticket" ] && ticket="$1"; shift;; esac; done
-  [ -n "$ticket" ] || { _tk_err "usage: redeem <ticket-string> [--yes] [--timeout N]"; return 1; }
+  # A ticket string embeds the SECRET. Prefer reading it from a file (kept 0600 by the
+  # caller, e.g. setup.sh) so it never lands on this process's argv or any child's.
+  if [ -n "$ticketFile" ]; then
+    [ -f "$ticketFile" ] || { _tk_err "--ticket-file '$ticketFile' not found"; return 1; }
+    ticket="$(cat "$ticketFile")"
+  fi
+  [ -n "$ticket" ] || { _tk_err "usage: redeem <ticket-string>|--ticket-file <path> [--yes] [--timeout N]"; return 1; }
 
   local event; event="$(_tk_decode "$ticket")" || return 1
   # Verify sig ∧ pubkey==iss BEFORE any network send (fail-closed).
-  local vf; vf="$(_tk_run_helper ticket-verify "$event")" || { _tk_err "ticket signature INVALID — refusing to redeem"; return 1; }
+  local vf; vf="$(_tk_run_helper_stdin "$event" ticket-verify)" || { _tk_err "ticket signature INVALID — refusing to redeem"; return 1; }
   [ "$(printf '%s' "$vf" | jq -r '.valid')" = "true" ] || { _tk_err "ticket invalid: $(printf '%s' "$vf" | jq -r '.reason // "?"')"; return 1; }
   local payload; payload="$(printf '%s' "$vf" | jq -c '.payload')"
+  # Hard-fail an unknown ticket VERSION on the embedded payload (not just the string prefix):
+  # a v2 ticket may carry different fields/semantics we don't understand — refuse it.
+  local pv; pv="$(jq -r '.v // ""' <<<"$payload")"
+  [ "$pv" = "1" ] || { _tk_err "unsupported ticket version '${pv:-none}' (this build understands v1 only)"; return 1; }
   local tid iss issName secret expEpoch nowEpoch
   tid="$(jq -r '.tid' <<<"$payload")"; iss="$(jq -r '.iss' <<<"$payload")"
   issName="$(jq -r '.issName' <<<"$payload")"; secret="$(jq -r '.secret' <<<"$payload")"
@@ -310,8 +332,17 @@ tk_ingest_redeem() {  # issuer side
   bind="$(jq -r '.bind // ""' <<<"$rec")"; expIso="$(jq -r '.exp' <<<"$rec")"
   redeemedHex="$(jq -r '.redeemedBy.hex // ""' <<<"$rec")"
 
-  # Idempotent re-redeem: same hex, already redeemed → just re-send the grant.
+  # Idempotent re-redeem: same hex, already redeemed. Re-authorize BEFORE re-sending the
+  # grant — the FIRST redeem may have burned the ticket "redeemed" yet failed to authorize
+  # (write/lock error); resending a grant then would falsely report MUTUAL AUTH while our
+  # registry never held the peer. authorize is idempotent, so this is a safe no-op when the
+  # peer is already authorized, and a real repair when it isn't. Fail LOUD, don't re-grant.
   if [ "$status" = "redeemed" ] && [ "$redeemedHex" = "$hex" ]; then
+    local rrCaps rrLabel; rrCaps="$(jq -r '.caps | join(" ")' <<<"$rec")"; rrLabel="$(jq -r '.label // ""' <<<"$rec")"
+    bash "$TK_REGISTRY" upsert-peer --pubkey "$hex" >/dev/null 2>&1 || true
+    if ! bash "$TK_REGISTRY" authorize "$hex" "$rrCaps" --note "ticket $tid: $rrLabel (re-redeem)" >/dev/null 2>&1; then
+      _tk_err "re-redeem authorize FAILED tid=$tid ${hex:0:12}… — NOT re-granting (registry never held this peer)"; return 0
+    fi
     _tk_send_grant "$tid" "$hex" "$rec"; return 0
   fi
   # Validate: secret hash, expiry, bind (against transport hex), status.
@@ -413,8 +444,8 @@ tk_self_test() {
   _tk_run_helper create-identity > "$id" 2>/dev/null
   local iss; iss="$(jq -r .npub "$id")"
   local p; p="$(jq -nc --arg iss "$iss" '{v:1,tid:"tselftest0001",iss:$iss,issName:"self",relays:["wss://x"],secret:"x",caps:["consult"],grantBack:["consult"],exp:9999999999,bind:"",label:"self"}')"
-  local ev; ev="$(_tk_run_helper ticket-sign --identity "$id" "$p")"
-  local ok; ok="$(_tk_run_helper ticket-verify "$ev" | jq -r .valid)"
+  local ev; ev="$(_tk_run_helper_stdin "$p" ticket-sign --identity "$id")"
+  local ok; ok="$(_tk_run_helper_stdin "$ev" ticket-verify | jq -r .valid)"
   rm -rf "$tmp"
   [ "$ok" = "true" ] && echo "self-test OK (sign→verify round-trip)" || { echo "self-test FAILED"; return 1; }
 }
