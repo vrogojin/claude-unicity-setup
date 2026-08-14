@@ -110,12 +110,13 @@ where the event is:
   "id": "<sha256 of NIP-01 serialization>", "sig": "<64-byte schnorr>" }
 ```
 
-Built and verified by two new `sphere-helper.mjs` subcommands (§7.2):
-`ticket-sign --identity <identity.json> '<payload-json>'` → signed-event JSON, and
-`ticket-verify '<event-json>'` → `{valid, pubkey, npub, payload}` (standard NIP-01 id
-recompute + schnorr verify; `payload` only emitted when `valid:true` **and**
-`event.pubkey == decode(payload.iss)` — a signature by any key other than `iss` is
-invalid).
+Built and verified by two new `sphere-helper.mjs` subcommands (§7.2). Both take their
+secret-bearing input on **stdin** (or `--in-file <path>`), never argv (§8, local-exposure):
+`ticket-sign --identity <identity.json>` (payload JSON on stdin) → signed-event JSON, and
+`ticket-verify` (event JSON on stdin) → `{valid, pubkey, npub, payload}` (standard NIP-01 id
+recompute + schnorr verify; `payload` only emitted when `valid:true`, the event
+`kind == 30777`, **and** `event.pubkey == decode(payload.iss)` — a signature by any key
+other than `iss`, or a non-30777 kind, is invalid).
 
 **What the redeemer verifies, before any network send** (all fail-closed, loud):
 1. prefix + version are known;
@@ -381,12 +382,15 @@ a cap from `AGENT_CAPS_DESTRUCTIVE` prints a red warning at issue time (grant st
 
 ### 7.2 `lib/sphere-helper.mjs` — two subcommands
 
-- `ticket-sign --identity <path> '<payload-json>'` → builds the kind-30777 event with
-  `content = base64url(payload)`, signs with the identity key (same
+- `ticket-sign --identity <path>` (payload JSON on **stdin** / `--in-file`) → builds the
+  kind-30777 event with `content = base64url(payload)`, signs with the identity key (same
   `keyManagerFromIdentity` path used by `send-dm`), prints the signed event JSON.
-- `ticket-verify '<event-json>'` → recomputes the NIP-01 id, schnorr-verifies `sig`
-  against `event.pubkey`, decodes `content`, checks `event.pubkey ==
-  decode(payload.iss)`; prints `{valid, pubkey, npub, payload}`; exit 1 on any failure.
+- `ticket-verify` (event JSON on **stdin** / `--in-file`) → recomputes the NIP-01 id,
+  asserts `kind == 30777`, schnorr-verifies `sig` against `event.pubkey`, decodes
+  `content`, checks `event.pubkey == decode(payload.iss)`; prints `{valid, pubkey, npub,
+  payload}`; exit 1 on any failure.
+- `send-dm <npub> --identity <path>` reads the DM body from **stdin** / `--body-file` (the
+  body may carry a ticket secret) — never argv.
 
 No relay interaction in either; pure local crypto through `@unicitylabs/nostr-js-sdk`.
 
@@ -506,6 +510,19 @@ Everything below either narrows that window or bounds the damage.
   existing `RC_REAP_DAYS` cycle); no per-message file creation for invalid redeems.
 - A flood of *valid-looking* first-contact envelopes still lands in the existing bounded
   deferred stash — unchanged.
+
+**Threat: local secret exposure via process arguments.**
+- The ticket secret (and any envelope that carries it, e.g. `ticket.redeem`) is **never
+  passed on a command line** — `ps` / `/proc/<pid>/cmdline` is world-readable, so an argv
+  secret leaks to any local user for the command's lifetime. Instead:
+  `sphere-helper.mjs ticket-sign` / `ticket-verify` read the payload/event from **stdin**
+  (or a `--in-file <path>` 0600 file); `send-dm` reads the DM body from **stdin** /
+  `--body-file`; `rc_emit` and the team-coord send path pipe the envelope in via stdin;
+  `setup.sh --ticket` hands the ticket to `ticket.sh` through a `mktemp` **0600** file
+  (`umask 077`, `trap … EXIT` cleanup), and `ticket.sh redeem --ticket-file` reads it there.
+  Only non-secret arguments (`--identity <path>`, a recipient npub) remain on argv. Covered
+  by a regression test that shims `node`, records every child argv, and asserts neither the
+  base64 event content nor a sentinel secret ever appears (§9.1).
 
 **Threat: hostile relay.**
 - Content is NIP-17 encrypted end-to-end; the relay sees gift wraps only. A relay can

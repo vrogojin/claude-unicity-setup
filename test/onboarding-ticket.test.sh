@@ -21,6 +21,10 @@ export CLAUDE_PROJECT_DIR="$SBX/proj" COORD_ROOT="$SBX/coord" \
   AGENT_REGISTRY_FILE="$SBX/registry.json" TEAM_SELF_NAME="test-coord" TEAM_DRY_RUN=1
 NP="$(cd "$(dirname "$HELPER")/.." && pwd)/node_modules"
 helper() { NODE_PATH="$NP:${NODE_PATH:-}" node "$HELPER" "$@"; }
+# ticket-sign/ticket-verify take their secret-bearing input on STDIN (never argv) — mirror
+# how ticket.sh calls them, so the suite exercises the real no-argv-leak path.
+hsign()   { printf '%s' "$2" | helper ticket-sign --identity "$1"; }   # <identity> <payload>
+hverify() { printf '%s' "$1" | helper ticket-verify; }                 # <event>  (JSON on stdin)
 
 helper create-identity > "$SBX/proj/.claude/agent/identity.json" 2>/dev/null
 echo '{"agent_nametag":"test-coord"}' > "$SBX/proj/.claude/agent/config.json"
@@ -31,8 +35,8 @@ fi
 # helpers
 new_peer() { helper create-identity > "$SBX/$1.json" 2>/dev/null; local n; n="$(jq -r .npub "$SBX/$1.json")"; local h; h="$(helper npub-to-hex "$n" 2>/dev/null | jq -r .hex)"; echo "$n $h"; }
 issue()    { bash "$TICKET" issue "$@" 2>/dev/null; }
-secret_of(){ local ev; ev="$(bash "$TICKET" decode "$1" 2>/dev/null)"; helper ticket-verify "$ev" 2>/dev/null | jq -r '.payload.secret'; }
-tid_of()   { local ev; ev="$(bash "$TICKET" decode "$1" 2>/dev/null)"; helper ticket-verify "$ev" 2>/dev/null | jq -r '.payload.tid'; }
+secret_of(){ local ev; ev="$(bash "$TICKET" decode "$1" 2>/dev/null)"; hverify "$ev" 2>/dev/null | jq -r '.payload.secret'; }
+tid_of()   { local ev; ev="$(bash "$TICKET" decode "$1" 2>/dev/null)"; hverify "$ev" 2>/dev/null | jq -r '.payload.tid'; }
 redeem_msg(){ jq -nc --arg from "$1" --arg tid "$2" --arg secret "$3" --arg npub "$4" \
   '{from:$from,id:("m"+$tid+$from[0:6]),body:({a2a:"1",kind:"ticket.redeem",payload:{tid:$tid,secret:$secret,npub:$npub,name:"peer"}}|tojson)}'; }
 authst(){ jq -r --arg h "$1" '.agents[$h].status // "absent"' "$SBX/registry.json"; }
@@ -41,12 +45,15 @@ tkst()  { jq -r --arg t "$1" '.tickets[]? | select(.tid==$t) | .status' "$SBX/co
 echo "== 1. crypto: sign→verify, tamper, wrong-signer =="
 read -r AN AH < <(new_peer alice)
 P=$(jq -nc --arg iss "$AN" '{v:1,tid:"tcrypto000001",iss:$iss,issName:"a",relays:["wss://x"],secret:"s",caps:["consult"],grantBack:["consult"],exp:9999999999,bind:"",label:""}')
-EV=$(helper ticket-sign --identity "$SBX/alice.json" "$P")
-[ "$(helper ticket-verify "$EV" | jq -r .valid)" = "true" ] && ok "valid ticket verifies" || bad "valid verify"
+EV=$(hsign "$SBX/alice.json" "$P")
+[ "$(hverify "$EV" | jq -r .valid)" = "true" ] && ok "valid ticket verifies" || bad "valid verify"
 TAMP=$(echo "$EV" | jq -c '.content=(.content+"AA")')
-[ "$(helper ticket-verify "$TAMP" 2>/dev/null | jq -r '.valid')" = "false" ] && ok "tampered rejected" || bad "tampered"
-EV2=$(helper ticket-sign --identity "$SBX/bob.json" "$P" 2>/dev/null); [ -z "$EV2" ] && { read -r BN BH < <(new_peer bob); EV2=$(helper ticket-sign --identity "$SBX/bob.json" "$P"); }
-[ "$(helper ticket-verify "$EV2" 2>/dev/null | jq -r '.reason')" = "iss-mismatch" ] && ok "wrong-signer (iss-mismatch)" || bad "wrong-signer"
+[ "$(hverify "$TAMP" 2>/dev/null | jq -r '.valid')" = "false" ] && ok "tampered rejected" || bad "tampered"
+EV2=$(hsign "$SBX/bob.json" "$P" 2>/dev/null); [ -z "$EV2" ] && { read -r BN BH < <(new_peer bob); EV2=$(hsign "$SBX/bob.json" "$P"); }
+[ "$(hverify "$EV2" 2>/dev/null | jq -r '.reason')" = "iss-mismatch" ] && ok "wrong-signer (iss-mismatch)" || bad "wrong-signer"
+# wrong-kind: a validly-signed NON-30777 event must be rejected before its content is trusted.
+WK=$(printf '%s' "$P" | helper ticket-sign --identity "$SBX/alice.json" | jq -c '.kind=1')
+[ "$(hverify "$WK" 2>/dev/null | jq -r '.reason')" = "wrong-kind" ] && ok "non-30777 kind rejected" || bad "wrong-kind not rejected"
 
 echo "== 2. issue stores hash-only, ticket is one line =="
 T=$(issue --caps consult,claim-area --ttl 2h --name dev)
@@ -130,6 +137,52 @@ bash "$TICKET" revoke "$TIDV" >/dev/null 2>&1
 read -r VN VH < <(new_peer rv)
 OUT=$(redeem_msg "$VH" "$TIDV" "$(secret_of "$TV")" "$VN" | bash "$TICKET" ingest-redeem - 2>&1)
 echo "$OUT" | grep -qiE "already-redeemed|invalid|deny" && ok "revoked ticket not redeemable" || bad "revoked still redeemable"
+
+echo "== 13. rate-limit: >N failed redeems/hex/hr silently dropped (no oracle) =="
+TL=$(TK_RATE_HEX_HOUR=3 issue --caps consult --name rl); TIDL=$(tid_of "$TL")
+read -r LN LH < <(new_peer rl)
+# 3 bad-secret attempts: each denied 'invalid' AND logged as a failed attempt.
+for i in 1 2 3; do redeem_msg "$LH" "$TIDL" "BAD$i" "$LN" | TK_RATE_HEX_HOUR=3 bash "$TICKET" ingest-redeem - >/dev/null 2>&1; done
+# 4th (still bad) must now be RATE-LIMITED (silent drop) — NOT a fresh 'invalid' oracle.
+OUT=$(redeem_msg "$LH" "$TIDL" "BAD4" "$LN" | TK_RATE_HEX_HOUR=3 bash "$TICKET" ingest-redeem - 2>&1)
+echo "$OUT" | grep -q "rate-limited" && ok "over-limit redeem dropped (rate-limited)" || bad "rate-limit not enforced"
+[ "$(authst "$LH")" = "absent" ] && ok "rate-limited peer not authorized" || bad "rate-limited peer authorized!"
+
+echo "== 14. deferred-replay (#14): authorizing the redeemer replays their stashed envelope =="
+SD="$(. "$HOOKS/state-dir.sh" 2>/dev/null && printf '%s' "$STATE_DIR")"
+TD=$(issue --caps consult --name defer); TIDD=$(tid_of "$TD"); SECD=$(secret_of "$TD")
+read -r DN DH < <(new_peer d14)
+# Stash a peer consult.request (arrived BEFORE authorization), exactly as classify-inbound would.
+mkdir -p "$SD/agent-deferred/$DH"
+DENV=$(jq -nc '{a2a:"1",kind:"consult.request",id:"defer-14",consult:"c14",area:"x",payload:{note:"pre-auth"}}')
+jq -nc --arg b "$DENV" --arg np "$DN" '{body:$b,receivedAt:"2026-01-01T00:00:00Z",npub:$np,unicityName:"d14",kind:"consult.request"}' > "$SD/agent-deferred/$DH/defer-14.json"
+# Redeem → authorizes DH with cap consult → fires the deferred-replay.
+redeem_msg "$DH" "$TIDD" "$SECD" "$DN" | bash "$TICKET" ingest-redeem - >/dev/null 2>&1
+if [ -f "$SD/agent-consult-events/defer-14.json" ] && [ ! -d "$SD/agent-deferred/$DH" ]; then
+  ok "stashed envelope replayed onto consult queue on ticket-authorize"
+else
+  bad "deferred envelope not replayed (#14)"
+fi
+rm -f "$SD/agent-consult-events/defer-14.json"; rm -rf "$SD/agent-deferred/$DH"  # clean our shared-STATE_DIR footprint
+
+echo "== 15. secret NEVER on child (node) argv — piped via stdin only =="
+# Shim `node` on PATH to record every child invocation's argv; the secret-bearing input to
+# ticket-verify (base64 event content) and send-dm (envelope body) must arrive on STDIN, so
+# it must be ABSENT from the recorded argv. Pre-fix (input as argv) this fails.
+BIN="$SBX/bin"; mkdir -p "$BIN"; REALNODE="$(command -v node)"
+{ printf '#!/bin/bash\n'; printf 'printf "%%s\\0" "$@" >> "%s"\n' "$SBX/argv.log"; printf 'exec "%s" "$@"\n' "$REALNODE"; } > "$BIN/node"
+chmod +x "$BIN/node"; : > "$SBX/argv.log"
+TS=$(issue --caps consult --name argv); TSEV=$(bash "$TICKET" decode "$TS"); TSCONTENT=$(printf '%s' "$TSEV" | jq -r '.content')
+printf '%s' "$TSEV" | PATH="$BIN:$PATH" node "$HELPER" ticket-verify >/dev/null 2>&1
+SENT="SENTINELSECRET_DEADBEEF01234567"
+BODY=$(jq -nc --arg s "$SENT" '{a2a:"1",kind:"ticket.redeem",payload:{tid:"tx",secret:$s}}')
+printf '%s' "$BODY" | PATH="$BIN:$PATH" node "$HELPER" send-dm "npub1bogus" --identity "$SBX/proj/.claude/agent/identity.json" >/dev/null 2>&1 || true
+if [ -s "$SBX/argv.log" ] && grep -aqF "ticket-verify" "$SBX/argv.log" \
+   && ! grep -aqF "$TSCONTENT" "$SBX/argv.log" && ! grep -aqF "$SENT" "$SBX/argv.log"; then
+  ok "ticket secret never on child node argv (stdin only)"
+else
+  bad "secret leaked onto child node argv"
+fi
 
 echo ""
 echo "════════════════════════════════════════"
