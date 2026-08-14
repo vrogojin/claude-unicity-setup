@@ -229,20 +229,40 @@ fi
 # /coordinator-advise (or /consult-coordinator for threads we opened). Never auto-run.
 CE_DIR="$STATE_DIR/agent-consult-events"
 RC_LIB="$DIAG_HOOK_DIR/remote-coord.sh"
+
+# FRESHNESS WINDOW + BULK-DISMISS (item 9): a flood of stale peer coordination noise
+# must not wedge the admin's Stop gate FOREVER. Only items newer than the cutoff block;
+# older ones stay on disk for manual review but no longer hold the gate. The cutoff is
+# the LATER of (now − RC_STOP_TTL_HOURS) and a bulk-dismiss marker. Bulk-dismiss:
+#   • RC_COORD_DISMISS_ALL=1  → suppress everything now, OR
+#   • write an ISO-8601 timestamp to $STATE_DIR/agent-coord-dismissed-until
+RC_STOP_TTL_HOURS="${RC_STOP_TTL_HOURS:-72}"
+case "$RC_STOP_TTL_HOURS" in ''|*[!0-9]*) RC_STOP_TTL_HOURS=72;; esac
+COORD_CUTOFF="$(date -u -d "-${RC_STOP_TTL_HOURS} hours" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "1970-01-01T00:00:00Z")"
+DISMISS_FILE="$STATE_DIR/agent-coord-dismissed-until"
+if [ -f "$DISMISS_FILE" ]; then
+  DUNTIL="$(tr -d ' \n\r\t' < "$DISMISS_FILE" 2>/dev/null || echo "")"
+  [ -n "$DUNTIL" ] && [ "$DUNTIL" \> "$COORD_CUTOFF" ] && COORD_CUTOFF="$DUNTIL"
+fi
+case "${RC_COORD_DISMISS_ALL:-}" in 1|true|yes) COORD_CUTOFF="$(date -u +%Y-%m-%dT%H:%M:%SZ)";; esac
+
 CE_QUEUED=0
 if [ -d "$CE_DIR" ]; then
   for f in "$CE_DIR"/*.json; do
     [ -e "$f" ] || continue
-    [ "$(jq -r '.status // "queued"' "$f" 2>/dev/null)" = "queued" ] && CE_QUEUED=$((CE_QUEUED+1))
+    [ "$(jq -r '.status // "queued"' "$f" 2>/dev/null)" = "queued" ] || continue
+    # Only a FRESH queued event blocks — a stale one is left for review, not a wedge.
+    EN="$(jq -r '.enqueuedAt // .receivedAt // ""' "$f" 2>/dev/null)"
+    [ -z "$EN" ] || [ "$EN" \> "$COORD_CUTOFF" ] && CE_QUEUED=$((CE_QUEUED+1))
   done
 fi
 RC_OPEN=0; RC_INT=0; RC_SPL=0; RC_CONF=0; RC_PEND=0
 if [ -f "$RC_LIB" ]; then
-  RC_OPEN="$(bash "$RC_LIB" consult-list open 2>/dev/null | jq 'length' 2>/dev/null || echo 0)"
-  RC_INT="$(bash "$RC_LIB" intents 2>/dev/null | jq '[.[] | select(.side=="remote" and .status=="awaiting-reply")] | length' 2>/dev/null || echo 0)"
-  RC_SPL="$(bash "$RC_LIB" splits 2>/dev/null | jq '[.[] | select(.status=="proposed")] | length' 2>/dev/null || echo 0)"
-  RC_CONF="$(bash "$RC_LIB" conflicts 2>/dev/null | jq '[.[] | select(.status=="open")] | length' 2>/dev/null || echo 0)"
-  RC_PEND="$(bash "$RC_LIB" commitments 2>/dev/null | jq '[.[] | select(.status=="pending")] | length' 2>/dev/null || echo 0)"
+  RC_OPEN="$(bash "$RC_LIB" consult-list open 2>/dev/null | jq --arg c "$COORD_CUTOFF" '[.[] | select((.openedAt // .receivedAt // "") == "" or (.openedAt // .receivedAt) > $c)] | length' 2>/dev/null || echo 0)"
+  RC_INT="$(bash "$RC_LIB" intents 2>/dev/null | jq --arg c "$COORD_CUTOFF" '[.[] | select(.side=="remote" and .status=="awaiting-reply" and ((.receivedAt // "") == "" or .receivedAt > $c))] | length' 2>/dev/null || echo 0)"
+  RC_SPL="$(bash "$RC_LIB" splits 2>/dev/null | jq --arg c "$COORD_CUTOFF" '[.[] | select(.status=="proposed" and ((.receivedAt // .proposedAt // "") == "" or (.receivedAt // .proposedAt) > $c))] | length' 2>/dev/null || echo 0)"
+  RC_CONF="$(bash "$RC_LIB" conflicts 2>/dev/null | jq --arg c "$COORD_CUTOFF" '[.[] | select(.status=="open" and ((.receivedAt // .openedAt // "") == "" or (.receivedAt // .openedAt) > $c))] | length' 2>/dev/null || echo 0)"
+  RC_PEND="$(bash "$RC_LIB" commitments 2>/dev/null | jq --arg c "$COORD_CUTOFF" '[.[] | select(.status=="pending" and ((.createdAt // "") == "" or .createdAt > $c))] | length' 2>/dev/null || echo 0)"
   [ -n "$RC_OPEN" ] || RC_OPEN=0; [ -n "$RC_INT" ] || RC_INT=0; [ -n "$RC_SPL" ] || RC_SPL=0
   [ -n "$RC_CONF" ] || RC_CONF=0; [ -n "$RC_PEND" ] || RC_PEND=0
 fi
@@ -254,7 +274,7 @@ if [ "$((CE_QUEUED + RC_OPEN + RC_INT + RC_SPL + RC_CONF + RC_PEND))" -gt 0 ] 2>
   [ "$RC_SPL" -gt 0 ] 2>/dev/null && RC_MSG="$RC_MSG ${RC_SPL} split proposal(s) to review;"
   [ "$RC_CONF" -gt 0 ] 2>/dev/null && RC_MSG="$RC_MSG ${RC_CONF} open conflict(s) awaiting reconciliation;"
   [ "$RC_PEND" -gt 0 ] 2>/dev/null && RC_MSG="$RC_MSG ${RC_PEND} change-commitment(s) we promised but have not applied;"
-  RC_MSG="$RC_MSG Run /coordinator-advise to process them (reply, ack overlaps, arbitrate splits, reconcile conflicts, work off commitments). Nothing has been acted on."
+  RC_MSG="$RC_MSG Run /coordinator-advise to process them (reply, ack overlaps, arbitrate splits, reconcile conflicts, work off commitments). Nothing has been acted on. Only items newer than ${RC_STOP_TTL_HOURS}h block; to dismiss stale peer noise now: printf '%s' \"\$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > \"${DISMISS_FILE}\" (or set RC_COORD_DISMISS_ALL=1)."
   jq -n --arg reason "$RC_MSG" '{"decision":"block","reason":$reason}'
   exit 0
 fi

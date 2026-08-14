@@ -188,6 +188,15 @@ _ar_npub_to_hex() {
   command -v node >/dev/null 2>&1 || return 1
   hex="$(printf '%s' "$npub" | node -e '
     const CH="qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    // Full bech32 verification — the checksum MUST validate (polymod===1 over the
+    // hrp-expansion + data), and the 5→8-bit regroup MUST leave no non-zero padding.
+    // Without this a valid-HRP but corrupted npub decoded to a plausible-looking (but
+    // wrong) 32-byte key, silently authorizing the WRONG identity.
+    const polymod=(vals)=>{const G=[0x3b6a57b2,0x26508e6d,0x1ea119fa,0x3d4233dd,0x2a1462b3];
+      let chk=1;for(const v of vals){const b=chk>>>25;chk=((chk&0x1ffffff)<<5)^v;
+        for(let i=0;i<5;i++)if((b>>i)&1)chk^=G[i];}return chk>>>0;};
+    const hrpExpand=(hrp)=>{const r=[];for(let i=0;i<hrp.length;i++)r.push(hrp.charCodeAt(i)>>5);
+      r.push(0);for(let i=0;i<hrp.length;i++)r.push(hrp.charCodeAt(i)&31);return r;};
     let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
       s=s.trim().toLowerCase();
       const pos=s.lastIndexOf("1");
@@ -195,10 +204,12 @@ _ar_npub_to_hex() {
       const hrp=s.slice(0,pos), data=s.slice(pos+1);
       if(hrp!=="npub"){process.exit(1);}
       const vals=[];for(const c of data){const i=CH.indexOf(c);if(i<0)process.exit(1);vals.push(i);}
-      if(vals.length<7)process.exit(1);
+      if(vals.length<7)process.exit(1);                      // 6 checksum + >=1 data
+      if(polymod(hrpExpand(hrp).concat(vals))!==1)process.exit(1);   // checksum MUST verify
       const d5=vals.slice(0,-6);              // drop the 6-char bech32 checksum
       let acc=0,bits=0;const out=[];
       for(const v of d5){acc=(acc<<5)|v;bits+=5;while(bits>=8){bits-=8;out.push((acc>>bits)&0xff);}}
+      if(bits>=5||((acc<<(8-bits))&0xff)!==0)process.exit(1);        // no non-zero padding
       if(out.length!==32)process.exit(1);
       process.stdout.write(Buffer.from(out).toString("hex"));
     });

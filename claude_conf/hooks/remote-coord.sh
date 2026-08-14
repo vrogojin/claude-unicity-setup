@@ -107,15 +107,20 @@ coord_root() {
 _rc_ensure_dir() { mkdir -p "$1" 2>/dev/null || true; }
 
 # Atomic locked read-modify-write of a JSON file (same pattern as _tc_write).
+# SECURITY (fail-closed): flock is MANDATORY. A lock timeout (contention) or a missing
+# flock binary FAILS the write with a non-zero return — callers MUST honor it and NOT
+# mark the driving event as seen, so a write lost to contention is retried, never
+# silently dropped. We never fall through to an unlocked read-modify-write.
 _rc_write() {
   local f="$1"; shift
   local filter="$1"; shift
   local dir; dir="$(dirname "$f")"; _rc_ensure_dir "$dir"
   [ -f "$f" ] || printf '{}' > "$f"
   local lock="$f.lock" tmp="$f.tmp.$$"
+  command -v flock >/dev/null 2>&1 || { echo "ERR: flock unavailable — refusing unlocked write to $f" >&2; return 3; }
   (
-    flock -w 5 9 2>/dev/null || true
-    if jq "$@" "$filter" "$f" > "$tmp" 2>/dev/null; then mv "$tmp" "$f"; else rm -f "$tmp"; return 1; fi
+    flock -w 5 9 || { echo "ERR: lock timeout on $f" >&2; exit 3; }
+    if jq "$@" "$filter" "$f" > "$tmp" 2>/dev/null; then mv "$tmp" "$f"; else rm -f "$tmp"; exit 1; fi
   ) 9>"$lock"
 }
 
@@ -178,6 +183,31 @@ rc_verb_cap() {
 rc_is_verb() { [ -n "$(rc_verb_cap "$1")" ]; }
 
 # ============================================================================
+# Authorization + record-ownership helpers (security hardening)
+# ============================================================================
+# Is <npub> a peer WE have authorized (or our own self)? Awareness state (an area
+# claim materialized from an accepted split) may only ever name a KNOWN identity —
+# never an arbitrary attacker-chosen npub smuggled inside a split partition.
+_rc_npub_authorized() {
+  local np="$1"; [ -n "$np" ] && [ "$np" != "null" ] || return 1
+  [ "$np" = "$(rc_self_npub)" ] && return 0
+  bash "$RC_REGISTRY" list authorized 2>/dev/null | jq -e --arg n "$np" 'any(.[]?; .npub==$n)' >/dev/null 2>&1
+}
+
+# Deterministic, SENDER-NAMESPACED area id for an INBOUND peer area verb. A peer can
+# therefore only ever create/heartbeat/release ITS OWN area records — a crafted areaId
+# can never collide with (and thereby hijack) another peer's or our own local claim.
+_rc_peer_area_id() {  # <from_npub> <raw_area> <mid>
+  local f="$1" a="$2" m="$3"; [ -n "$a" ] && [ "$a" != "null" ] || a="$m"
+  printf 'ar%s' "$(printf '%s|%s' "$f" "$a" | sha1sum 2>/dev/null | cut -c1-12)"
+}
+
+# The recorded holderNpub of an area (empty if none) — ownership gate for area verbs.
+_rc_area_holder() {  # <areaId>
+  _rc_areas | jq -r --arg id "$1" 'first(.[] | select(.areaId==$id) | .holderNpub) // ""' 2>/dev/null
+}
+
+# ============================================================================
 # Inbound event queue (written by classify-inbound.sh, drained by /coordinator-advise
 # on the coordinator side and /consult-coordinator on the remote side)
 # ============================================================================
@@ -212,7 +242,7 @@ rc_enqueue_event() {
 # made work: "I intend to work on X — conflicts?" / "I changed CRM API Y — please
 # apply the matching backend changes". side:remote = they opened it with us (we are
 # the coordinator); side:local = we opened it with a remote coordinator.
-rc_consult_open() {  # --to <npub|nametag> --intent I [--areas csv --repos csv --changes J --questions J --urgency u]
+rc_consult_open() {  # --to <npub> --intent I [--areas csv --repos csv --changes J --questions J --urgency u]
   local to="" intent="" areas="" repos="" changes='[]' questions='[]' urgency="normal"
   while [ $# -gt 0 ]; do case "$1" in
     --to) to="$2"; shift 2;; --intent) intent="$2"; shift 2;; --areas) areas="$2"; shift 2;;
@@ -331,8 +361,11 @@ rc_area_upsert() {  # --area ID --scope csv --holder npub [--name N --side remot
     --arg side "$side" --arg status "$status" --arg exp "$exp" --arg note "$note" --arg now "$(rc_now)" \
     && { rc_render >/dev/null 2>&1 || true; printf '%s\n' "$id"; }
 }
-_rc_area_patch() {  # <areaId> <jq-expr on the area object as .>
-  _rc_write "$(_rc_areas_file)" '.areas = ((.areas // []) | map(if .areaId==$id then ('"$2"') else . end))' --arg id "$1"
+_rc_area_patch() {  # <areaId> <jq-expr on the area object as .> [jq-args...]
+  # Extra jq args are forwarded so callers pass attacker-influenced JSON via --argjson
+  # (never string-interpolated into the program) — see the area.ack/heartbeat ingest.
+  local id="$1" expr="$2"; shift 2
+  _rc_write "$(_rc_areas_file)" '.areas = ((.areas // []) | map(if .areaId==$id then ('"$expr"') else . end))' --arg id "$id" "$@"
 }
 rc_area_list() {  # [status-filter] — expired active leases are reported as expired
   jq -c --arg s "${1:-}" --arg now "$(rc_now)" '
@@ -376,14 +409,62 @@ rc_area_release() {  # <areaId> — local-side release; returns area.release env
   rc_render >/dev/null 2>&1 || true
   rc_envelope area.release --area "$1" --payload '{}'
 }
-rc_reap() {  # mark active claims past their lease as expired (stale-claim reaping).
-  # Mechanical tier-0 pass (Overstory watchdog pattern) — safe because claims are
-  # advisory: expiring one blocks nobody, it just stops asserting presence.
+rc_reap() {  # stale-claim reaping + durable-store COMPACTION (item 10).
+  # (1) expire active claims past their lease, and (2) actually DELETE long-terminal
+  # records (expired/released areas, agreed/closed splits, resolved conflicts, closed
+  # intents, terminal consult files) older than RC_REAP_DAYS, plus cap edges.jsonl —
+  # so the coord store cannot grow without bound. Advisory data: reaping blocks nobody.
+  local now cutoff reap_days edges_max
+  now="$(rc_now)"
+  reap_days="${RC_REAP_DAYS:-7}"; [[ "$reap_days" =~ ^[0-9]+$ ]] || reap_days=7
+  edges_max="${RC_EDGES_MAX:-5000}"; [[ "$edges_max" =~ ^[0-9]+$ ]] || edges_max=5000
+  cutoff="$(date -u -d "-${reap_days} days" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "1970-01-01T00:00:00Z")"
+
+  # (1)+(2a) areas: expire past-lease actives, then drop long-dead expired/released.
   _rc_write "$(_rc_areas_file)" '
-    .areas = ((.areas // []) | map(
-      if (.status=="active" and (.lease.expiresAt // "") != "" and (.lease.expiresAt // "") < $now)
-      then (.status="expired" | .reapedAt=$now) else . end))' --arg now "$(rc_now)" \
-    && { rc_render >/dev/null 2>&1 || true; rc_area_list expired | jq -r 'map(.areaId) | join(" ")'; }
+    .areas = ((.areas // [])
+      | map(if (.status=="active" and (.lease.expiresAt // "") != "" and (.lease.expiresAt // "") < $now)
+            then (.status="expired" | .reapedAt=$now) else . end)
+      | map(select(((.status=="expired" or .status=="released")
+                    and ((.reapedAt // .releasedAt // .updatedAt // "") < $cutoff)) | not)))' \
+    --arg now "$now" --arg cutoff "$cutoff" || true
+
+  # (2b) splits: drop terminal (agreed/closed) older than cutoff.
+  _rc_write "$(_rc_splits_file)" '
+    .splits = ((.splits // []) | map(select((((.status=="agreed") or (.status=="closed"))
+      and ((.agreedAt // .receivedAt // .proposedAt // "") < $cutoff)) | not)))' --arg cutoff "$cutoff" || true
+
+  # (2c) conflicts: drop resolved older than cutoff.
+  _rc_write "$(_rc_conflicts_file)" '
+    .conflicts = ((.conflicts // []) | map(select(((.status=="resolved")
+      and ((.updatedAt // .receivedAt // .openedAt // "") < $cutoff)) | not)))' --arg cutoff "$cutoff" || true
+
+  # (2d) intents: drop closed, or those whose reply window closed before cutoff.
+  _rc_write "$(_rc_intents_file)" '
+    .intents = ((.intents // []) | map(select(((.status=="closed")
+      or ((.windowUntil // "") != "" and (.windowUntil // "") < $cutoff)) | not)))' --arg cutoff "$cutoff" || true
+
+  # (2e) consults: delete terminal thread files (closed/advised) older than cutoff.
+  local cd f st ts
+  cd="$(_rc_consults_dir)"
+  if [ -d "$cd" ]; then
+    for f in "$cd"/*.json; do [ -e "$f" ] || continue
+      st="$(jq -r '.status // ""' "$f" 2>/dev/null)"
+      ts="$(jq -r '(.ack.at // .advisory.at // .receivedAt // .openedAt // "")' "$f" 2>/dev/null)"
+      case "$st" in
+        closed|advised) [ -n "$ts" ] && [ "$ts" \< "$cutoff" ] && rm -f "$f" 2>/dev/null || true;;
+      esac
+    done
+  fi
+
+  # (2f) edges.jsonl: cap to the most recent RC_EDGES_MAX lines.
+  local ef; ef="$(_rc_edges_file)"
+  if [ -f "$ef" ] && [ "$(wc -l < "$ef" 2>/dev/null || echo 0)" -gt "$edges_max" ]; then
+    tail -n "$edges_max" "$ef" > "$ef.tmp.$$" 2>/dev/null && mv "$ef.tmp.$$" "$ef" 2>/dev/null || rm -f "$ef.tmp.$$" 2>/dev/null || true
+  fi
+
+  rc_render >/dev/null 2>&1 || true
+  rc_area_list expired | jq -r 'map(.areaId) | join(" ")'
 }
 
 # ============================================================================
@@ -520,6 +601,13 @@ _rc_split_apply() {  # <sid>
     owner="$(jq -r ".partition[$i].owner" <<<"$sp")"
     slice="$(jq -r ".partition[$i].slice" <<<"$sp")"
     pscope="$(jq -r ".partition[$i].scope // \"\"" <<<"$sp")"
+    # SECURITY: only materialize an advisory claim for a KNOWN identity (self or an
+    # authorized peer). A partition owner is attacker-controlled JSON; without this a
+    # crafted split could plant a claim for any npub in our awareness map.
+    if ! _rc_npub_authorized "$owner"; then
+      echo "  ⚠ split $sid part $((i+1)): skipping unknown/unauthorized owner ${owner:0:16}…" >&2
+      continue
+    fi
     side="remote"; [ "$owner" = "$me" ] && side="local"
     rc_area_upsert --area "${sid}-p$((i+1))" --scope "$pscope" --holder "$owner" \
       --side "$side" --status active --note "per split $sid: $slice" >/dev/null
@@ -619,7 +707,7 @@ rc_peer_note() {  # <npub> <name> <initiatives-json-array>
   local npub="$1" name="$2" inits="$3"
   echo "$inits" | jq -e . >/dev/null 2>&1 || inits='[]'
   _rc_write "$(_rc_peers_file)" '.peers[$np] = {name:$n, initiatives:$i, lastAnnounce:$now}' \
-    --arg np "$npub" --arg n "$name" --argjson i "$inits" --arg now "$(rc_now)"
+    --arg np "$npub" --arg n "$name" --argjson i "$inits" --arg now "$(rc_now)" || return $?
   rc_render >/dev/null 2>&1 || true
 }
 rc_peers() { local f; f="$(_rc_peers_file)"; [ -f "$f" ] && jq -c '.peers // {}' "$f" || echo '{}'; }
@@ -732,7 +820,11 @@ rc_emit() {
   local n rc=0
   for n in "${recips[@]}"; do
     if [ -f "$RC_SIF" ]; then
-      local dec; dec="$(printf '%s' "$env" | bash "$RC_SIF" check --direction outbound --principal "$n" --source agent-comms 2>/dev/null | jq -r '.decision // "pass"' 2>/dev/null || echo pass)"
+      # Capture then parse (see the inbound note): sif-guard exits 10 on a flag, which
+      # under `set -o pipefail` would otherwise let `|| echo pass` mislabel it as a pass
+      # and send a flagged message. This egress guard must fail CLOSED on a real flag.
+      local sifout; sifout="$(printf '%s' "$env" | bash "$RC_SIF" check --direction outbound --principal "$n" --source agent-comms 2>/dev/null)"
+      local dec; dec="$(printf '%s' "$sifout" | jq -r '.decision // "pass"' 2>/dev/null || echo pass)"
       [ "$dec" = "quarantine" ] && { echo "BLOCKED(sif) → $n : $kind" >&2; rc=1; continue; }
     fi
     if [ "${TEAM_DRY_RUN:-0}" = "1" ]; then
@@ -770,70 +862,114 @@ rc_ingest() {  # <event-json-or-file-or-->  (event = the queued wrapper OR a raw
   payload="$(jq -c '.payload // {}' <<<"$env")"
   [ -n "$kind" ] || { echo "ERR: no kind" >&2; return 1; }
   if [ -n "$mid" ] && rc_seen_check "$mid"; then echo "DUP: $mid ($kind) ignored"; return 0; fi
+  # SECURITY (item 15): track durable-write failures across the handler. A non-zero
+  # value at the end means a lock timeout / jq error lost the write → we must NOT mark
+  # the event seen, so it is retried on the next drain instead of silently vanishing.
+  local wrc=0
 
   case "$kind" in
     peer.announce)
-      rc_peer_note "$from_npub" "$from_name" "$(jq -c '.initiatives // []' <<<"$payload")"
+      rc_peer_note "$from_npub" "$from_name" "$(jq -c '.initiatives // []' <<<"$payload")" || wrc=$?
       echo "ANNOUNCE: $from_npub initiatives updated";;
     consult.request)
       # They opened a consult with us — record the thread (side:remote), status open.
-      [ -n "$cid" ] || cid="c$(printf '%s%s' "$from_npub" "$mid" | sha1sum | cut -c1-10)"
+      # SECURITY (item 3): a crafted .consult reusing an id WE own (side:local), or one
+      # owned by a DIFFERENT peer, would otherwise wholesale-overwrite that thread.
+      # Namespace any colliding/foreign id by the sender so a peer can only create or
+      # refresh ITS OWN thread; merge-patch (never clobber status/advisory) on a resend.
+      [ -n "$cid" ] && [ "$cid" != "null" ] || cid="c$(printf '%s%s' "$from_npub" "$mid" | sha1sum | cut -c1-10)"
       local d; d="$(_rc_consults_dir)"; _rc_ensure_dir "$d"
-      jq -nc --arg cid "$cid" --arg from "$from_npub" --arg name "$from_name" \
-         --argjson p "$payload" --arg now "$(rc_now)" \
-         '{cid:$cid, side:"remote", peerNpub:$from, peerName:$name, status:"open",
-           intent:($p.intent // ""), urgency:($p.urgency // "normal"),
-           areas:($p.areas // []), repos:($p.repos // []),
-           changes:($p.changes // []), questions:($p.questions // []),
-           advisory:null, commitments:[], receivedAt:$now}' > "$d/$cid.json.tmp.$$" \
-        && mv "$d/$cid.json.tmp.$$" "$d/$cid.json"
+      local cf="$d/$cid.json"
+      if [ -f "$cf" ]; then
+        local ex_side ex_owner
+        ex_side="$(jq -r '.side // ""' "$cf" 2>/dev/null)"
+        ex_owner="$(jq -r '.peerNpub // ""' "$cf" 2>/dev/null)"
+        if [ "$ex_side" = "local" ] || { [ -n "$ex_owner" ] && [ "$ex_owner" != "$from_npub" ]; }; then
+          cid="c$(printf '%s|%s' "$from_npub" "$cid" | sha1sum | cut -c1-10)"; cf="$d/$cid.json"
+        fi
+      fi
+      if [ -f "$cf" ]; then
+        _rc_consult_patch "$cid" '. + {peerName:$name,
+             intent:($p.intent // .intent // ""), urgency:($p.urgency // .urgency // "normal"),
+             areas:($p.areas // .areas // []), repos:($p.repos // .repos // []),
+             changes:($p.changes // .changes // []), questions:($p.questions // .questions // []),
+             updatedAt:$now}' --arg name "$from_name" --argjson p "$payload" --arg now "$(rc_now)" >/dev/null 2>&1 || wrc=$?
+      else
+        jq -nc --arg cid "$cid" --arg from "$from_npub" --arg name "$from_name" \
+           --argjson p "$payload" --arg now "$(rc_now)" \
+           '{cid:$cid, side:"remote", peerNpub:$from, peerName:$name, status:"open",
+             intent:($p.intent // ""), urgency:($p.urgency // "normal"),
+             areas:($p.areas // []), repos:($p.repos // []),
+             changes:($p.changes // []), questions:($p.questions // []),
+             advisory:null, commitments:[], receivedAt:$now}' > "$cf.tmp.$$" \
+          && mv "$cf.tmp.$$" "$cf" || { rm -f "$cf.tmp.$$" 2>/dev/null; wrc=1; }
+      fi
       rc_render >/dev/null 2>&1 || true
       echo "CONSULT opened: $cid from $from_npub — advise via /coordinator-advise";;
     consult.advise)
-      # A coordinator answered a consult WE opened. The wire payload carries the
-      # advisory text under key `advisory`; store it ALSO under `.advisory.text` so
-      # readers match the coordinator-side shape (rc_advise writes `.advisory.text`).
-      # Keeps `.advisory.advisory` too for back-compat. See consult.advise field-name fix.
-      _rc_consult_patch "$cid" '.status="advised" | .advisory=($p + {text:($p.text // $p.advisory // ""), at:$now})' \
-        --argjson p "$payload" --arg now "$(rc_now)" >/dev/null 2>&1 \
-        && echo "ADVISORY received on $cid" || echo "ADVISORY for unknown consult $cid — noted"
+      # A coordinator answered a consult WE opened (side:local). SECURITY (item 3): only
+      # the peer we ACTUALLY consulted may advise it — gate on peerNpub == sender. The
+      # payload text lands under `.advisory.text` (matches rc_advise's shape).
+      local cowner; cowner="$(rc_consult_get "$cid" 2>/dev/null | jq -r '.peerNpub // ""' 2>/dev/null)"
+      if [ -z "$cowner" ]; then
+        echo "ADVISORY for unknown consult $cid — noted"
+      elif [ -n "$from_npub" ] && [ "$cowner" != "$from_npub" ]; then
+        echo "ADVISORY IGNORED on $cid: sender ${from_npub:0:12}… is not the consulted peer ${cowner:0:12}…" >&2
+      else
+        _rc_consult_patch "$cid" '.status="advised" | .advisory=($p + {text:($p.text // $p.advisory // ""), at:$now})' \
+          --argjson p "$payload" --arg now "$(rc_now)" >/dev/null 2>&1 && echo "ADVISORY received on $cid" || wrc=$?
+      fi
       rc_render >/dev/null 2>&1 || true;;
     consult.ack)
-      # Dual duty: closes a consult thread (by .consult/cid) AND — when the payload
-      # carries a sid — accepts a split we proposed (the lead protocol: recipients
-      # reply to split.propose via consult.ack). Acceptance applies the partition.
+      # Dual duty: closes a consult thread (by cid) AND records acceptance of a split.
+      # SECURITY (item 2): an inbound ack NEVER materializes the partition into claims —
+      # it only records status. Materializing awareness state (which names attacker-
+      # chosen owners) happens ONLY on OUR OWN deliberate acceptance (the split-agree
+      # CLI), where owners are additionally re-validated. SECURITY (item 3): only close
+      # a thread the SENDER owns (peerNpub == sender).
       local acksid; acksid="$(jq -r '.sid // ""' <<<"$payload")"
-      if [ -n "$acksid" ]; then
-        _rc_split_patch "$acksid" '.status="agreed" | .agreedAt=$now | .agreeNote=($p.note // "")' \
-          --arg now "$(rc_now)" --argjson p "$payload" >/dev/null 2>&1
-        _rc_split_apply "$acksid"
+      if [ -n "$acksid" ] && [ "$acksid" != "null" ]; then
+        _rc_split_patch "$acksid" '.status="agreed" | .agreedAt=$now | .agreeNote=($p.note // "") | .agreedByNpub=$from' \
+          --arg now "$(rc_now)" --arg from "$from_npub" --argjson p "$payload" >/dev/null 2>&1 || wrc=$?
         rc_render >/dev/null 2>&1 || true
-        echo "SPLIT accepted via consult.ack: $acksid — per-part advisory claims recorded"
+        echo "SPLIT ack recorded on $acksid (status only — apply via /coordinator-advise)"
       fi
-      if [ -n "$cid" ]; then
-        _rc_consult_patch "$cid" '.status="closed" | .ack=($p + {at:$now})' \
-          --argjson p "$payload" --arg now "$(rc_now)" >/dev/null 2>&1
-        rc_render >/dev/null 2>&1 || true
-        echo "ACK on $cid"
+      if [ -n "$cid" ] && [ "$cid" != "null" ]; then
+        local aowner; aowner="$(rc_consult_get "$cid" 2>/dev/null | jq -r '.peerNpub // ""' 2>/dev/null)"
+        if [ -n "$aowner" ] && [ -n "$from_npub" ] && [ "$aowner" != "$from_npub" ]; then
+          echo "ACK IGNORED on $cid: sender not the thread peer" >&2
+        else
+          _rc_consult_patch "$cid" '.status="closed" | .ack=($p + {at:$now})' \
+            --argjson p "$payload" --arg now "$(rc_now)" >/dev/null 2>&1 || wrc=$?
+          rc_render >/dev/null 2>&1 || true
+          echo "ACK on $cid"
+        fi
       fi;;
     consult.commit_done)
-      _rc_consult_patch "$cid" '.commitments = ((.commitments // []) | map(if .cmid==($p.cmid // "") then (.status="applied") else . end))' \
-        --argjson p "$payload" >/dev/null 2>&1
-      rc_render >/dev/null 2>&1 || true
-      echo "COMMITMENT applied on $cid: $(jq -r '.cmid // "?"' <<<"$payload")";;
+      # SECURITY (item 3): only the peer that owns the thread may mark a commitment done.
+      local cowner; cowner="$(rc_consult_get "$cid" 2>/dev/null | jq -r '.peerNpub // ""' 2>/dev/null)"
+      if [ -n "$cowner" ] && [ -n "$from_npub" ] && [ "$cowner" != "$from_npub" ]; then
+        echo "COMMIT_DONE IGNORED on $cid: sender not the thread peer" >&2
+      else
+        _rc_consult_patch "$cid" '.commitments = ((.commitments // []) | map(if .cmid==($p.cmid // "") then (.status="applied") else . end))' \
+          --argjson p "$payload" >/dev/null 2>&1 || wrc=$?
+        rc_render >/dev/null 2>&1 || true
+        echo "COMMITMENT applied on $cid: $(jq -r '.cmid // "?"' <<<"$payload")"
+      fi;;
     work.intent)
       # A peer broadcasts "is anyone already working on X?" — record it and surface
-      # what WE hold on that scope (active claims AND our own live intents) so the
-      # skill can compose an honest work.status. Record-only: nothing auto-decides.
-      local iid; iid="$(jq -r '.iid // ""' <<<"$payload")"; [ -n "$iid" ] || iid="i-$mid"
+      # what WE hold on that scope. SECURITY (item 3): only ever replace THIS sender's
+      # own prior same-iid intent; a crafted iid can never overwrite another peer's (or
+      # our local) intent.
+      local iid; iid="$(jq -r '.iid // ""' <<<"$payload")"; [ -n "$iid" ] && [ "$iid" != "null" ] || iid="i-$mid"
       _rc_write "$(_rc_intents_file)" '
-        .intents = ((.intents // []) | map(select(.iid != $iid)))
+        .intents = ((.intents // []) | map(select((.iid==$iid and .side=="remote" and .peerNpub==$from) | not)))
         | .intents += [{iid:$iid, side:"remote", peerNpub:$from, peerName:$name,
             subject:($p.subject // $p.intent // ""), approach:($p.approach // ""),
             scope:($p.scope // []), windowUntil:($p.windowUntil // $p.deadline // ""),
             status:"awaiting-reply", receivedAt:$now}]' \
         --arg iid "$iid" --arg from "$from_npub" --arg name "$from_name" \
-        --argjson p "$payload" --arg now "$(rc_now)"
+        --argjson p "$payload" --arg now "$(rc_now)" || wrc=$?
       rc_render >/dev/null 2>&1 || true
       local qscope; qscope="$(jq -r '(.scope // []) | join(",")' <<<"$payload")"
       local mine; mine="$(rc_area_check "$qscope")"
@@ -844,41 +980,81 @@ rc_ingest() {  # <event-json-or-file-or-->  (event = the queued wrapper OR a raw
       [ "$(jq 'length' <<<"$myint" 2>/dev/null || echo 0)" -gt 0 ] \
         && echo "  ⚠ we have live intent(s) on that scope: $(jq -r 'map(.iid + " (" + .subject + ")") | join(", ")' <<<"$myint")";;
     work.status)
-      # A reply to OUR broadcast: onIt=true/false (+ optional parallelVersions offer).
+      # A reply to OUR broadcast. SECURITY (item 3): only append to an intent that is
+      # OURS (side:local) and exists — a peer cannot inject responses into another
+      # peer's remote intent record.
       local iid; iid="$(jq -r '.iid // ""' <<<"$payload")"
-      _rc_intent_patch "$iid" '.responses = ((.responses // []) + [($p + {fromNpub:$from, fromName:$name, at:$now})])' \
-        --argjson p "$payload" --arg from "$from_npub" --arg name "$from_name" --arg now "$(rc_now)" >/dev/null 2>&1
-      rc_render >/dev/null 2>&1 || true
-      echo "WORK-STATUS on $iid from $from_npub: onIt=$(jq -r '.onIt // false' <<<"$payload")";;
+      local istat; istat="$(_rc_intents | jq -r --arg i "$iid" 'first(.[] | select(.iid==$i) | .side) // ""')"
+      if [ "$istat" = "local" ]; then
+        _rc_intent_patch "$iid" '.responses = ((.responses // []) + [($p + {fromNpub:$from, fromName:$name, at:$now})])' \
+          --argjson p "$payload" --arg from "$from_npub" --arg name "$from_name" --arg now "$(rc_now)" >/dev/null 2>&1 || wrc=$?
+        rc_render >/dev/null 2>&1 || true
+        echo "WORK-STATUS on $iid from $from_npub: onIt=$(jq -r '.onIt // false' <<<"$payload")"
+      else
+        echo "WORK-STATUS IGNORED: no local intent $iid to attach a reply to" >&2
+      fi;;
     area.claim)
-      # A peer registers an ADVISORY claim — recorded as active immediately (soft
-      # claim; nothing to grant). Overlap with our areas is surfaced as a notice so
-      # /coordinator-advise can send an area.ack naming the peers to coordinate with.
-      [ -n "$area" ] || area="a$(printf '%s%s' "$from_npub" "$mid" | sha1sum | cut -c1-8)"
-      rc_area_upsert --area "$area" \
+      # A peer registers an ADVISORY claim. SECURITY (item 3): the area id is SENDER-
+      # NAMESPACED so a crafted id can never overwrite another peer's or our own claim;
+      # the holder is bound to the sender.
+      local aid; aid="$(_rc_peer_area_id "$from_npub" "$area" "$mid")"
+      rc_area_upsert --area "$aid" \
         --scope "$(jq -r '(.scope // []) | join(",")' <<<"$payload")" \
         --holder "$from_npub" --name "$from_name" --side remote --status active \
-        --note "$(jq -r '.note // ""' <<<"$payload")" >/dev/null
-      local clash; clash="$(rc_area_check "$(jq -r '(.scope // []) | join(",")' <<<"$payload")" | jq -c --arg id "$area" 'map(select(.areaId != $id))')"
-      echo "AREA claimed (advisory): $area by $from_npub"
+        --note "$(jq -r '.note // ""' <<<"$payload")" >/dev/null || wrc=$?
+      local clash; clash="$(rc_area_check "$(jq -r '(.scope // []) | join(",")' <<<"$payload")" | jq -c --arg id "$aid" 'map(select(.areaId != $id))')"
+      echo "AREA claimed (advisory): $aid by $from_npub"
       [ "$(jq 'length' <<<"$clash" 2>/dev/null || echo 0)" -gt 0 ] \
         && echo "  ⚠ OVERLAP notice — coordinate with holders of: $(jq -r 'map(.areaId + " (" + ((.holderName // .holderNpub[0:12])) + ")") | join(", ")' <<<"$clash") — ack via /coordinator-advise";;
     area.ack)
-      # Advisory response to OUR claim: overlaps + advice (informational, not permission).
-      _rc_area_patch "$area" ".ack=$(jq -c '.' <<<"$payload") | .ackAt=\"$(rc_now)\"" >/dev/null 2>&1
-      rc_render >/dev/null 2>&1 || true
-      local ovl; ovl="$(jq -r '(.overlaps // []) | length' <<<"$payload")"
-      echo "AREA ack on $area: ${ovl} overlap(s)$( [ "$ovl" != "0" ] && printf ' — coordinate: %s' "$(jq -r '(.overlaps // []) | map(.areaId) | join(", ")' <<<"$payload")" )";;
+      # Advisory response to OUR claim. SECURITY (item 3): only patch an area WE hold
+      # (side:local). SECURITY (item 17): payload passed via --argjson, never interpolated.
+      local aside; aside="$(_rc_areas | jq -r --arg id "$area" 'first(.[] | select(.areaId==$id) | .side) // ""')"
+      if [ "$aside" != "local" ]; then
+        echo "AREA ack IGNORED on $area: not our (side:local) claim" >&2
+      else
+        _rc_area_patch "$area" '.ack=$ack | .ackAt=$now' --argjson ack "$payload" --arg now "$(rc_now)" >/dev/null 2>&1 || wrc=$?
+        rc_render >/dev/null 2>&1 || true
+        local ovl; ovl="$(jq -r '(.overlaps // []) | length' <<<"$payload")"
+        echo "AREA ack on $area: ${ovl} overlap(s)$( [ "$ovl" != "0" ] && printf ' — coordinate: %s' "$(jq -r '(.overlaps // []) | map(.areaId) | join(", ")' <<<"$payload")" )"
+      fi;;
     area.heartbeat)
-      _rc_area_patch "$area" ".status=\"active\" | .lease=$(jq -c '.lease // {}' <<<"$payload") | .heartbeatAt=\"$(rc_now)\"" >/dev/null 2>&1
-      rc_render >/dev/null 2>&1 || true
-      echo "AREA heartbeat: $area";;
+      # SECURITY (item 3): sender-namespaced id + holder gate → a peer can only renew
+      # ITS OWN claim; a heartbeat for peer B's area is a no-op. (item 17): --argjson lease.
+      local aid; aid="$(_rc_peer_area_id "$from_npub" "$area" "$mid")"
+      local h; h="$(_rc_area_holder "$aid")"
+      if [ -z "$h" ] || [ "$h" = "$from_npub" ]; then
+        _rc_area_patch "$aid" '.status="active" | .lease=$lease | .heartbeatAt=$now' \
+          --argjson lease "$(jq -c '.lease // {}' <<<"$payload")" --arg now "$(rc_now)" >/dev/null 2>&1 || wrc=$?
+        rc_render >/dev/null 2>&1 || true
+        echo "AREA heartbeat: $aid"
+      else
+        echo "AREA heartbeat IGNORED: $aid not held by sender" >&2
+      fi;;
     area.release)
-      _rc_area_patch "$area" ".status=\"released\" | .releasedAt=\"$(rc_now)\"" >/dev/null 2>&1
-      rc_render >/dev/null 2>&1 || true
-      echo "AREA released: $area";;
+      # SECURITY (item 3): sender-namespaced id + holder gate — a peer can only release
+      # ITS OWN claim; a release for peer B's area is a no-op.
+      local aid; aid="$(_rc_peer_area_id "$from_npub" "$area" "$mid")"
+      local h; h="$(_rc_area_holder "$aid")"
+      if [ -z "$h" ] || [ "$h" = "$from_npub" ]; then
+        _rc_area_patch "$aid" '.status="released" | .releasedAt=$now' --arg now "$(rc_now)" >/dev/null 2>&1 || wrc=$?
+        rc_render >/dev/null 2>&1 || true
+        echo "AREA released: $aid"
+      else
+        echo "AREA release IGNORED: $aid not held by sender" >&2
+      fi;;
     split.propose)
-      local sid; sid="$(jq -r '.sid // ""' <<<"$payload")"; [ -n "$sid" ] || sid="s-$mid"
+      # SECURITY (item 3): namespace a sid that collides with a split WE own (side:local)
+      # or another peer's, so a crafted sid can't overwrite it. Recorded side:remote;
+      # the partition is NEVER auto-applied (that happens only on our deliberate accept).
+      local sid; sid="$(jq -r '.sid // ""' <<<"$payload")"; [ -n "$sid" ] && [ "$sid" != "null" ] || sid="s-$mid"
+      local ex_sd; ex_sd="$(_rc_splits | jq -r --arg s "$sid" '(first(.[] | select(.sid==$s))) as $x | if $x==null then "" else ($x.side + "|" + ($x.peerNpub // "")) end')"
+      if [ -n "$ex_sd" ]; then
+        local ex_side="${ex_sd%%|*}" ex_owner="${ex_sd#*|}"
+        if [ "$ex_side" = "local" ] || { [ -n "$ex_owner" ] && [ "$ex_owner" != "$from_npub" ]; }; then
+          sid="s$(printf '%s|%s' "$from_npub" "$sid" | sha1sum | cut -c1-8)"
+        fi
+      fi
       _rc_write "$(_rc_splits_file)" '
         .splits = ((.splits // []) | map(select(.sid != $sid)))
         | .splits += [{sid:$sid, side:"remote", peerNpub:$from, peerName:$name,
@@ -886,7 +1062,7 @@ rc_ingest() {  # <event-json-or-file-or-->  (event = the queued wrapper OR a raw
             parallelVersions:($p.parallelVersions // false), note:($p.note // ""),
             status:"proposed", receivedAt:$now}]' \
         --arg sid "$sid" --arg from "$from_npub" --arg name "$from_name" \
-        --argjson p "$payload" --arg now "$(rc_now)"
+        --argjson p "$payload" --arg now "$(rc_now)" || wrc=$?
       rc_render >/dev/null 2>&1 || true
       if [ "$(jq -r '.parallelVersions // false' <<<"$payload")" = "true" ]; then
         echo "SPLIT proposal $sid from $from_npub: acknowledged PARALLEL-VERSIONS run on '$(jq -r '.subject // .about // "?"' <<<"$payload")' — agree via 'split-agree $sid' if intended"
@@ -894,35 +1070,64 @@ rc_ingest() {  # <event-json-or-file-or-->  (event = the queued wrapper OR a raw
         echo "SPLIT proposal $sid from $from_npub: partition of '$(jq -r '.subject // .about // "?"' <<<"$payload")' — review + 'split-agree $sid' (accept, records per-part claims) or counter with another split-propose; escalate to admins only if a judgment call is needed"
       fi;;
     split.agree)
-      # Peer accepted OUR proposal → the agreed partition becomes real awareness
-      # state: each part auto-creates that owner's advisory area claim.
+      # Peer accepted OUR proposal. SECURITY (item 2): an inbound accept RECORDS STATUS
+      # ONLY — it does not auto-materialize the partition into awareness state (that is
+      # done by /coordinator-advise or our own split-agree, with owner re-validation).
+      # Gate: only a split WE proposed (side:local) is affected.
       local sid; sid="$(jq -r '.sid // ""' <<<"$payload")"
-      _rc_split_patch "$sid" '.status="agreed" | .agreedAt=$now | .agreeNote=($p.note // "")' \
-        --arg now "$(rc_now)" --argjson p "$payload" >/dev/null 2>&1
-      _rc_split_apply "$sid"
-      rc_render >/dev/null 2>&1 || true
-      echo "SPLIT agreed: $sid — per-part advisory claims recorded; proceed on your slice";;
+      local sp_side; sp_side="$(_rc_splits | jq -r --arg s "$sid" 'first(.[] | select(.sid==$s) | .side) // ""')"
+      if [ -z "$sp_side" ]; then
+        echo "SPLIT agree for unknown split $sid — noted"
+      elif [ "$sp_side" != "local" ]; then
+        echo "SPLIT agree IGNORED on $sid: not a proposal we made" >&2
+      else
+        _rc_split_patch "$sid" '.status="agreed" | .agreedAt=$now | .agreeNote=($p.note // "") | .agreedByNpub=$from' \
+          --arg now "$(rc_now)" --arg from "$from_npub" --argjson p "$payload" >/dev/null 2>&1 || wrc=$?
+        rc_render >/dev/null 2>&1 || true
+        echo "SPLIT agreed on our proposal $sid (status only — materialize via /coordinator-advise)"
+      fi;;
     conflict.open)
-      local kid; kid="$(jq -r '.kid // ""' <<<"$payload")"; [ -n "$kid" ] || kid="k-$mid"
+      # SECURITY (item 3): namespace a colliding kid so a peer can't overwrite our or a
+      # third peer's conflict record.
+      local kid; kid="$(jq -r '.kid // ""' <<<"$payload")"; [ -n "$kid" ] && [ "$kid" != "null" ] || kid="k-$mid"
+      local ex_ko; ex_ko="$(_rc_conflicts | jq -r --arg k "$kid" '(first(.[] | select(.kid==$k))) as $x | if $x==null then "" else ($x.peerNpub // "-") end')"
+      if [ -n "$ex_ko" ] && [ "$ex_ko" != "$from_npub" ]; then
+        kid="k$(printf '%s|%s' "$from_npub" "$kid" | sha1sum | cut -c1-8)"
+      fi
       _rc_write "$(_rc_conflicts_file)" '
         .conflicts = ((.conflicts // []) | map(select(.kid != $kid)))
         | .conflicts += [{kid:$kid, side:"remote", peerNpub:$from, paths:($p.paths // []),
             parties:($p.parties // []), note:($p.note // ""), stage:"clean",
             status:"open", receivedAt:$now}]' \
-        --arg kid "$kid" --arg from "$from_npub" --argjson p "$payload" --arg now "$(rc_now)"
+        --arg kid "$kid" --arg from "$from_npub" --argjson p "$payload" --arg now "$(rc_now)" || wrc=$?
       rc_render >/dev/null 2>&1 || true
       echo "CONFLICT opened: $kid on $(jq -r '(.paths // []) | join(", ")' <<<"$payload") — reconcile via /coordinator-advise (ladder: clean → auto-merge → ai-resolve → re-plan)";;
     conflict.resolve)
+      # SECURITY (item 3): a conflict.resolve from a NON-PARTY is ignored — only a party
+      # to the conflict (in .parties, or the peer who opened it) may advance its stage.
       local kid; kid="$(jq -r '.kid // ""' <<<"$payload")"
-      _rc_write "$(_rc_conflicts_file)" '
-        .conflicts = ((.conflicts // []) | map(if .kid==($p.kid // "") then
-          (.stage=($p.stage // .stage) | .status=($p.status // "resolved")
-           | .resolution=($p.resolution // "") | .updatedAt=$now) else . end))' \
-        --argjson p "$payload" --arg now "$(rc_now)" >/dev/null 2>&1
-      rc_render >/dev/null 2>&1 || true
-      echo "CONFLICT $kid → $(jq -r '.status // "resolved"' <<<"$payload") at stage $(jq -r '.stage // "?"' <<<"$payload")";;
+      local party; party="$(_rc_conflicts | jq -r --arg k "$kid" --arg f "$from_npub" \
+        '(first(.[] | select(.kid==$k))) as $c | if $c==null then "unknown" elif ((($c.parties // []) | index($f)) != null or $c.peerNpub==$f) then "yes" else "no" end')"
+      if [ "$party" = "no" ]; then
+        echo "CONFLICT resolve IGNORED on $kid: sender ${from_npub:0:12}… is not a party" >&2
+      elif [ "$party" = "unknown" ]; then
+        echo "CONFLICT resolve for unknown conflict $kid — noted"
+      else
+        _rc_write "$(_rc_conflicts_file)" '
+          .conflicts = ((.conflicts // []) | map(if .kid==($p.kid // "") then
+            (.stage=($p.stage // .stage) | .status=($p.status // "resolved")
+             | .resolution=($p.resolution // "") | .updatedAt=$now) else . end))' \
+          --argjson p "$payload" --arg now "$(rc_now)" >/dev/null 2>&1 || wrc=$?
+        rc_render >/dev/null 2>&1 || true
+        echo "CONFLICT $kid → $(jq -r '.status // "resolved"' <<<"$payload") at stage $(jq -r '.stage // "?"' <<<"$payload")"
+      fi;;
     *) echo "IGNORED: unknown kind $kind";;
   esac
+  # SECURITY (item 15): a failed durable write must NOT be marked seen — retry it later.
+  if [ "${wrc:-0}" != 0 ]; then
+    echo "WRITE-FAILED(rc=$wrc): $kind not durably recorded — NOT marking seen (will retry)" >&2
+    return 1
+  fi
   [ -n "$mid" ] && rc_seen_mark "$mid" >/dev/null 2>&1
   return 0
 }
@@ -971,7 +1176,18 @@ rc_replay_deferred() {  # <hex>
   [ -n "$hex" ] || { echo "ERR: hex required" >&2; return 1; }
   local d="$STATE_DIR/agent-deferred/$hex"
   [ -d "$d" ] || { printf '0\n'; return 0; }
-  local n=0 f env kind ts npub name
+  # SECURITY (item 1): the stash was written BEFORE authorization and WITHOUT SIF (in
+  # classify-inbound's cap-missing/pending branches). Replay must therefore re-run the
+  # EXACT fresh-inbound gate per envelope — resolve the verb's required cap, confirm it
+  # is in the NOW-granted caps of this (authorized) peer, AND pass the body through SIF
+  # inbound — BEFORE enqueueing. A verb whose cap was not granted is DROPPED; a SIF-
+  # flagged body is QUARANTINED (never enqueued). Nothing bypasses the gate on replay.
+  local entry status caps
+  entry="$(bash "$RC_REGISTRY" get "$hex" 2>/dev/null || echo '{}')"
+  status="$(jq -r '.status // ""' <<<"$entry" 2>/dev/null)"
+  caps="$(jq -c '.capabilities // []' <<<"$entry" 2>/dev/null)"; [ -n "$caps" ] && [ "$caps" != "null" ] || caps='[]'
+  local qdir="$STATE_DIR/agent-quarantine"
+  local n=0 f env kind ts npub name reqcap
   for f in "$d"/*.json; do
     [ -e "$f" ] || continue
     env="$(jq -r '.body // ""' "$f" 2>/dev/null)"
@@ -980,9 +1196,46 @@ rc_replay_deferred() {  # <hex>
     name="$(jq -r '.unicityName // ""' "$f" 2>/dev/null)"
     kind="$(printf '%s' "$env" | jq -r '.kind // ""' 2>/dev/null)"
     [ -n "$kind" ] && [ "$kind" != "null" ] || kind="$(jq -r '.kind // ""' "$f" 2>/dev/null)"
+
+    # Only ever replay for a still-authorized peer.
+    if [ "$status" != "authorized" ]; then rm -f "$f" 2>/dev/null || true; continue; fi
+
+    # Resolve the required cap (peer OR team engine); an unknown verb has no replay path.
+    reqcap=""
+    if rc_is_verb "$kind"; then reqcap="$(rc_verb_cap "$kind")"
+    elif type team_is_verb >/dev/null 2>&1 && team_is_verb "$kind"; then reqcap="$(team_verb_cap "$kind")"
+    else rm -f "$f" 2>/dev/null || true; continue; fi
+
+    # Cap gate: the verb's cap MUST be in the now-granted set, else DROP (never enqueue).
+    if ! printf '%s' "$caps" | jq -e --arg c "$reqcap" 'index($c)' >/dev/null 2>&1; then
+      echo "DROP(cap) replay $kind — '$reqcap' not granted to ${hex:0:12}…" >&2
+      rm -f "$f" 2>/dev/null || true; continue
+    fi
+
+    # SIF inbound: a flagged body is QUARANTINED for owner review, not enqueued.
+    # NB: sif-guard EXITS 10 on quarantine — under `set -o pipefail`, piping it straight
+    # into `jq ... || echo pass` would let the non-zero pipeline trigger the `|| echo pass`
+    # and mislabel a flag as a pass. Capture the verdict JSON first, THEN parse it.
+    if [ -f "$RC_SIF" ]; then
+      local sifout; sifout="$(printf '%s' "$env" | bash "$RC_SIF" check --direction inbound --principal "$hex" --source agent-comms 2>/dev/null)"
+      local dec; dec="$(printf '%s' "$sifout" | jq -r '.decision // "pass"' 2>/dev/null || echo pass)"
+      if [ "$dec" = "quarantine" ]; then
+        _rc_ensure_dir "$qdir"
+        local qid; qid="$(printf '%s|%s|%s' "$hex" "$ts" "$env" | sha1sum 2>/dev/null | cut -c1-16)"
+        jq -nc --arg id "$qid" --arg from "$hex" --arg npub "$npub" --arg name "$name" \
+           --arg body "$env" --arg kind "$kind" --arg now "$(rc_now)" \
+           '{id:$id, status:"quarantined", from_pubkey:$from, npub:$npub, unicityName:$name,
+             kind:$kind, body:$body, quarantinedAt:$now, source:"replay-deferred"}' \
+           > "$qdir/$qid.json.tmp.$$" 2>/dev/null \
+          && mv "$qdir/$qid.json.tmp.$$" "$qdir/$qid.json" 2>/dev/null || rm -f "$qdir/$qid.json.tmp.$$" 2>/dev/null || true
+        echo "QUARANTINE(sif) replay $kind from ${hex:0:12}…" >&2
+        rm -f "$f" 2>/dev/null || true; continue
+      fi
+    fi
+
     if rc_is_verb "$kind"; then
       rc_enqueue_event "$hex" "$ts" "$env" "$npub" "$name" >/dev/null 2>&1 && n=$((n+1))
-    elif type team_is_verb >/dev/null 2>&1 && team_is_verb "$kind"; then
+    else
       team_enqueue_event "$hex" "$ts" "$env" "$npub" "$name" >/dev/null 2>&1 && n=$((n+1))
     fi
     rm -f "$f" 2>/dev/null || true
