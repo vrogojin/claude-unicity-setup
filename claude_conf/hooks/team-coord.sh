@@ -539,7 +539,9 @@ team_emit() {
     fi
     if [ "${TEAM_DRY_RUN:-0}" = "1" ]; then
       printf 'DRY-RUN send → %s : %s\n' "$n" "$kind"
-    elif NODE_PATH="$nodepath" node "$helper" send-dm "$n" "$env" --identity "$ident" >/dev/null 2>&1; then
+    # SECURITY: pipe the envelope via STDIN, never argv, so a body is never exposed on
+    # `ps` / /proc/<pid>/cmdline during the send window (matches rc_emit).
+    elif printf '%s' "$env" | NODE_PATH="$nodepath" node "$helper" send-dm "$n" --identity "$ident" >/dev/null 2>&1; then
       printf 'sent → %s : %s\n' "$n" "$kind"; sent=$((sent+1))
     else
       printf 'FAILED send → %s : %s\n' "$n" "$kind" >&2; fail=$((fail+1))

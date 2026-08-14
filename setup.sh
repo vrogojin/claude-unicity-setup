@@ -918,7 +918,12 @@ echo ""
 if [ -n "$TICKET_STR" ] && [ "$DRY_RUN" != "true" ]; then
   echo ""
   info "Redeeming invite ticket (single-command mutual onboarding)…"
-  if CLAUDE_PROJECT_DIR="$TARGET_DIR" bash "$CLAUDE_DIR/hooks/ticket.sh" redeem "$TICKET_STR" --yes; then
+  # The ticket embeds a bearer SECRET — hand it to ticket.sh via a 0600 file (auto-removed),
+  # NOT on argv, so no child process re-exposes it on `ps` / /proc/<pid>/cmdline.
+  TICKET_TMP="$(umask 077; mktemp "${TMPDIR:-/tmp}/onboard-ticket.XXXXXX")"
+  trap 'rm -f "$TICKET_TMP"' EXIT
+  printf '%s' "$TICKET_STR" > "$TICKET_TMP"
+  if CLAUDE_PROJECT_DIR="$TARGET_DIR" bash "$CLAUDE_DIR/hooks/ticket.sh" redeem --ticket-file "$TICKET_TMP" --yes; then
     echo ""
     echo "  ✅ MUTUAL AUTH complete — you and the issuer now recognize each other."
     echo "     Start the daemon (above), then:  /consult-coordinator <issuer-name> \"…\""
