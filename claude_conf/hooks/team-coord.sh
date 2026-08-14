@@ -513,26 +513,57 @@ team_emit() {
   if [ "${#recips[@]}" -eq 0 ]; then echo "WARN: no recipients for $kind on team $id" >&2; fi
   local helper; helper="$(_tc_sphere_helper)"
   local ident; ident="$(team_identity_path)"
-  local sent=0 n
+  # Point NODE_PATH at the framework clone's node_modules (helper dir → ../node_modules) so
+  # the transport helper can load @unicitylabs/sphere-sdk even when invoked from outside the
+  # clone (mirrors sphere-daemon.mjs, which sets NODE_PATH the same way).
+  local nodepath=""; [ -n "$helper" ] && nodepath="$(cd "$(dirname "$helper")/.." 2>/dev/null && pwd)/node_modules"
+  # Transport preflight: a MISSING helper or identity must FAIL LOUD — never masquerade as a
+  # successful DRY-RUN. Only an explicit TEAM_DRY_RUN=1 suppresses real sending. A fresh peer
+  # whose helper is unresolved otherwise "sends" every verb into the void (#20).
+  if [ "${TEAM_DRY_RUN:-0}" != "1" ]; then
+    if [ -z "$helper" ]; then
+      echo "ERROR(team_emit): sphere-helper.mjs not found — '$kind' NOT sent. Set \$TEAM_SPHERE_HELPER or record transport.helper_path in the agent config (re-run setup.sh)." >&2
+      return 3
+    fi
+    if [ ! -f "$ident" ]; then
+      echo "ERROR(team_emit): identity file '$ident' missing — '$kind' NOT sent. Re-run setup.sh to mint the agent identity." >&2
+      return 3
+    fi
+  fi
+  local sent=0 fail=0 n
   for n in "${recips[@]}"; do
     # Egress content-guard (same posture as /dm-agent). Envelope JSON is the body.
     if [ -f "$TC_SIF" ]; then
       local dec; dec="$(printf '%s' "$env" | bash "$TC_SIF" check --direction outbound --principal "$n" --source agent-comms 2>/dev/null | jq -r '.decision // "pass"' 2>/dev/null || echo pass)"
-      [ "$dec" = "quarantine" ] && { echo "BLOCKED(sif) → $n : $kind" >&2; continue; }
+      [ "$dec" = "quarantine" ] && { echo "BLOCKED(sif) → $n : $kind" >&2; fail=$((fail+1)); continue; }
     fi
-    if [ "${TEAM_DRY_RUN:-0}" = "1" ] || [ -z "$helper" ] || [ ! -f "$ident" ]; then
+    if [ "${TEAM_DRY_RUN:-0}" = "1" ]; then
       printf 'DRY-RUN send → %s : %s\n' "$n" "$kind"
+    elif NODE_PATH="$nodepath" node "$helper" send-dm "$n" "$env" --identity "$ident" >/dev/null 2>&1; then
+      printf 'sent → %s : %s\n' "$n" "$kind"; sent=$((sent+1))
     else
-      if node "$helper" send-dm "$n" "$env" --identity "$ident" >/dev/null 2>&1; then
-        printf 'sent → %s : %s\n' "$n" "$kind"; sent=$((sent+1))
-      else
-        printf 'FAILED send → %s : %s\n' "$n" "$kind" >&2
-      fi
+      printf 'FAILED send → %s : %s\n' "$n" "$kind" >&2; fail=$((fail+1))
     fi
   done
+  [ "$fail" -gt 0 ] && return 1
   return 0
 }
 _tc_sphere_helper() {
+  # setup.sh COPIES these hooks into <project>/.claude/hooks/, but the transport helper must
+  # stay under the framework clone (it loads @unicitylabs/sphere-sdk from the clone's
+  # node_modules). So the relative candidates below cannot reach it on a fresh peer — the
+  # recorded absolute path can. Resolution order: explicit env → recorded config → candidates.
+  # (1) Explicit override.
+  if [ -n "${TEAM_SPHERE_HELPER:-}" ] && [ -f "${TEAM_SPHERE_HELPER}" ]; then
+    printf '%s' "$TEAM_SPHERE_HELPER"; return
+  fi
+  # (2) transport.helper_path recorded in the agent config by setup.sh.
+  local cfg; cfg="$(_tc_agent_dir)/config.json"
+  if [ -f "$cfg" ]; then
+    local hp; hp="$(jq -r '.transport.helper_path // ""' "$cfg" 2>/dev/null || echo "")"
+    [ -n "$hp" ] && [ -f "$hp" ] && { printf '%s' "$hp"; return; }
+  fi
+  # (3) Fallback: relative candidates — only reachable when the hooks run IN PLACE under the clone.
   local cands=(
     "${CLAUDE_PROJECT_DIR:-}/../lib/sphere-helper.mjs"
     "${CLAUDE_PROJECT_DIR:-}/lib/sphere-helper.mjs"

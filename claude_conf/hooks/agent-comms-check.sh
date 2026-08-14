@@ -38,28 +38,46 @@ fi
 echo "$NOW" > "$COOLDOWN_FILE"
 
 # --- Locate sphere-helper.mjs ---
-# Try relative to hooks dir (deployed), then relative to project
+# Prefer the path recorded at setup time (env, then config): the framework helper lives under
+# the clone (it loads @unicitylabs/sphere-sdk from the clone's node_modules), NOT under the
+# hooks copied into .claude/, so the relative candidates below miss on a fresh peer.
 HELPER=""
-for candidate in \
-  "$CLAUDE_PROJECT_DIR/../lib/sphere-helper.mjs" \
-  "$CLAUDE_PROJECT_DIR/lib/sphere-helper.mjs" \
-  "$(dirname "$HOOK_DIR")/../lib/sphere-helper.mjs"; do
-  if [ -f "$candidate" ]; then
-    HELPER="$candidate"
-    break
+if [ -n "${TEAM_SPHERE_HELPER:-}" ] && [ -f "${TEAM_SPHERE_HELPER}" ]; then
+  HELPER="$TEAM_SPHERE_HELPER"
+else
+  HELPER_CFG="$(jq -r '.transport.helper_path // ""' "$CONFIG_FILE" 2>/dev/null || echo "")"
+  if [ -n "$HELPER_CFG" ] && [ -f "$HELPER_CFG" ]; then
+    HELPER="$HELPER_CFG"
+  else
+    for candidate in \
+      "$CLAUDE_PROJECT_DIR/../lib/sphere-helper.mjs" \
+      "$CLAUDE_PROJECT_DIR/lib/sphere-helper.mjs" \
+      "$(dirname "$HOOK_DIR")/../lib/sphere-helper.mjs"; do
+      if [ -f "$candidate" ]; then
+        HELPER="$candidate"
+        break
+      fi
+    done
   fi
-done
+fi
 
 if [ -z "$HELPER" ]; then
-  # No helper available — cannot poll
+  # No transport helper resolvable → inbound relay polling cannot run. On a fresh peer this
+  # is a real misconfiguration (no recorded transport.helper_path), not a benign no-op, so
+  # surface it (rate-limited by the cooldown already stamped above) instead of exiting silently.
+  echo "WARN(agent-comms-check): sphere-helper.mjs unresolved — inbound relay polling DISABLED. Set \$TEAM_SPHERE_HELPER or record transport.helper_path (re-run setup.sh)." >&2
   exit 0
 fi
+
+# NODE_PATH → the clone's node_modules (helper dir → ../node_modules) so the helper loads
+# @unicitylabs/sphere-sdk even when invoked from outside the clone (mirrors sphere-daemon.mjs).
+HELPER_NODE_PATH="$(cd "$(dirname "$HELPER")/.." 2>/dev/null && pwd)/node_modules"
 
 # --- Calculate since timestamp (10 minutes ago) ---
 SINCE=$(( NOW - 600 ))
 
 # --- Poll for messages ---
-POLL_RESULT=$(node "$HELPER" check-messages \
+POLL_RESULT=$(NODE_PATH="$HELPER_NODE_PATH" node "$HELPER" check-messages \
   --identity "$IDENTITY_FILE" \
   --config "$CONFIG_FILE" \
   --since "$SINCE" 2>/dev/null || echo '{"messages":[]}')
