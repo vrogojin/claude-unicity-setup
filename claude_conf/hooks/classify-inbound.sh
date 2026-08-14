@@ -119,15 +119,45 @@ quarantine_message() {  # args: from ts body type group name npub sif_verdict_js
 # egg — issue #14). Keyed by sender pubkey hex; the raw envelope body is preserved so
 # agent-registry.sh → remote-coord.sh replay-deferred can re-enqueue it by kind. Only
 # coordination verbs are stashed (a plain DM has no replay path); dedup by event id.
+# Bounds (env-overridable) — an unauthorized/pending sender must not be able to fill
+# the disk by flooding first-contact envelopes (issue: unbounded stash = DoS).
+STASH_PER_HEX_MAX="${STASH_PER_HEX_MAX:-50}"     # max stashed envelopes per sender hex
+STASH_TOTAL_MAX="${STASH_TOTAL_MAX:-500}"         # max stashed envelopes across all senders
+STASH_MAX_AGE_DAYS="${STASH_MAX_AGE_DAYS:-7}"     # reap any stash older than this, always
+
 stash_deferred() {  # from ts body npub name kind eventid
   local from="$1" ts="$2" body="$3" npub="$4" name="$5" kind="$6" eid="$7"
   [ -n "$from" ] && [ "$from" != "unknown" ] || return 0
-  local d="$DEFERRED_DIR/$from"
-  mkdir -p "$d" 2>/dev/null || return 0
+  # SECURITY (item 8): $from is a directory component and $eid a filename — validate
+  # BOTH as hex BEFORE they touch any path, so a crafted `.id` (e.g. "../../x") or a
+  # bogus pubkey can never escape agent-deferred/.
+  [[ "$from" =~ ^[0-9a-f]{64}$ ]] || { echo "stash: rejecting non-hex from '$from'" >&2; return 0; }
   [ -n "$eid" ] || eid="$(printf '%s|%s|%s' "$from" "$ts" "$body" | sha1sum 2>/dev/null | cut -c1-16)"
   [ -n "$eid" ] || return 0
+  [[ "$eid" =~ ^[0-9a-f]{1,64}$ ]] || { echo "stash: rejecting non-hex eid '$eid'" >&2; return 0; }
+
+  # SECURITY (item 7): reap stale stashes (age-based, regardless of any later authorize),
+  # then enforce a per-sender cap and a global cap by evicting the OLDEST — bounded disk.
+  find "$DEFERRED_DIR" -type f -name '*.json' -mtime +"$STASH_MAX_AGE_DAYS" -delete 2>/dev/null || true
+
+  local d="$DEFERRED_DIR/$from"
+  mkdir -p "$d" 2>/dev/null || return 0
   local df="$d/$eid.json"
   [ -f "$df" ] && return 0
+
+  # Per-hex cap: keep the newest (STASH_PER_HEX_MAX-1), drop the rest before adding one.
+  local cnt; cnt="$(find "$d" -maxdepth 1 -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "${cnt:-0}" -ge "$STASH_PER_HEX_MAX" ] 2>/dev/null; then
+    ls -1t "$d"/*.json 2>/dev/null | tail -n +"$STASH_PER_HEX_MAX" | while IFS= read -r old; do rm -f "$old" 2>/dev/null || true; done
+  fi
+  # Global cap: if the whole stash tree is at/over the ceiling, evict oldest files.
+  local tcnt; tcnt="$(find "$DEFERRED_DIR" -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "${tcnt:-0}" -ge "$STASH_TOTAL_MAX" ] 2>/dev/null; then
+    find "$DEFERRED_DIR" -type f -name '*.json' -printf '%T@ %p\n' 2>/dev/null | sort -n \
+      | head -n "$(( tcnt - STASH_TOTAL_MAX + 1 ))" | cut -d' ' -f2- \
+      | while IFS= read -r old; do rm -f "$old" 2>/dev/null || true; done
+  fi
+
   jq -nc --arg from "$from" --arg ts "$ts" --arg body "$body" --arg npub "$npub" \
      --arg name "$name" --arg kind "$kind" --arg now "$(now_iso)" \
      '{from_pubkey:$from, receivedAt:$ts, body:$body, npub:$npub, unicityName:$name,

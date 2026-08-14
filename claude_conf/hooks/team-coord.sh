@@ -703,14 +703,34 @@ team_ingest_award() {  # worker side: accept an award for us (epoch-fenced)
 
 team_ingest_lease() {  # coordinator heartbeat / claim — adopt higher epoch, fence lower
   local team="$1" env="$2"
-  local ep holder exp cur
+  local ep holder exp cur from
   ep="$(jq -r '.payload.epoch // .epoch // 1' <<<"$env")"
   holder="$(jq -r '.payload.holderNpub // .fromNpub // ""' <<<"$env")"
+  from="$(jq -r '.fromNpub // ""' <<<"$env")"
   exp="$(jq -r '.payload.expiresAt // ""' <<<"$env")"
   cur="$(team_get "$team" | jq -r '.epoch // 1')"
   local me; me="$(team_self_npub)"
+  # SECURITY (item 16): a lease BINDS the coordinator role to the SENDER. A peer may not
+  # install a THIRD PARTY (or a spoofed holder) as coordinator on someone else's behalf —
+  # the claimed holderNpub must equal the envelope's fromNpub.
+  if [ -n "$from" ] && [ -n "$holder" ] && [ "$holder" != "$from" ]; then
+    echo "LEASE REJECTED: holder ${holder:0:12}… != sender ${from:0:12}… (unbound seizure)"; return 0
+  fi
+  # SECURITY (item 16): clamp the epoch to at most cur+1. A crafted far-future epoch
+  # would otherwise permanently fence every legitimate (lower-epoch) message = epoch-DoS.
+  if [ "${ep:-0}" -gt "$((cur+1))" ] 2>/dev/null; then
+    echo "LEASE REJECTED: epoch $ep > cur+1 ($((cur+1))) — clamped/ignored"; return 0
+  fi
   if [ "${ep:-0}" -gt "$cur" ] 2>/dev/null; then
-    # Higher epoch wins outright.
+    # SECURITY (item 16): a higher-epoch SEIZURE is honored only when the CURRENT lease
+    # has EXPIRED (no live coordinator to displace) — OR the sender IS the current
+    # coordinator advancing its own epoch. A valid, unexpired lease is never overridden
+    # by an outsider bumping the epoch.
+    local lstat; lstat="$(team_lease_status "$team" | awk '{print $1}')"
+    local curh; curh="$(team_get "$team" | jq -r '.coordinatorNpub // ""')"
+    if [ "$lstat" = "valid" ] && [ -n "$curh" ] && [ "$holder" != "$curh" ]; then
+      echo "LEASE REJECTED: epoch $ep seizure while current lease valid (holder ${curh:0:12}…)"; return 0
+    fi
     local role="member"; [ "$holder" = "$me" ] && role="coordinator"
     _tc_write "$(team_dir "$team")/team.json" '.epoch=$ep | .coordinatorNpub=$h | .role=$role | .lease={epoch:$ep, holderNpub:$h, expiresAt:$exp}' \
       --argjson ep "$ep" --arg h "$holder" --arg role "$role" --arg exp "$exp"
