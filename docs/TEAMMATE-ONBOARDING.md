@@ -65,6 +65,25 @@ Concierge side, a build, or a redeploy, you **consult the coordinator** and it d
 
 ## 2. Setup — two paths
 
+### Path 0 — One command with an invite ticket (fastest; skips §3 entirely)
+
+If the coordinator (or any authorized peer) handed you a **one-time invite ticket**
+(`unicity-ticket:v1.…`), you do the whole thing — install, identity, *and* the mutual
+authorization handshake — in a **single command**:
+
+```bash
+git clone git@github.com:vrogojin/claude-unicity-setup.git && cd claude-unicity-setup
+./setup.sh /absolute/path/to/your-project --ticket 'unicity-ticket:v1.…'
+```
+
+`setup.sh` installs the framework and mints your identity as usual, then **redeems the
+ticket**: it verifies the ticket's signature and issuer, sends a signed redeem, and waits
+for the issuer's grant. On success it prints `MUTUAL AUTH complete` — you and the issuer now
+recognize each other, with **no npub copy-paste and no manual `authorize` on either side**.
+Then just start the daemon (2A.3) and go to §4. If you don't have a ticket, use Path A +
+the manual handshake in §3. (A ticket is a **bearer credential** — treat the string as a
+secret and confirm the issuer name it shows is who you expect.)
+
 ### Path A — Full framework (recommended)
 
 Install the whole coordination framework into your project. This gives you the daemon,
@@ -101,6 +120,11 @@ your first message once authorized.
 ---
 
 ## 3. Get authorized (one handshake)
+
+> **Skip this whole section if you redeemed an invite ticket (Path 0)** — the redeem already
+> did the mutual authorization for you. This section is the manual equivalent for when no
+> ticket was issued. The coordinator can mint you a ticket with
+> `bash .claude/hooks/ticket.sh issue --name "your-name"` (see the `issue-ticket` skill).
 
 1. **Send the coordinator your npub** (from step 2A.2) through any human channel (chat,
    email), *or* just have your daemon send a hello — either way the coordinator needs to

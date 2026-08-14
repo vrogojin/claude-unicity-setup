@@ -110,6 +110,41 @@ All registry reads/writes go through **`.claude/hooks/agent-registry.sh`** (sour
 library + CLI). It validates capabilities, writes atomically under a lock, and never
 downgrades an `authorized`/`denied` status on an idempotent `upsert-pending`.
 
+### 2.1 One-time invite tickets (single-command mutual onboarding)
+
+The manual §3 handshake (exchange npubs → each side authorizes the other) collapses into a
+**single command** when one party issues a **one-time invite ticket**. Symmetric: either the
+coordinator or any authorized peer can issue; whoever redeems ends up **mutually authorized**.
+
+- **Format:** `unicity-ticket:v1.<base64url(signed-event-json)>`. The event is a Nostr
+  **kind 30777** signed by the issuer's identity key; its content is a canonical payload
+  `{v,tid,iss,issName,relays,secret,caps,grantBack,exp,bind,label}`. `tid = "t"+sha256(secret)[0:12]`.
+  A ticket is a **bearer credential** — the `secret` is the single-use bearer token; send it
+  over a private channel.
+- **Engine:** `.claude/hooks/ticket.sh` (`issue|list|revoke|redeem|ingest-redeem|ingest-grant|ingest-deny|reap`).
+  Crypto (sign/verify) is in `lib/sphere-helper.mjs` (`ticket-sign` / `ticket-verify`);
+  verify **requires the event pubkey to equal the payload's `iss`**, so a ticket cannot claim
+  a different issuer than the key that signed it.
+- **State stores** (under the coord root, out of git): `tickets.json` (issuer side — the
+  ledger, storing only `sha256(secret)`, **never the secret**), `redemptions.json` (redeemer
+  side — pending/sent/complete), `ticket-attempts.log` (rate-limit ledger, 5/peer/hr + 50/day).
+- **Wire verbs:** `ticket.redeem` / `ticket.grant` / `ticket.deny`. These are **deliberately
+  not in the capability enum** — the gate is the ticket secret + a live pending record, not a
+  registry cap. `classify-inbound.sh` routes them **status-independently** (a redeemer is not
+  yet authorized), SIF-checked first like all inbound.
+- **Handshake:** redeemer verifies signature+issuer **before sending**, sends signed
+  `ticket.redeem`; issuer validates (hash match, not expired, `bind` npub if set, rate-limit),
+  **atomically consumes** the ticket (`pending→redeemed`, flock, re-read to confirm the single
+  winner — a concurrent double-redeem loses), seeds+authorizes the redeemer with `caps`, and
+  replies `ticket.grant`; redeemer authorizes the issuer with `grantBack`. Any failure emits a
+  **loud, reasoned `ticket.deny`** (and a local log line) — fail-closed, never silent (§9).
+- **Fold-in:** `setup.sh --ticket '<ticket>'` runs the redeem right after preflight (it polls
+  `check-messages` itself, so it works before the daemon is up). Skills: `issue-ticket`,
+  `redeem-ticket`. The Stop gate surfaces redeemed tickets whose grant never sent and sent
+  redemptions still awaiting a grant.
+
+See `docs/onboarding-ticket-design.md` for the full protocol + security analysis.
+
 ---
 
 ## 3. Capabilities

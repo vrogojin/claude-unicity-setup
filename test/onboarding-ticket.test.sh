@@ -1,0 +1,138 @@
+#!/bin/bash
+# Hermetic test suite for one-time invite tickets (ticket.sh + sphere-helper ticket-sign/verify
+# + classify-inbound routing). No live relay: emits are TEAM_DRY_RUN=1; inbound is crafted
+# exactly as the daemon delivers it ({from:<hex>, body:<envelope-json>}) and fed to ingest-*.
+# Real schnorr crypto IS exercised (ticket-sign/verify), so a resolvable node_modules is required.
+set -uo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
+HOOKS="$REPO/claude_conf/hooks"
+HELPER="$REPO/lib/sphere-helper.mjs"
+TICKET="$HOOKS/ticket.sh"
+PASS=0; FAIL=0
+ok()   { PASS=$((PASS+1)); echo "  PASS: $1"; }
+bad()  { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
+
+# --- sandbox ---
+SBX="$(mktemp -d)"; trap 'rm -rf "$SBX"' EXIT
+mkdir -p "$SBX/proj/.claude/agent" "$SBX/coord"
+export CLAUDE_PROJECT_DIR="$SBX/proj" COORD_ROOT="$SBX/coord" \
+  TEAM_SPHERE_HELPER="$HELPER" TEAM_IDENTITY_FILE="$SBX/proj/.claude/agent/identity.json" \
+  AGENT_REGISTRY_FILE="$SBX/registry.json" TEAM_SELF_NAME="test-coord" TEAM_DRY_RUN=1
+NP="$(cd "$(dirname "$HELPER")/.." && pwd)/node_modules"
+helper() { NODE_PATH="$NP:${NODE_PATH:-}" node "$HELPER" "$@"; }
+
+helper create-identity > "$SBX/proj/.claude/agent/identity.json" 2>/dev/null
+echo '{"agent_nametag":"test-coord"}' > "$SBX/proj/.claude/agent/config.json"
+if ! jq -e .npub "$SBX/proj/.claude/agent/identity.json" >/dev/null 2>&1; then
+  echo "SKIP: sphere-helper/SDK not resolvable (node_modules missing) — cannot run crypto tests"; exit 0
+fi
+
+# helpers
+new_peer() { helper create-identity > "$SBX/$1.json" 2>/dev/null; local n; n="$(jq -r .npub "$SBX/$1.json")"; local h; h="$(helper npub-to-hex "$n" 2>/dev/null | jq -r .hex)"; echo "$n $h"; }
+issue()    { bash "$TICKET" issue "$@" 2>/dev/null; }
+secret_of(){ local ev; ev="$(bash "$TICKET" decode "$1" 2>/dev/null)"; helper ticket-verify "$ev" 2>/dev/null | jq -r '.payload.secret'; }
+tid_of()   { local ev; ev="$(bash "$TICKET" decode "$1" 2>/dev/null)"; helper ticket-verify "$ev" 2>/dev/null | jq -r '.payload.tid'; }
+redeem_msg(){ jq -nc --arg from "$1" --arg tid "$2" --arg secret "$3" --arg npub "$4" \
+  '{from:$from,id:("m"+$tid+$from[0:6]),body:({a2a:"1",kind:"ticket.redeem",payload:{tid:$tid,secret:$secret,npub:$npub,name:"peer"}}|tojson)}'; }
+authst(){ jq -r --arg h "$1" '.agents[$h].status // "absent"' "$SBX/registry.json"; }
+tkst()  { jq -r --arg t "$1" '.tickets[]? | select(.tid==$t) | .status' "$SBX/coord/tickets.json"; }
+
+echo "== 1. crypto: sign→verify, tamper, wrong-signer =="
+read -r AN AH < <(new_peer alice)
+P=$(jq -nc --arg iss "$AN" '{v:1,tid:"tcrypto000001",iss:$iss,issName:"a",relays:["wss://x"],secret:"s",caps:["consult"],grantBack:["consult"],exp:9999999999,bind:"",label:""}')
+EV=$(helper ticket-sign --identity "$SBX/alice.json" "$P")
+[ "$(helper ticket-verify "$EV" | jq -r .valid)" = "true" ] && ok "valid ticket verifies" || bad "valid verify"
+TAMP=$(echo "$EV" | jq -c '.content=(.content+"AA")')
+[ "$(helper ticket-verify "$TAMP" 2>/dev/null | jq -r '.valid')" = "false" ] && ok "tampered rejected" || bad "tampered"
+EV2=$(helper ticket-sign --identity "$SBX/bob.json" "$P" 2>/dev/null); [ -z "$EV2" ] && { read -r BN BH < <(new_peer bob); EV2=$(helper ticket-sign --identity "$SBX/bob.json" "$P"); }
+[ "$(helper ticket-verify "$EV2" 2>/dev/null | jq -r '.reason')" = "iss-mismatch" ] && ok "wrong-signer (iss-mismatch)" || bad "wrong-signer"
+
+echo "== 2. issue stores hash-only, ticket is one line =="
+T=$(issue --caps consult,claim-area --ttl 2h --name dev)
+[ "$(jq -r '.tickets[-1] | has("secret")' "$SBX/coord/tickets.json")" = "false" ] && ok "no raw secret at rest" || bad "secret leak"
+[ "$(printf '%s' "$T" | wc -l)" = "0" ] && [ -n "$T" ] && ok "ticket is one copy-pasteable line" || bad "ticket format"
+
+echo "== 3. happy path: redeem → redeemer authorized + grant emitted + ticket consumed =="
+read -r RN RH < <(new_peer red)
+TID=$(tid_of "$T"); SEC=$(secret_of "$T")
+OUT=$(redeem_msg "$RH" "$TID" "$SEC" "$RN" | bash "$TICKET" ingest-redeem - 2>&1)
+[ "$(authst "$RH")" = "authorized" ] && ok "redeemer authorized" || bad "redeemer not authorized"
+[ "$(jq -rc --arg h "$RH" '.agents[$h].capabilities' "$SBX/registry.json")" = '["consult","claim-area"]' ] && ok "granted ticket caps" || bad "wrong caps"
+echo "$OUT" | grep -q "DRY-RUN send.*ticket.grant" && ok "ticket.grant emitted" || bad "no grant emit"
+[ "$(tkst "$TID")" = "redeemed" ] && ok "ticket consumed" || bad "ticket not consumed"
+
+echo "== 4. replay from a DIFFERENT hex → deny already-redeemed, nothing authorized =="
+read -r EN EH < <(new_peer eve)
+OUT=$(redeem_msg "$EH" "$TID" "$SEC" "$EN" | bash "$TICKET" ingest-redeem - 2>&1)
+echo "$OUT" | grep -q "already-redeemed" && ok "replay denied (already-redeemed)" || bad "replay not denied"
+[ "$(authst "$EH")" = "absent" ] && ok "replayer NOT authorized" || bad "replayer authorized!"
+
+echo "== 5. idempotent re-redeem: SAME hex → re-grant, single registry entry =="
+OUT=$(redeem_msg "$RH" "$TID" "$SEC" "$RN" | bash "$TICKET" ingest-redeem - 2>&1)
+echo "$OUT" | grep -q "DRY-RUN send.*ticket.grant" && ok "re-grant on same-hex re-redeem" || bad "no re-grant"
+
+echo "== 6. bad secret → deny invalid, nothing authorized =="
+T2=$(issue --caps consult --name b); TID2=$(tid_of "$T2")
+read -r MN MH < <(new_peer mal)
+OUT=$(redeem_msg "$MH" "$TID2" "WRONGSECRET" "$MN" | bash "$TICKET" ingest-redeem - 2>&1)
+echo "$OUT" | grep -q "invalid" && ok "bad secret denied" || bad "bad secret not denied"
+[ "$(authst "$MH")" = "absent" ] && ok "bad-secret sender not authorized" || bad "authorized on bad secret!"
+
+echo "== 7. bind mismatch: --bind <alice>, redeem from red → deny, nothing authorized =="
+TB=$(issue --caps consult --bind "$AN" --name bound); TIDB=$(tid_of "$TB"); SECB=$(secret_of "$TB")
+OUT=$(redeem_msg "$RH" "$TIDB" "$SECB" "$RN" | bash "$TICKET" ingest-redeem - 2>&1)
+echo "$OUT" | grep -q "bind-mismatch" && ok "bind mismatch denied" || bad "bind not enforced"
+# and the bound peer (alice) CAN redeem it
+OUT=$(redeem_msg "$AH" "$TIDB" "$SECB" "$AN" | bash "$TICKET" ingest-redeem - 2>&1)
+[ "$(authst "$AH")" = "authorized" ] && ok "bound peer redeems ok" || bad "bound peer blocked"
+
+echo "== 8. expiry: --ttl 1s, sleep, redeem → deny expired =="
+TE=$(issue --caps consult --ttl 1s --name exp); TIDE=$(tid_of "$TE"); SECE=$(secret_of "$TE")
+sleep 2
+read -r XN XH < <(new_peer xp)
+OUT=$(redeem_msg "$XH" "$TIDE" "$SECE" "$XN" | bash "$TICKET" ingest-redeem - 2>&1)
+echo "$OUT" | grep -q "expired" && ok "expired ticket denied" || bad "expiry not enforced"
+[ "$(authst "$XH")" = "absent" ] && ok "expired sender not authorized" || bad "authorized on expired!"
+
+echo "== 9. wire cap-widening ignored: grant finalization uses LOCAL grantBack, not payload =="
+# Redeemer side: record a redemption with grantBack=[consult], then feed a ticket.grant whose
+# payload claims caps=[review-merge-pr] — the issuer must be authorized with LOCAL [consult].
+read -r IN IH < <(new_peer iss9)
+_rc_seed() { COORD_ROOT="$SBX/coord" bash -c '. '"$HOOKS"'/remote-coord.sh 2>/dev/null; _rc_write "'"$SBX"'/coord/redemptions.json" "$1" "${@:2}"'; }
+jq -nc --arg iss "$IN" --arg hex "$IH" '{redemptions:[{tid:"tgrant9",issuerNpub:$iss,issuerHex:$hex,issuerName:"i9",grantBack:["consult"],exp:"2999-01-01T00:00:00Z",status:"sent",sentAt:"now",grantedAt:""}]}' > "$SBX/coord/redemptions.json"
+GMSG=$(jq -nc --arg from "$IH" '{from:$from,id:"g9",body:({a2a:"1",kind:"ticket.grant",payload:{tid:"tgrant9",status:"granted",caps:["review-merge-pr","consult"],grantBack:["review-merge-pr"],issuerName:"i9"}}|tojson)}')
+echo "$GMSG" | bash "$TICKET" ingest-grant - >/dev/null 2>&1
+[ "$(authst "$IH")" = "authorized" ] && ok "issuer authorized via grant" || bad "grant not applied"
+[ "$(jq -rc --arg h "$IH" '.agents[$h].capabilities' "$SBX/registry.json")" = '["consult"]' ] && ok "wire cap-widening IGNORED (local caps only)" || bad "wire caps leaked in!"
+
+echo "== 10. grant from WRONG hex → ignored (no matching sent redemption) =="
+read -r WN WH < <(new_peer wrong)
+GMSG2=$(jq -nc --arg from "$WH" '{from:$from,id:"gw",body:({a2a:"1",kind:"ticket.grant",payload:{tid:"tgrant9",status:"granted",caps:["consult"],grantBack:["consult"]}}|tojson)}')
+echo "$GMSG2" | bash "$TICKET" ingest-grant - >/dev/null 2>&1
+[ "$(authst "$WH")" = "absent" ] && ok "grant from wrong hex ignored" || bad "wrong-hex grant applied!"
+
+echo "== 11. concurrent double-redeem race: exactly one wins =="
+TR=$(issue --caps consult --name race); TIDR=$(tid_of "$TR"); SECR=$(secret_of "$TR")
+read -r R1N R1H < <(new_peer r1); read -r R2N R2H < <(new_peer r2)
+redeem_msg "$R1H" "$TIDR" "$SECR" "$R1N" | bash "$TICKET" ingest-redeem - >/dev/null 2>&1 &
+redeem_msg "$R2H" "$TIDR" "$SECR" "$R2N" | bash "$TICKET" ingest-redeem - >/dev/null 2>&1 &
+wait
+WINNERS=0
+[ "$(authst "$R1H")" = "authorized" ] && WINNERS=$((WINNERS+1))
+[ "$(authst "$R2H")" = "authorized" ] && WINNERS=$((WINNERS+1))
+[ "$WINNERS" = "1" ] && ok "exactly one redeemer wins the race" || bad "race produced $WINNERS winners"
+
+echo "== 12. revoke + reap =="
+TV=$(issue --caps consult --name rev); TIDV=$(tid_of "$TV")
+bash "$TICKET" revoke "$TIDV" >/dev/null 2>&1
+[ "$(tkst "$TIDV")" = "revoked" ] && ok "revoke works" || bad "revoke failed"
+read -r VN VH < <(new_peer rv)
+OUT=$(redeem_msg "$VH" "$TIDV" "$(secret_of "$TV")" "$VN" | bash "$TICKET" ingest-redeem - 2>&1)
+echo "$OUT" | grep -qiE "already-redeemed|invalid|deny" && ok "revoked ticket not redeemable" || bad "revoked still redeemable"
+
+echo ""
+echo "════════════════════════════════════════"
+echo "  onboarding-ticket: $PASS passed, $FAIL failed"
+echo "════════════════════════════════════════"
+[ "$FAIL" -eq 0 ]
