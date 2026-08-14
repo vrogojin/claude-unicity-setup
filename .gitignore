@@ -7,3 +7,5 @@ node_modules/
 # The *.example.json template is tracked; any real registry is not.
 **/agent-registry.json
 .claude/agent/
+
+/node_modules

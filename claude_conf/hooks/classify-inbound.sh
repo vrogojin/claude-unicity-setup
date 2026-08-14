@@ -240,6 +240,26 @@ while [ "$i" -lt "$TOTAL" ]; do
      || { [ -n "$OWNER_NPUB" ] && [ "$FROM" = "$OWNER_NPUB" ]; } \
      || { [ -n "$OWNER_NAMETAG" ] && [ "$FROMNAME" = "$OWNER_NAMETAG" ]; }; then
     AUTHZJSON='{"role":"owner","status":"authorized","classified":true}'
+  elif [ "$ENV_KIND" = "ticket.redeem" ] || [ "$ENV_KIND" = "ticket.grant" ] || [ "$ENV_KIND" = "ticket.deny" ]; then
+    # --- One-time invite-ticket verbs — status-INDEPENDENT --------------------------------
+    # A redeemer is by definition NOT yet authorized, so this must run before the
+    # registry-status switch. The gate is the ticket secret / pending-redemption record,
+    # NOT a registry capability (these verbs are deliberately absent from rc_verb_cap). SIF
+    # is checked FIRST (fail-closed); the ticket engine then does ALL validation, atomic
+    # consume, rate-limiting, and any authorize / grant / deny sends itself, reading the
+    # transport .from hex from the message wrapper (never a payload identity claim).
+    SIF_Q=0
+    if [ -f "$SIF_GUARD" ]; then
+      SIF_OUT="$(printf '%s' "$BODY" | bash "$SIF_GUARD" check --direction inbound --principal "$FROM" --source agent-comms 2>/dev/null)"
+      [ -n "$SIF_OUT" ] || SIF_OUT='{}'
+      [ "$(echo "$SIF_OUT" | jq -r '.decision // "pass"' 2>/dev/null)" = "quarantine" ] && SIF_Q=1
+    fi
+    if [ "$SIF_Q" = "1" ]; then
+      quarantine_message "$FROM" "$TS" "$BODY" "$TYPE" "$GROUP" "$CLAIMED_NAME" "$ENV_NPUB" "${SIF_OUT:-{}}"
+    else
+      bash "$HOOK_DIR/ticket.sh" "ingest-${ENV_KIND#ticket.}" "$MSG" >/dev/null 2>&1 || true
+    fi
+    AUTHZJSON="$(jq -nc --arg kind "$ENV_KIND" --argjson q "$SIF_Q" '{role:"agent", ticketVerb:$kind, sifQuarantined:($q==1), classified:true}')"
   else
     [ -n "$FROM" ] || FROM="unknown"
     ST="$(bash "$REGISTRY" status "$FROM" 2>/dev/null || echo unknown)"
