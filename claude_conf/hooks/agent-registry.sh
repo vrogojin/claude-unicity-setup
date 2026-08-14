@@ -258,7 +258,7 @@ _ar_cli() {
         [ .agents | to_entries[]
           | select($s == "" or .value.status == $s)
           | { name: (if (.value.unicityName // "") != "" then .value.unicityName
-                     else ((.value.note // "") | if startswith("teammate: ") then ltrimstr("teammate: ") else "" end) end),
+                     else ((.value.note // "") | if startswith("teammate: ") then (ltrimstr("teammate: ") | split(" — ")[0]) else "" end) end),
               status: .value.status,
               capabilities: (.value.capabilities // []),
               npub: (.value.npub // ""), pubkey: .key,

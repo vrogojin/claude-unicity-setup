@@ -94,13 +94,23 @@ if [ -f "$LAST_OK_FILE" ]; then
 fi
 
 # --- Poll for messages ---
+# Capture the helper's REAL exit code (no inline `|| echo` fallback, which would mask a
+# transport failure as exit 0 and let the fallback JSON below advance the last-OK floor).
 POLL_RESULT=$(NODE_PATH="$HELPER_NODE_PATH" node "$HELPER" check-messages \
   --identity "$IDENTITY_FILE" \
   --config "$CONFIG_FILE" \
-  --since "$SINCE" 2>/dev/null || echo '{"messages":[]}')
+  --since "$SINCE" 2>/dev/null)
+POLL_RC=$?
 
-# Record this successful poll as the next lookback floor (the helper returned parseable JSON).
-if echo "$POLL_RESULT" | jq -e '.messages' >/dev/null 2>&1; then
+if [ "$POLL_RC" -ne 0 ]; then
+  # Helper failed (crash / relay unreachable / network down) — do NOT advance the last-OK
+  # floor. Advancing it on an outage would silently shrink the next lookback window and drop
+  # messages the relay retained during the gap. Leaving the floor intact lets the next
+  # successful poll recover them. Fall through with an empty set (async hook stays exit 0).
+  POLL_RESULT='{"messages":[]}'
+elif echo "$POLL_RESULT" | jq -e 'has("messages")' >/dev/null 2>&1; then
+  # Genuine success (helper exited 0 AND returned parseable JSON with a messages array):
+  # record NOW as the next lookback floor.
   echo "$NOW" > "$LAST_OK_FILE" 2>/dev/null || true
 fi
 
