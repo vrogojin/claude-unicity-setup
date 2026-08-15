@@ -88,7 +88,7 @@ redeem message). Same trust model, moved one step earlier and made replay/race-s
 | `secret` | 32 random bytes (`/dev/urandom` via `openssl rand` fallback `head -c32 /dev/urandom`), base64url — the one-time bearer secret. **The issuer never stores this**; only its sha256 |
 | `caps` | capabilities the issuer will grant the redeemer (validated against `AGENT_CAPABILITIES` at issue time) |
 | `grantBack` | capabilities the redeemer is asked to grant the issuer (defaults to `caps`); the redeemer displays them at redeem time and uses **its locally-stored copy** when granting — never the wire payload |
-| `exp` | unix expiry; default now + 24h (`--ttl 24h`, accepts `30m`/`24h`/`7d`) |
+| `exp` | unix expiry; default now + 15m (`--ttl 15m`, accepts `30s`/`30m`/`24h`/`7d`) |
 | `bind` | optional: npub that alone may redeem (`--bind <npub>`); checked against the **transport-authenticated sender hex**, not any claimed field |
 | `label` | free-text label for the issuer's ledger |
 
@@ -362,7 +362,7 @@ Dual-use module in the house style (guarded CLI; sourcing only defines functions
 `rc_emit`, `rc_self_npub`, `_ar_npub_to_hex`, `_ar_validate_caps`, `registry` calls.
 
 ```
-ticket.sh issue   [--caps csv] [--grant-back csv] [--ttl 24h] [--bind npub]
+ticket.sh issue   [--caps csv] [--grant-back csv] [--ttl 15m] [--bind npub]
                   [--name|--label L] [--relay url]        → prints the ticket string
 ticket.sh list    [status]                                → issuer ledger (tickets.json)
 ticket.sh revoke  <tid>                                   → pending → revoked (fail-closed on absent)
@@ -374,9 +374,9 @@ ticket.sh reap                                            → expire/prune (call
 ticket.sh self-test                                       → local sign→verify round-trip
 ```
 
-Defaults: `--caps` = the `onboard-teammate.sh` non-destructive set
-(`team-coordinate,task-bid,knowledge-share,self-directed,consult,claim-area`);
-`--grant-back` defaults to `--caps`. Caps are validated via `_ar_validate_caps`; including
+Defaults: `--caps` = the minimal coordination set (`consult,claim-area`) — least privilege;
+widen explicitly (e.g. add `task-bid`) when a ticket needs more. `--grant-back` defaults to
+`--caps`. Caps are validated via `_ar_validate_caps`; including
 a cap from `AGENT_CAPS_DESTRUCTIVE` prints a red warning at issue time (grant still only
 *permits asking* — destructive execution keeps its owner-confirmation, unchanged).
 

@@ -184,6 +184,18 @@ else
   bad "secret leaked onto child node argv"
 fi
 
+echo "== 16. least-privilege + short-lived defaults (#25 a/e) =="
+TDEF=$(issue --name defaults)                 # NO --caps / --ttl → defaults apply
+DEV=$(bash "$TICKET" decode "$TDEF" 2>/dev/null); DPL=$(hverify "$DEV" 2>/dev/null | jq -c '.payload')
+DCAPS=$(printf '%s' "$DPL" | jq -r '.caps | join(",")')
+DEXP=$(printf '%s' "$DPL" | jq -r '.exp'); NOWS=$(date -u +%s); DELTA=$(( DEXP - NOWS ))
+[ "$DCAPS" = "consult,claim-area" ] && ok "default caps are minimal (consult,claim-area)" || bad "default caps = '$DCAPS' (want consult,claim-area)"
+{ [ "$DELTA" -gt 0 ] && [ "$DELTA" -le 1800 ]; } && ok "default ttl is minutes-scale (exp in ${DELTA}s ≤ 30m)" || bad "default ttl not minutes-scale (exp in ${DELTA}s)"
+# still overridable
+TOVR=$(issue --caps consult,claim-area,task-bid --ttl 2h --name ovr)
+OCAPS=$(hverify "$(bash "$TICKET" decode "$TOVR" 2>/dev/null)" 2>/dev/null | jq -r '.payload.caps | join(",")')
+[ "$OCAPS" = "consult,claim-area,task-bid" ] && ok "explicit --caps still honored" || bad "override --caps = '$OCAPS'"
+
 echo ""
 echo "════════════════════════════════════════"
 echo "  onboarding-ticket: $PASS passed, $FAIL failed"

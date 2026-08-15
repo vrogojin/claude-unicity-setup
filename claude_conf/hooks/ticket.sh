@@ -67,7 +67,7 @@ _tk_run_helper_stdin() {  # <stdin-data> <helper-args...>
 
 # Convert a duration like 30m / 24h / 7d (or bare seconds) to epoch-seconds-from-now.
 _tk_ttl_to_exp() {
-  local ttl="${1:-24h}" now n u; now="$(_tk_now_epoch)"
+  local ttl="${1:-15m}" now n u; now="$(_tk_now_epoch)"
   case "$ttl" in
     *s) n="${ttl%s}"; u=1;; *m) n="${ttl%m}"; u=60;; *h) n="${ttl%h}"; u=3600;; *d) n="${ttl%d}"; u=86400;;
     *[!0-9]*) _tk_err "bad --ttl '$ttl' (use 30s/30m/24h/7d)"; return 1;; *) n="$ttl"; u=1;;
@@ -116,8 +116,11 @@ _tk_deny() {  # <hex> <tid> <reason>
 # ISSUE
 # ════════════════════════════════════════════════════════════════════════════════════
 tk_issue() {
-  local caps="team-coordinate,task-bid,knowledge-share,self-directed,consult,claim-area"
-  local grantBack="" ttl="24h" bind="" label="" relay=""
+  # Least-privilege + short-lived defaults (dmytro #25 a/e): a bare `issue` grants only the
+  # two non-destructive coordination caps and expires in minutes, not a full-capability
+  # day-long ticket. Both stay overridable via --caps / --ttl.
+  local caps="consult,claim-area"
+  local grantBack="" ttl="15m" bind="" label="" relay=""
   while [ $# -gt 0 ]; do case "$1" in
     --caps) caps="$2"; shift 2;; --grant-back) grantBack="$2"; shift 2;;
     --ttl) ttl="$2"; shift 2;; --bind) bind="$2"; shift 2;;

@@ -13,15 +13,15 @@ or `/redeem-ticket`) ends up **mutually authorized** with you — no npub-copyin
 
 ```bash
 bash .claude/hooks/ticket.sh issue \
-  --caps team-coordinate,task-bid,knowledge-share,self-directed,consult,claim-area \
-  --grant-back consult,claim-area \
-  --ttl 24h \
   --name "dev-2 peer"        # [--bind <npub>] to lock it to one known npub
+# Defaults: --caps consult,claim-area (least privilege) · --ttl 15m (minutes, not a day).
+# Widen deliberately, e.g. --caps consult,claim-area,task-bid --ttl 2h, when you mean to.
 ```
 
 It prints a single line `unicity-ticket:v1.…`. That string **is a bearer credential**:
 - Send it over a **private** channel (DM/email), not a public one.
-- Default TTL is 24h; use a short one for high-value caps and add `--bind <npub>` when you
+- Default TTL is 15m and default caps are the two non-destructive coordination caps
+  (`consult,claim-area`); widen only when you mean to, and add `--bind <npub>` when you
   already know the peer's npub (closes the bearer window entirely).
 - Leaked? `bash .claude/hooks/ticket.sh revoke <tid>` (the tid prints in the issue log).
 - `bash .claude/hooks/ticket.sh list [pending|redeemed]` shows your ledger.
