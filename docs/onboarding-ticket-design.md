@@ -32,7 +32,7 @@ redeems it with a single command; both end up **mutually authorized** with the a
 capabilities — zero further manual steps on either side.
 
 ```
-issuer:   ticket.sh issue --caps consult,claim-area --ttl 24h --name dev-2
+issuer:   ticket.sh issue --caps consult,claim-area --ttl 15m --name dev-2
           → prints  unicity-ticket:v1.eyJra…   (one line, copy-pasteable)
 
 redeemer: ./setup.sh <project> --ticket 'unicity-ticket:v1.eyJra…'
@@ -466,7 +466,7 @@ Everything below either narrows that window or bounds the damage.
 - Single-use with **atomic flock-serialized consumption** (§4.1): a thief and the intended
   peer cannot both win; the loser's deny (`already-redeemed`, naming no one) plus the
   issuer's ledger (`redeemedBy` hex) make a hijack immediately visible.
-- Short default TTL (24h) and `ticket.sh revoke <tid>` for known leaks.
+- Short default TTL (15m) and `ticket.sh revoke <tid>` for known leaks.
 - `--bind <npub>` closes the bearer window entirely when the peer's npub is already known
   (checked against the transport-authenticated sender hex — unspoofable) — at the cost of
   one extra out-of-band datum; recommend it for high-value caps.
