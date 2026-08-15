@@ -239,17 +239,22 @@ PYSEED
 # --- Parse arguments ---
 
 TARGET_DIR=""
-for arg in "$@"; do
-  case "$arg" in
-    --dry-run) DRY_RUN=true ;;
-    --serena-only) SERENA_ONLY=true ;;
+TICKET_STR=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=true; shift ;;
+    --serena-only) SERENA_ONLY=true; shift ;;
+    --ticket) TICKET_STR="${2:-}"; shift 2 ;;
+    --ticket=*) TICKET_STR="${1#--ticket=}"; shift ;;
     --help|-h)
-      echo "Usage: $0 <target-project-dir> [--dry-run] [--serena-only]"
+      echo "Usage: $0 <target-project-dir> [--dry-run] [--serena-only] [--ticket '<t>']"
       echo ""
       echo "Deploys Unicity Claude Code configuration to a target project."
       echo ""
       echo "Options:"
       echo "  --dry-run      Print actions without executing"
+      echo "  --ticket '<t>' Redeem a one-time invite ticket after install → single-command"
+      echo "                 mutual onboarding (you and the issuer end up mutually authorized)."
       echo "  --serena-only  Re-apply ONLY the Serena MCP config (.mcp.json +"
       echo "                 substitution + gitignore + image/volume setup) and"
       echo "                 exit; skips identity/owner/network/notify/deps/config."
@@ -258,7 +263,7 @@ for arg in "$@"; do
       echo "  --help         Show this help"
       exit 0
       ;;
-    *) TARGET_DIR="$arg" ;;
+    *) TARGET_DIR="$1"; shift ;;
   esac
 done
 
@@ -905,3 +910,28 @@ info "  # --live = sub-second push; polls every 5s as fallback (default)."
 info "  # The daemon runs in the FOREGROUND; a bare '… &' dies with your shell. Use nohup"
 info "  #   (above) or a systemd --user unit for durability across logout/session-end."
 echo ""
+
+# ============================================================
+# Phase 9.7: One-command mutual onboarding — redeem an invite ticket
+# The redeem does its own check-messages polling, so it works BEFORE the daemon is started.
+# ============================================================
+if [ -n "$TICKET_STR" ] && [ "$DRY_RUN" != "true" ]; then
+  echo ""
+  info "Redeeming invite ticket (single-command mutual onboarding)…"
+  # The ticket embeds a bearer SECRET — hand it to ticket.sh via a 0600 file (auto-removed),
+  # NOT on argv, so no child process re-exposes it on `ps` / /proc/<pid>/cmdline.
+  TICKET_TMP="$(umask 077; mktemp "${TMPDIR:-/tmp}/onboard-ticket.XXXXXX")"
+  trap 'rm -f "$TICKET_TMP"' EXIT
+  printf '%s' "$TICKET_STR" > "$TICKET_TMP"
+  if CLAUDE_PROJECT_DIR="$TARGET_DIR" bash "$CLAUDE_DIR/hooks/ticket.sh" redeem --ticket-file "$TICKET_TMP" --yes; then
+    echo ""
+    echo "  ✅ MUTUAL AUTH complete — you and the issuer now recognize each other."
+    echo "     Start the daemon (above), then:  /consult-coordinator <issuer-name> \"…\""
+  else
+    echo ""
+    warn "Ticket redemption did NOT complete (reason above). The framework IS installed;"
+    warn "once the issuer is reachable (their daemon up, same relay), re-run:"
+    warn "  CLAUDE_PROJECT_DIR=$TARGET_DIR bash $CLAUDE_DIR/hooks/ticket.sh redeem '<ticket>'"
+    exit 1
+  fi
+fi

@@ -279,4 +279,22 @@ if [ "$((CE_QUEUED + RC_OPEN + RC_INT + RC_SPL + RC_CONF + RC_PEND))" -gt 0 ] 2>
   exit 0
 fi
 
+# --- One-time invite tickets: grants that failed to send + redemptions still awaiting a grant ---
+TK_STUCK=0; TK_REDEEM_STUCK=0
+if [ -f "$RC_LIB" ]; then
+  TK_ROOT="$(bash "$RC_LIB" root 2>/dev/null)"
+  if [ -n "$TK_ROOT" ]; then
+    TK_STUCK="$(jq '[.tickets[]? | select(.status=="redeemed" and (.grantSentAt // "")=="")] | length' "$TK_ROOT/tickets.json" 2>/dev/null || echo 0)"
+    TK_REDEEM_STUCK="$(jq --arg c "$COORD_CUTOFF" '[.redemptions[]? | select(.status=="sent" and ($c=="" or (.sentAt // "9999") < $c))] | length' "$TK_ROOT/redemptions.json" 2>/dev/null || echo 0)"
+    [ -n "$TK_STUCK" ] || TK_STUCK=0; [ -n "$TK_REDEEM_STUCK" ] || TK_REDEEM_STUCK=0
+  fi
+fi
+if [ "$((TK_STUCK + TK_REDEEM_STUCK))" -gt 0 ] 2>/dev/null; then
+  TK_MSG="Invite-ticket follow-ups:"
+  [ "$TK_STUCK" -gt 0 ] 2>/dev/null && TK_MSG="$TK_MSG ${TK_STUCK} redeemed ticket(s) whose grant-back never sent (you authorized the peer, but they may not have authorized you — their re-redeem re-sends it, or check the relay);"
+  [ "$TK_REDEEM_STUCK" -gt 0 ] 2>/dev/null && TK_MSG="$TK_MSG ${TK_REDEEM_STUCK} redemption(s) you sent with no grant back (issuer offline / relay drop — re-run 'ticket.sh redeem' or wait for the daemon to finalize);"
+  jq -n --arg reason "$TK_MSG" '{"decision":"block","reason":$reason}'
+  exit 0
+fi
+
 exit 0

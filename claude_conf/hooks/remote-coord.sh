@@ -829,7 +829,9 @@ rc_emit() {
     fi
     if [ "${TEAM_DRY_RUN:-0}" = "1" ]; then
       printf 'DRY-RUN send → %s : %s\n' "$n" "$kind"
-    elif NODE_PATH="$nodepath" node "$helper" send-dm "$n" "$env" --identity "$ident" >/dev/null 2>&1; then
+    # SECURITY: the envelope may carry a ticket SECRET (ticket.redeem) — pipe it via STDIN,
+    # never argv, so it can't be read from `ps` / /proc/<pid>/cmdline during the send window.
+    elif printf '%s' "$env" | NODE_PATH="$nodepath" node "$helper" send-dm "$n" --identity "$ident" >/dev/null 2>&1; then
       printf 'sent → %s : %s\n' "$n" "$kind"
     else
       printf 'FAILED send → %s : %s\n' "$n" "$kind" >&2; rc=1
