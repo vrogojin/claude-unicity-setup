@@ -904,12 +904,32 @@ echo "  Config dir:      $CLAUDE_DIR/"
 echo "  Identity:        $CLAUDE_DIR/agent/identity.json"
 echo "  Roadmap:         $TARGET_DIR/docs/ROADMAP.md (⇄ Project board — run /roadmap-sync)"
 echo ""
-info "To start the message daemon (run from the clone so the transport helper resolves):"
-info "  nohup node $SCRIPT_DIR/lib/sphere-daemon.mjs start --project $TARGET_DIR --live >/tmp/sphere-daemon.log 2>&1 &"
-info "  # --live = sub-second push; polls every 5s as fallback (default)."
-info "  # The daemon runs in the FOREGROUND; a bare '… &' dies with your shell. Use nohup"
-info "  #   (above) or a systemd --user unit for durability across logout/session-end."
+info "Message daemon: starts AUTOMATICALLY on each Claude session (SessionStart hook →"
+info "  .claude/hooks/daemon-session.sh) and stops when the last session ends. It runs"
+info "  self-detached (survives the launching shell); concurrent sessions share one daemon."
+info "  Manual control if you need it:"
+info "    bash $CLAUDE_DIR/hooks/a2a.sh daemon status|start|stop|restart"
 echo ""
+
+# ============================================================
+# Phase 9.6: End-to-end round-trip self-test (the missing check dmytro + claude-test1 flagged)
+# The config-level preflight above proves resolution; this proves the transport actually MOVES
+# a message both ways (identity → helper → relay → gift-wrap → back). LOUD PASS/FAIL with a
+# diagnosis. Non-fatal: a transient relay outage must not block a completed local install
+# (the fatal config checks already ran), but the result is printed unmissably.
+# ============================================================
+if [ "$DRY_RUN" != "true" ] && [ -x "$CLAUDE_DIR/hooks/a2a.sh" ]; then
+  info "Round-trip self-test (live relay — send+receive to self)…"
+  if CLAUDE_PROJECT_DIR="$TARGET_DIR" TEAM_SPHERE_HELPER="$SCRIPT_DIR/lib/sphere-helper.mjs" \
+       bash "$CLAUDE_DIR/hooks/a2a.sh" verify --timeout 40; then
+    ok "A2A transport round-trip verified"
+  else
+    warn "A2A round-trip self-test did NOT pass (diagnosis above). The framework IS installed;"
+    warn "re-check with:  bash $CLAUDE_DIR/hooks/a2a.sh verify"
+    warn "Most common causes: relay unreachable/flaky, or (cd \"$SCRIPT_DIR\" && npm install) not run."
+  fi
+  echo ""
+fi
 
 # ============================================================
 # Phase 9.7: One-command mutual onboarding — redeem an invite ticket
