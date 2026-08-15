@@ -67,22 +67,25 @@ Concierge side, a build, or a redeploy, you **consult the coordinator** and it d
 
 ### Path 0 — One command with an invite ticket (fastest; skips §3 entirely)
 
-If the coordinator (or any authorized peer) handed you a **one-time invite ticket**
-(`unicity-ticket:v1.…`), you do the whole thing — install, identity, *and* the mutual
-authorization handshake — in a **single command**:
+If the coordinator (or any authorized peer) handed you a **one-time invite ticket** — a
+short `ut2_…` string (47 chars; older invites may still be the long self-contained
+`unicity-ticket:v1.…` form, which works the same way) — you do the whole thing — install,
+identity, *and* the mutual authorization handshake — in a **single command**:
 
 ```bash
 git clone git@github.com:vrogojin/claude-unicity-setup.git && cd claude-unicity-setup
-./setup.sh /absolute/path/to/your-project --ticket 'unicity-ticket:v1.…'
+./setup.sh /absolute/path/to/your-project --ticket 'ut2_…'
 ```
 
 `setup.sh` installs the framework and mints your identity as usual, then **redeems the
-ticket**: it verifies the ticket's signature and issuer, sends a signed redeem, and waits
-for the issuer's grant. On success it prints `MUTUAL AUTH complete` — you and the issuer now
-recognize each other, with **no npub copy-paste and no manual `authorize` on either side**.
-Then just start the daemon (2A.3) and go to §4. If you don't have a ticket, use Path A +
-the manual handshake in §3. (A ticket is a **bearer credential** — treat the string as a
-secret and confirm the issuer name it shows is who you expect.)
+ticket**: for a `ut2_` ticket it fetches the issuer-signed authorization event from the
+relay (addressed by the ticket's hash), verifies the signature, issuer, and expiry, then
+sends a signed redeem and waits for the issuer's grant. On success it prints `MUTUAL AUTH
+complete` — you and the issuer now recognize each other, with **no npub copy-paste and no
+manual `authorize` on either side**. Then just start the daemon (2A.3) and go to §4. If you
+don't have a ticket, use Path A + the manual handshake in §3. (A ticket is a **bearer
+credential** — treat the string as a secret and confirm the issuer name it shows is who you
+expect.)
 
 ### Path A — Full framework (recommended)
 

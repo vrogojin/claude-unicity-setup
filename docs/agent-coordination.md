@@ -116,15 +116,19 @@ The manual §3 handshake (exchange npubs → each side authorizes the other) col
 **single command** when one party issues a **one-time invite ticket**. Symmetric: either the
 coordinator or any authorized peer can issue; whoever redeems ends up **mutually authorized**.
 
-- **Format:** `unicity-ticket:v1.<base64url(signed-event-json)>`. The event is a Nostr
-  **kind 30777** signed by the issuer's identity key; its content is a canonical payload
-  `{v,tid,iss,issName,relays,secret,caps,grantBack,exp,bind,label}`. `tid = "t"+sha256(secret)[0:12]`.
-  A ticket is a **bearer credential** — the `secret` is the single-use bearer token; send it
-  over a private channel.
+- **Format (v2, default):** `ut2_<43 alnum chars>` — 47 chars, ≤64, paste-proof. The string
+  is ONLY a ~256-bit bearer secret; the issuer-signed Nostr **kind 30777** authorization
+  event (caps/grantBack/exp/bind, content AES-GCM-encrypted under a secret-derived key) is
+  **published to the relay** at issue, addressed by `d = sha256(secret)`; redeem fetches it
+  by `#d` and verifies sig + hash commitment + `iss == event.pubkey` before anything is
+  sent. `tid = "t"+sha256(secret)[0:12]`. A ticket is a **bearer credential** — send it over
+  a private channel. Legacy **v1** (`unicity-ticket:v1.<base64url(signed-event-json)>`,
+  self-contained, `issue --v1`) still redeems.
 - **Engine:** `.claude/hooks/ticket.sh` (`issue|list|revoke|redeem|ingest-redeem|ingest-grant|ingest-deny|reap`).
-  Crypto (sign/verify) is in `lib/sphere-helper.mjs` (`ticket-sign` / `ticket-verify`);
-  verify **requires the event pubkey to equal the payload's `iss`**, so a ticket cannot claim
-  a different issuer than the key that signed it.
+  Crypto is in `lib/sphere-helper.mjs` (`ticket2-sign`/`ticket2-verify`/`relay-publish`/
+  `relay-fetch`; legacy `ticket-sign`/`ticket-verify`); verify **requires the event pubkey
+  to equal the payload's `iss`**, so a ticket cannot claim a different issuer than the key
+  that signed it.
 - **State stores** (under the coord root, out of git): `tickets.json` (issuer side — the
   ledger, storing only `sha256(secret)`, **never the secret**), `redemptions.json` (redeemer
   side — pending/sent/complete), `ticket-attempts.log` (rate-limit ledger, 5/peer/hr + 50/day).

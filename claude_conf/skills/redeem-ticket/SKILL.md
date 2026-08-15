@@ -13,20 +13,23 @@ authorized**; nothing to copy back to them.
 Fold it into install — a single command past `git clone`:
 
 ```bash
-./setup.sh <your-project-dir> --ticket 'unicity-ticket:v1.…'
+./setup.sh <your-project-dir> --ticket 'ut2_…'
 ```
 
 ## After an existing setup
 
 ```bash
-bash .claude/hooks/ticket.sh redeem 'unicity-ticket:v1.…'
+bash .claude/hooks/ticket.sh redeem 'ut2_…'    # [--relay <url>] if issued on a non-default relay
 ```
 
-The redeem **verifies the ticket signature and that it was signed by the issuer it names
-BEFORE sending anything**, prints who you're about to mutually authorize (issuer, the caps
-each side grants, expiry), sends a signed redeem, and waits (~120s) for the issuer's grant —
-it polls on its own, so it works **before** the daemon is running. On success it prints
-`MUTUAL AUTH OK`.
+(Long `unicity-ticket:v1.…` strings from older issuers redeem with the same commands.)
+
+For a short `ut2_` ticket the redeem **fetches the issuer-signed authorization event from
+the relay** (addressed by the ticket's hash) and **verifies its signature, hash commitment,
+issuer, and expiry BEFORE sending anything**, prints who you're about to mutually authorize
+(issuer, the caps each side grants, expiry), sends a signed redeem, and waits (~120s) for
+the issuer's grant — it polls on its own, so it works **before** the daemon is running. On
+success it prints `MUTUAL AUTH OK`.
 
 - The issuer must be reachable on the ticket's relay while you redeem (their daemon up). If
   it times out, the redemption is recorded and finalizes automatically when the grant

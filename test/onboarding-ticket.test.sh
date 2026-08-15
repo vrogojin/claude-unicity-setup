@@ -1,8 +1,10 @@
 #!/bin/bash
 # Hermetic test suite for one-time invite tickets (ticket.sh + sphere-helper ticket-sign/verify
-# + classify-inbound routing). No live relay: emits are TEAM_DRY_RUN=1; inbound is crafted
-# exactly as the daemon delivers it ({from:<hex>, body:<envelope-json>}) and fed to ingest-*.
-# Real schnorr crypto IS exercised (ticket-sign/verify), so a resolvable node_modules is required.
+# + v2 short tickets + classify-inbound routing). No live relay: emits are TEAM_DRY_RUN=1;
+# the v2 relay publish/fetch goes through TICKET_RELAY_STUB (file-drop with the same JSON
+# contract as the raw-ws path); inbound is crafted exactly as the daemon delivers it
+# ({from:<hex>, body:<envelope-json>}) and fed to ingest-*.
+# Real schnorr + AES-GCM crypto IS exercised, so a resolvable node_modules is required.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
@@ -18,7 +20,8 @@ SBX="$(mktemp -d)"; trap 'rm -rf "$SBX"' EXIT
 mkdir -p "$SBX/proj/.claude/agent" "$SBX/coord"
 export CLAUDE_PROJECT_DIR="$SBX/proj" COORD_ROOT="$SBX/coord" \
   TEAM_SPHERE_HELPER="$HELPER" TEAM_IDENTITY_FILE="$SBX/proj/.claude/agent/identity.json" \
-  AGENT_REGISTRY_FILE="$SBX/registry.json" TEAM_SELF_NAME="test-coord" TEAM_DRY_RUN=1
+  AGENT_REGISTRY_FILE="$SBX/registry.json" TEAM_SELF_NAME="test-coord" TEAM_DRY_RUN=1 \
+  TICKET_RELAY_STUB="$SBX/relay"
 NP="$(cd "$(dirname "$HELPER")/.." && pwd)/node_modules"
 helper() { NODE_PATH="$NP:${NODE_PATH:-}" node "$HELPER" "$@"; }
 # ticket-sign/ticket-verify take their secret-bearing input on STDIN (never argv) — mirror
@@ -35,8 +38,19 @@ fi
 # helpers
 new_peer() { helper create-identity > "$SBX/$1.json" 2>/dev/null; local n; n="$(jq -r .npub "$SBX/$1.json")"; local h; h="$(helper npub-to-hex "$n" 2>/dev/null | jq -r .hex)"; echo "$n $h"; }
 issue()    { bash "$TICKET" issue "$@" 2>/dev/null; }
-secret_of(){ local ev; ev="$(bash "$TICKET" decode "$1" 2>/dev/null)"; hverify "$ev" 2>/dev/null | jq -r '.payload.secret'; }
-tid_of()   { local ev; ev="$(bash "$TICKET" decode "$1" 2>/dev/null)"; hverify "$ev" 2>/dev/null | jq -r '.payload.tid'; }
+# v2 short tickets: the string IS the secret; tid derives from its hash.
+secret_of(){ printf '%s' "${1#ut2_}"; }
+tid_of()   { printf 't%s' "$(printf '%s' "${1#ut2_}" | sha256sum | cut -c1-12)"; }
+# Resolve a v2 ticket's verified payload via the stub relay (mirrors tk_redeem's fetch+verify).
+v2_payload_of() {
+  local sec; sec="$(secret_of "$1")"
+  local d;   d="$(printf '%s' "$sec" | sha256sum | awk '{print $1}')"
+  local evs; evs="$(helper relay-fetch --dtag "$d" 2>/dev/null)"
+  printf '%s' "$evs" | jq -c --arg s "$sec" '{secret:$s,events:.events}' | helper ticket2-verify 2>/dev/null | jq -c '.payload'
+}
+# v1 legacy extractors (for the --v1 compat tests).
+v1_secret_of(){ local ev; ev="$(bash "$TICKET" decode "$1" 2>/dev/null)"; hverify "$ev" 2>/dev/null | jq -r '.payload.secret'; }
+v1_tid_of()   { local ev; ev="$(bash "$TICKET" decode "$1" 2>/dev/null)"; hverify "$ev" 2>/dev/null | jq -r '.payload.tid'; }
 redeem_msg(){ jq -nc --arg from "$1" --arg tid "$2" --arg secret "$3" --arg npub "$4" \
   '{from:$from,id:("m"+$tid+$from[0:6]),body:({a2a:"1",kind:"ticket.redeem",payload:{tid:$tid,secret:$secret,npub:$npub,name:"peer"}}|tojson)}'; }
 authst(){ jq -r --arg h "$1" '.agents[$h].status // "absent"' "$SBX/registry.json"; }
@@ -55,10 +69,44 @@ EV2=$(hsign "$SBX/bob.json" "$P" 2>/dev/null); [ -z "$EV2" ] && { read -r BN BH 
 WK=$(printf '%s' "$P" | helper ticket-sign --identity "$SBX/alice.json" | jq -c '.kind=1')
 [ "$(hverify "$WK" 2>/dev/null | jq -r '.reason')" = "wrong-kind" ] && ok "non-30777 kind rejected" || bad "wrong-kind not rejected"
 
-echo "== 2. issue stores hash-only, ticket is one line =="
+echo "== 1b. v2 crypto: sign→publish→fetch→verify + commitment/tamper rejections =="
+S2="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 43)"
+D2="$(printf '%s' "$S2" | sha256sum | awk '{print $1}')"
+P2=$(jq -nc --arg iss "$AN" --arg s "$S2" '{secret:$s,payload:{iss:$iss,issName:"a",relays:["wss://x"],caps:["consult"],grantBack:["consult"],exp:9999999999,bind:"",label:"v2c"}}')
+EV2=$(printf '%s' "$P2" | helper ticket2-sign --identity "$SBX/alice.json")
+printf '%s' "$EV2" | helper relay-publish >/dev/null 2>&1
+FE=$(helper relay-fetch --dtag "$D2" 2>/dev/null)
+[ "$(printf '%s' "$FE" | jq '.events|length')" = "1" ] && ok "publish→fetch-by-#d round-trip" || bad "relay round-trip"
+V2OK=$(printf '%s' "$FE" | jq -c --arg s "$S2" '{secret:$s,events:.events}' | helper ticket2-verify 2>/dev/null)
+[ "$(printf '%s' "$V2OK" | jq -r .valid)" = "true" ] && [ "$(printf '%s' "$V2OK" | jq -r .payload.sh)" = "$D2" ] \
+  && ok "v2 verify OK + hash commitment (payload.sh == sha256(secret) == #d)" || bad "v2 verify/commitment"
+# event content is ciphertext: neither the secret nor the caps appear in the stored event
+STORED="$SBX/relay/$(printf '%s' "$EV2" | jq -r .id).json"
+if [ -f "$STORED" ] && ! grep -qF "$S2" "$STORED" && ! grep -qF '"caps"' "$STORED"; then
+  ok "published event leaks neither secret nor plaintext payload"; else bad "relay event leaks payload"; fi
+# wrong secret → no usable event (d-mismatch), fail closed
+SW="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 43)"
+VW=$(printf '%s' "$FE" | jq -c --arg s "$SW" '{secret:$s,events:.events}' | helper ticket2-verify 2>/dev/null; true)
+[ "$(printf '%s' "$VW" | jq -r .valid)" = "false" ] && ok "wrong secret rejected" || bad "wrong secret accepted!"
+# impersonation: a validly-signed event by a NON-iss key whose payload names alice as iss
+# (covers the copied-ciphertext-republished attack — same rejected check, iss-mismatch)
+read -r CN CH < <(new_peer copycat)
+FORGED=$(printf '%s' "$P2" | helper ticket2-sign --identity "$SBX/copycat.json" 2>/dev/null)
+VF2=$(jq -nc --arg s "$S2" --argjson e "[$FORGED]" '{secret:$s,events:$e}' | helper ticket2-verify 2>/dev/null; true)
+[ "$(printf '%s' "$VF2" | jq -r .reason)" = "iss-mismatch" ] && ok "non-iss signer rejected (iss-mismatch)" || bad "copycat event accepted: $VF2"
+# tampered d-tag (repointed at another secret's hash) breaks the signature
+TAMP2=$(printf '%s' "$EV2" | jq -c --arg d "$(printf '%s' "$SW" | sha256sum | awk '{print $1}')" '.tags=[["d",$d],.tags[1]]')
+VT2=$(jq -nc --arg s "$SW" --argjson e "[$TAMP2]" '{secret:$s,events:$e}' | helper ticket2-verify 2>/dev/null; true)
+[ "$(printf '%s' "$VT2" | jq -r .valid)" = "false" ] && ok "tampered d-tag rejected (sig covers the commitment)" || bad "tampered d accepted!"
+
+echo "== 2. issue stores hash-only, ticket is one short line =="
 T=$(issue --caps consult,claim-area --ttl 2h --name dev)
 [ "$(jq -r '.tickets[-1] | has("secret")' "$SBX/coord/tickets.json")" = "false" ] && ok "no raw secret at rest" || bad "secret leak"
 [ "$(printf '%s' "$T" | wc -l)" = "0" ] && [ -n "$T" ] && ok "ticket is one copy-pasteable line" || bad "ticket format"
+[ "${#T}" -le 64 ] && ok "ticket string ≤ 64 chars (${#T})" || bad "ticket too long: ${#T} chars"
+printf '%s' "$T" | grep -Eq '^ut2_[A-Za-z0-9]{43}$' && ok "ut2_ + 43 alnum shape" || bad "unexpected v2 shape: $T"
+EID=$(jq -r '.tickets[-1].eventId' "$SBX/coord/tickets.json")
+[ -n "$EID" ] && [ -f "$SBX/relay/$EID.json" ] && ok "authorization event published at issue" || bad "no published event"
 
 echo "== 3. happy path: redeem → redeemer authorized + grant emitted + ticket consumed =="
 read -r RN RH < <(new_peer red)
@@ -172,29 +220,63 @@ echo "== 15. secret NEVER on child (node) argv — piped via stdin only =="
 BIN="$SBX/bin"; mkdir -p "$BIN"; REALNODE="$(command -v node)"
 { printf '#!/bin/bash\n'; printf 'printf "%%s\\0" "$@" >> "%s"\n' "$SBX/argv.log"; printf 'exec "%s" "$@"\n' "$REALNODE"; } > "$BIN/node"
 chmod +x "$BIN/node"; : > "$SBX/argv.log"
-TS=$(issue --caps consult --name argv); TSEV=$(bash "$TICKET" decode "$TS"); TSCONTENT=$(printf '%s' "$TSEV" | jq -r '.content')
+TS=$(issue --v1 --caps consult --name argv); TSEV=$(bash "$TICKET" decode "$TS"); TSCONTENT=$(printf '%s' "$TSEV" | jq -r '.content')
 printf '%s' "$TSEV" | PATH="$BIN:$PATH" node "$HELPER" ticket-verify >/dev/null 2>&1
 SENT="SENTINELSECRET_DEADBEEF01234567"
 BODY=$(jq -nc --arg s "$SENT" '{a2a:"1",kind:"ticket.redeem",payload:{tid:"tx",secret:$s}}')
 printf '%s' "$BODY" | PATH="$BIN:$PATH" node "$HELPER" send-dm "npub1bogus" --identity "$SBX/proj/.claude/agent/identity.json" >/dev/null 2>&1 || true
-if [ -s "$SBX/argv.log" ] && grep -aqF "ticket-verify" "$SBX/argv.log" \
-   && ! grep -aqF "$TSCONTENT" "$SBX/argv.log" && ! grep -aqF "$SENT" "$SBX/argv.log"; then
-  ok "ticket secret never on child node argv (stdin only)"
+# v2: drive the whole redeem verify path (relay-fetch + ticket2-verify) under the shim —
+# the SECRET must reach the helper on stdin only; the dtag on argv is just its public hash.
+TV2=$(issue --caps consult --name argv2); SV2="$(secret_of "$TV2")"
+DV2="$(printf '%s' "$SV2" | sha256sum | awk '{print $1}')"
+FEV2=$(PATH="$BIN:$PATH" node "$HELPER" relay-fetch --dtag "$DV2" 2>/dev/null)
+printf '%s' "$FEV2" | jq -c --arg s "$SV2" '{secret:$s,events:.events}' | PATH="$BIN:$PATH" node "$HELPER" ticket2-verify >/dev/null 2>&1
+if [ -s "$SBX/argv.log" ] && grep -aqF "ticket-verify" "$SBX/argv.log" && grep -aqF "ticket2-verify" "$SBX/argv.log" \
+   && ! grep -aqF "$TSCONTENT" "$SBX/argv.log" && ! grep -aqF "$SENT" "$SBX/argv.log" && ! grep -aqF "$SV2" "$SBX/argv.log"; then
+  ok "ticket secret (v1 + v2) never on child node argv (stdin only)"
 else
   bad "secret leaked onto child node argv"
 fi
 
 echo "== 16. least-privilege + short-lived defaults (#25 a/e) =="
 TDEF=$(issue --name defaults)                 # NO --caps / --ttl → defaults apply
-DEV=$(bash "$TICKET" decode "$TDEF" 2>/dev/null); DPL=$(hverify "$DEV" 2>/dev/null | jq -c '.payload')
+DPL=$(v2_payload_of "$TDEF")
 DCAPS=$(printf '%s' "$DPL" | jq -r '.caps | join(",")')
 DEXP=$(printf '%s' "$DPL" | jq -r '.exp'); NOWS=$(date -u +%s); DELTA=$(( DEXP - NOWS ))
 [ "$DCAPS" = "consult,claim-area" ] && ok "default caps are minimal (consult,claim-area)" || bad "default caps = '$DCAPS' (want consult,claim-area)"
 { [ "$DELTA" -gt 0 ] && [ "$DELTA" -le 1800 ]; } && ok "default ttl is minutes-scale (exp in ${DELTA}s ≤ 30m)" || bad "default ttl not minutes-scale (exp in ${DELTA}s)"
 # still overridable
 TOVR=$(issue --caps consult,claim-area,task-bid --ttl 2h --name ovr)
-OCAPS=$(hverify "$(bash "$TICKET" decode "$TOVR" 2>/dev/null)" 2>/dev/null | jq -r '.payload.caps | join(",")')
+OCAPS=$(v2_payload_of "$TOVR" | jq -r '.caps | join(",")')
 [ "$OCAPS" = "consult,claim-area,task-bid" ] && ok "explicit --caps still honored" || bad "override --caps = '$OCAPS'"
+
+echo "== 17. v2 redeemer path: hash→fetch→verify→send, fail-closed variants =="
+# happy verify path via the real tk_redeem CLI (stub relay, dry-run send, no grant poll)
+T17=$(issue --caps consult --name r17)
+OUT=$(printf '%s' "$T17" > "$SBX/t17"; bash "$TICKET" redeem --ticket-file "$SBX/t17" --yes --timeout 0 2>&1; true)
+echo "$OUT" | grep -q "DRY-RUN send.*ticket.redeem" && ok "redeem verifies + sends ticket.redeem (dry-run)" || bad "no redeem send: $OUT"
+TID17=$(tid_of "$T17")
+[ "$(jq -r --arg t "$TID17" '.redemptions[]? | select(.tid==$t) | .status' "$SBX/coord/redemptions.json")" = "sent" ] \
+  && ok "redemption recorded (status=sent)" || bad "redemption not recorded"
+# malformed short string → refused before ANY fetch/send
+OUT=$(bash "$TICKET" redeem "ut2_tooshort" --yes 2>&1; true)
+echo "$OUT" | grep -q "malformed v2 ticket" && ok "mangled paste refused loudly" || bad "mangled ticket not refused"
+# unknown/bad secret (well-formed) → no event on the relay → refused before any send
+BADSEC="ut2_$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 43)"
+OUT=$(bash "$TICKET" redeem "$BADSEC" --yes 2>&1; true)
+echo "$OUT" | grep -q "no ticket event" && ok "unknown secret refused (no event)" || bad "bad secret not refused: $OUT"
+# expired ticket → redeemer-side expiry check refuses BEFORE any send
+T17E=$(issue --caps consult --ttl 1s --name r17e); sleep 2
+OUT=$(printf '%s' "$T17E" > "$SBX/t17e"; bash "$TICKET" redeem --ticket-file "$SBX/t17e" --yes 2>&1; true)
+echo "$OUT" | grep -q "EXPIRED" && ok "expired ticket refused at redeemer" || bad "expired not refused: $OUT"
+
+echo "== 18. v1 compat: issue --v1 still redeemable end-to-end =="
+TV1=$(issue --v1 --caps consult --name legacy)
+printf '%s' "$TV1" | grep -q '^unicity-ticket:v1\.' && ok "--v1 emits the legacy self-contained format" || bad "--v1 format wrong"
+TIDV1=$(v1_tid_of "$TV1"); SECV1=$(v1_secret_of "$TV1")
+read -r ZN ZH < <(new_peer legacyp)
+redeem_msg "$ZH" "$TIDV1" "$SECV1" "$ZN" | bash "$TICKET" ingest-redeem - >/dev/null 2>&1
+[ "$(authst "$ZH")" = "authorized" ] && ok "v1 ticket ingest still authorizes" || bad "v1 ingest broken"
 
 echo ""
 echo "════════════════════════════════════════"
