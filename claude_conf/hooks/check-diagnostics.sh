@@ -257,6 +257,14 @@ if [ -d "$CE_DIR" ]; then
   done
 fi
 RC_OPEN=0; RC_INT=0; RC_SPL=0; RC_CONF=0; RC_PEND=0
+# Side-aware skill hint (dmytro #10): the coordinator side runs /coordinator-advise; a
+# remote peer runs /consult-coordinator. Ask the engine for this instance's role; default
+# to the coordinator skill if it can't be determined.
+RC_SKILL="/coordinator-advise"
+if [ -f "$RC_LIB" ]; then
+  RC_SKILL="$(bash "$RC_LIB" advise-skill 2>/dev/null | tr -d ' \t\r\n')"
+  case "$RC_SKILL" in /coordinator-advise|/consult-coordinator) ;; *) RC_SKILL="/coordinator-advise";; esac
+fi
 if [ -f "$RC_LIB" ]; then
   RC_OPEN="$(bash "$RC_LIB" consult-list open 2>/dev/null | jq --arg c "$COORD_CUTOFF" '[.[] | select((.openedAt // .receivedAt // "") == "" or (.openedAt // .receivedAt) > $c)] | length' 2>/dev/null || echo 0)"
   RC_INT="$(bash "$RC_LIB" intents 2>/dev/null | jq --arg c "$COORD_CUTOFF" '[.[] | select(.side=="remote" and .status=="awaiting-reply" and ((.receivedAt // "") == "" or .receivedAt > $c))] | length' 2>/dev/null || echo 0)"
@@ -274,7 +282,7 @@ if [ "$((CE_QUEUED + RC_OPEN + RC_INT + RC_SPL + RC_CONF + RC_PEND))" -gt 0 ] 2>
   [ "$RC_SPL" -gt 0 ] 2>/dev/null && RC_MSG="$RC_MSG ${RC_SPL} split proposal(s) to review;"
   [ "$RC_CONF" -gt 0 ] 2>/dev/null && RC_MSG="$RC_MSG ${RC_CONF} open conflict(s) awaiting reconciliation;"
   [ "$RC_PEND" -gt 0 ] 2>/dev/null && RC_MSG="$RC_MSG ${RC_PEND} change-commitment(s) we promised but have not applied;"
-  RC_MSG="$RC_MSG Run /coordinator-advise to process them (reply, ack overlaps, arbitrate splits, reconcile conflicts, work off commitments). Nothing has been acted on. Only items newer than ${RC_STOP_TTL_HOURS}h block; to dismiss stale peer noise now: printf '%s' \"\$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > \"${DISMISS_FILE}\" (or set RC_COORD_DISMISS_ALL=1)."
+  RC_MSG="$RC_MSG Run ${RC_SKILL} to process them (reply, ack overlaps, arbitrate splits, reconcile conflicts, work off commitments). Nothing has been acted on. Only items newer than ${RC_STOP_TTL_HOURS}h block; to dismiss stale peer noise now: printf '%s' \"\$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > \"${DISMISS_FILE}\" (or set RC_COORD_DISMISS_ALL=1)."
   jq -n --arg reason "$RC_MSG" '{"decision":"block","reason":$reason}'
   exit 0
 fi

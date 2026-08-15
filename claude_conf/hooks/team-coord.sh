@@ -513,10 +513,6 @@ team_emit() {
   if [ "${#recips[@]}" -eq 0 ]; then echo "WARN: no recipients for $kind on team $id" >&2; fi
   local helper; helper="$(_tc_sphere_helper)"
   local ident; ident="$(team_identity_path)"
-  # Point NODE_PATH at the framework clone's node_modules (helper dir → ../node_modules) so
-  # the transport helper can load @unicitylabs/sphere-sdk even when invoked from outside the
-  # clone (mirrors sphere-daemon.mjs, which sets NODE_PATH the same way).
-  local nodepath=""; [ -n "$helper" ] && nodepath="$(cd "$(dirname "$helper")/.." 2>/dev/null && pwd)/node_modules:${NODE_PATH:-}"
   # Transport preflight: a MISSING helper or identity must FAIL LOUD — never masquerade as a
   # successful DRY-RUN. Only an explicit TEAM_DRY_RUN=1 suppresses real sending. A fresh peer
   # whose helper is unresolved otherwise "sends" every verb into the void (#20).
@@ -539,10 +535,14 @@ team_emit() {
     fi
     if [ "${TEAM_DRY_RUN:-0}" = "1" ]; then
       printf 'DRY-RUN send → %s : %s\n' "$n" "$kind"
-    elif NODE_PATH="$nodepath" node "$helper" send-dm "$n" "$env" --identity "$ident" >/dev/null 2>&1; then
-      printf 'sent → %s : %s\n' "$n" "$kind"; sent=$((sent+1))
     else
-      printf 'FAILED send → %s : %s\n' "$n" "$kind" >&2; fail=$((fail+1))
+      local reason src
+      reason="$(_tc_send_dm "$helper" "$ident" "$n" "$env")"; src=$?
+      if [ "$src" -eq 0 ]; then
+        printf 'sent → %s : %s\n' "$n" "$kind"; sent=$((sent+1))
+      else
+        printf 'FAILED send → %s : %s — %s\n' "$n" "$kind" "${reason:-node exited $src, no output}" >&2; fail=$((fail+1))
+      fi
     fi
   done
   [ "$fail" -gt 0 ] && return 1
@@ -563,15 +563,61 @@ _tc_sphere_helper() {
     local hp; hp="$(jq -r '.transport.helper_path // ""' "$cfg" 2>/dev/null || echo "")"
     [ -n "$hp" ] && [ -f "$hp" ] && { printf '%s' "$hp"; return; }
   fi
-  # (3) Fallback: relative candidates — only reachable when the hooks run IN PLACE under the clone.
+  # (3) Fallback candidates — relative ones reach the helper only when the hooks run IN
+  # PLACE under the clone; the conventional absolute install paths ($HOME/claude[-_]unicity_setup)
+  # let a coordinator whose project is a FOREIGN repo (and whose config never recorded
+  # transport.helper_path) still find the clone helper without a hand-made ~/lib symlink.
   local cands=(
     "${CLAUDE_PROJECT_DIR:-}/../lib/sphere-helper.mjs"
     "${CLAUDE_PROJECT_DIR:-}/lib/sphere-helper.mjs"
     "$TC_HOOK_DIR/../../lib/sphere-helper.mjs"
     "$TC_HOOK_DIR/../../../lib/sphere-helper.mjs"
+    "${HOME:-/root}/claude_unicity_setup/lib/sphere-helper.mjs"
+    "${HOME:-/root}/claude-unicity-setup/lib/sphere-helper.mjs"
   )
   local c; for c in "${cands[@]}"; do [ -f "$c" ] && { printf '%s' "$c"; return; }; done
   printf ''
+}
+
+# _tc_send_dm <helper> <ident> <npub> <envelope-json>
+# Invoke the transport helper's send-dm, CAPTURING stdout+stderr (never discard it).
+# Echoes a distilled one-line reason on stdout (the helper's {"status":"sent"} JSON on
+# success, or its "Error: …" text on failure); returns node's real exit code. Callers
+# key success off the return code and surface the reason on failure — a silent
+# `>/dev/null 2>&1` otherwise turns a real send failure (a transient "no connected
+# relays", an explicit relay NACK, or a 5s-silent drop) into an undiagnosable
+# "FAILED send" with no cause, which is exactly what wedged live coordination.
+_tc_send_dm() {
+  local helper="$1" ident="$2" n="$3" env="$4"
+  # Resolve symlinks so NODE_PATH points at the CLONE's real node_modules. A symlinked
+  # helper (…/lib → clone/lib) otherwise yields a dead NODE_PATH like $HOME/node_modules.
+  # ESM entry resolution ignores NODE_PATH (and Node realpaths the entry, so the SDK
+  # loads from the clone regardless), but transitive CJS requires inside the SDK honor
+  # it — keep it correct rather than pointing at a nonexistent dir.
+  local hreal np out rc
+  hreal="$(readlink -f "$helper" 2>/dev/null || printf '%s' "$helper")"
+  np="$(cd "$(dirname "$hreal")/.." 2>/dev/null && pwd)/node_modules"
+  out="$(NODE_PATH="${np}:${NODE_PATH:-}" node "$helper" send-dm "$n" "$env" --identity "$ident" 2>&1)"; rc=$?
+  printf '%s' "$out" | tr '\n' ' ' | sed 's/  */ /g; s/^ *//; s/ *$//' | cut -c1-300
+  return $rc
+}
+
+# _tc_reap_events — delete processed (status:done) team-queue events past the event TTL.
+# The drain marks events status:done IN PLACE (dispatch: event-done) and nothing ever
+# removed them, so agent-team-events/ grew without bound and every drain re-statted the
+# whole dir (dmytro #12). Mirrors the area-claim reap: advisory data, reaping blocks
+# nobody. TTL is hours-scale (TEAM_EVENT_REAP_HOURS, default 24) since a processed queue
+# event is a spent artifact.
+_tc_reap_events() {
+  local dir="$TEAM_EVENTS_DIR" hours cutoff f st ts
+  hours="${TEAM_EVENT_REAP_HOURS:-24}"; [[ "$hours" =~ ^[0-9]+$ ]] || hours=24
+  cutoff="$(date -u -d "-${hours} hours" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "1970-01-01T00:00:00Z")"
+  [ -d "$dir" ] || return 0
+  for f in "$dir"/*.json; do [ -e "$f" ] || continue
+    st="$(jq -r '.status // ""' "$f" 2>/dev/null)"; [ "$st" = "done" ] || continue
+    ts="$(jq -r '.processedAt // ""' "$f" 2>/dev/null)"
+    if [ -z "$ts" ] || [ "$ts" \< "$cutoff" ]; then rm -f "$f" 2>/dev/null || true; fi
+  done
 }
 
 # ============================================================================
@@ -865,7 +911,10 @@ _tc_cli() {
       for f in "$TEAM_EVENTS_DIR"/*.json; do [ -e "$f" ] || continue
         [ "$(jq -r '.status // "queued"' "$f")" = "queued" ] && out="$(jq -c --slurpfile e "$f" '. + [$e[0] | {id,kind,team,task,from_pubkey,npub}]' <<<"$out")"; done
       printf '%s\n' "$out";;
-    event-done) local f="$TEAM_EVENTS_DIR/${1:-}.json"; [ -f "$f" ] && { jq '.status="done"|.processedAt=(now|todate)' "$f" > "$f.t" && mv "$f.t" "$f"; echo done; };;
+    event-done) local f="$TEAM_EVENTS_DIR/${1:-}.json"; [ -f "$f" ] && { jq '.status="done"|.processedAt=(now|todate)' "$f" > "$f.t" && mv "$f.t" "$f"; echo done; }
+      # Opportunistic TTL reap so agent-team-events/ stays bounded without a separate cron.
+      _tc_reap_events;;
+    reap-events) _tc_reap_events; echo reaped;;
     dissolve) team_dissolve "${1:-}";;
     *)
       cat >&2 <<EOF
@@ -882,10 +931,10 @@ team-coord.sh — team-coordination engine (Contract-Net over A2A). Commands:
   lease-status <team> | claim-coord <team> [ttl-h] | beat <team> [ttl-h]
   kb-add --team <id> --fact F [--confidence --source --author-npub --lamport --supersedes --title] | kb-list <team>
   envelope <team> <kind> [--task --deadline --payload JSON] | emit <team> <env-json> [--to npub]
-  ingest <event-json|file|-> | events | event-done <id> | invites
+  ingest <event-json|file|-> | events | event-done <id> | reap-events | invites
   enqueue-event <from_pubkey> <ts> <envelope-json> [npub] [name]
   render <team> | lease-status | dissolve <team>
-Env: TEAM_ROOT, TEAM_SELF_NPUB, TEAM_SELF_NAME, TEAM_IDENTITY_FILE, TEAM_DRY_RUN=1
+Env: TEAM_ROOT, TEAM_SELF_NPUB, TEAM_SELF_NAME, TEAM_IDENTITY_FILE, TEAM_EVENT_REAP_HOURS, TEAM_DRY_RUN=1
 EOF
       return 1;;
   esac

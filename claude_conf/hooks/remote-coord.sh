@@ -409,6 +409,21 @@ rc_area_release() {  # <areaId> — local-side release; returns area.release env
   rc_render >/dev/null 2>&1 || true
   rc_envelope area.release --area "$1" --payload '{}'
 }
+# _rc_reap_event_dir <dir> <cutoff-iso> — delete processed (status:done) queue events
+# older than the cutoff. The drain marks events status:done IN PLACE (event-done) and
+# nothing removed them, so agent-consult-events/ (and agent-team-events/) grew without
+# bound and every drain re-statted the whole dir (dmytro #12). Advisory data — a spent
+# queue event blocks nobody once processed.
+_rc_reap_event_dir() {
+  local dir="$1" cutoff="$2" f st ts
+  [ -d "$dir" ] || return 0
+  for f in "$dir"/*.json; do [ -e "$f" ] || continue
+    st="$(jq -r '.status // ""' "$f" 2>/dev/null)"; [ "$st" = "done" ] || continue
+    ts="$(jq -r '.processedAt // ""' "$f" 2>/dev/null)"
+    if [ -z "$ts" ] || [ "$ts" \< "$cutoff" ]; then rm -f "$f" 2>/dev/null || true; fi
+  done
+}
+
 rc_reap() {  # stale-claim reaping + durable-store COMPACTION (item 10).
   # (1) expire active claims past their lease, and (2) actually DELETE long-terminal
   # records (expired/released areas, agreed/closed splits, resolved conflicts, closed
@@ -462,6 +477,15 @@ rc_reap() {  # stale-claim reaping + durable-store COMPACTION (item 10).
   if [ -f "$ef" ] && [ "$(wc -l < "$ef" 2>/dev/null || echo 0)" -gt "$edges_max" ]; then
     tail -n "$edges_max" "$ef" > "$ef.tmp.$$" 2>/dev/null && mv "$ef.tmp.$$" "$ef" 2>/dev/null || rm -f "$ef.tmp.$$" 2>/dev/null || true
   fi
+
+  # (2g) processed inbound queue events (consult + team) — hours-scale TTL since a done
+  # event is a spent artifact. RC_EVENT_REAP_HOURS default 24. TEAM_EVENTS_DIR is provided
+  # by the sourced team-coord.sh.
+  local ev_hours ev_cut
+  ev_hours="${RC_EVENT_REAP_HOURS:-24}"; [[ "$ev_hours" =~ ^[0-9]+$ ]] || ev_hours=24
+  ev_cut="$(date -u -d "-${ev_hours} hours" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "$cutoff")"
+  _rc_reap_event_dir "$CONSULT_EVENTS_DIR" "$ev_cut"
+  [ -n "${TEAM_EVENTS_DIR:-}" ] && _rc_reap_event_dir "$TEAM_EVENTS_DIR" "$ev_cut"
 
   rc_render >/dev/null 2>&1 || true
   rc_area_list expired | jq -r 'map(.areaId) | join(" ")'
@@ -779,6 +803,50 @@ rc_resolve_target() {
   printf '%s' "$npub"
 }
 
+# _rc_reply_awaited <kind> — true for verbs whose protocol elicits a RETURN envelope
+# (so a dropped send is caught by the missing reply, and exit-0 can be reported as a
+# plain "sent"). Every other verb is fire-and-forget: exit-0 only means "relay-accepted,
+# not NACKed within 5s" — never durable — so it is labelled "sent (unconfirmed)".
+_rc_reply_awaited() {
+  case "${1:-}" in
+    consult.request|area.claim) return 0;;
+    *) return 1;;
+  esac
+}
+
+# _rc_self_side — is THIS instance the coordinator (holds threads peers opened WITH us,
+# side:remote) or a remote peer (opened threads with a coordinator, side:local)?
+# Resolution: explicit RC_SELF_SIDE → config .coordination.role → derived from the coord
+# store (any side:local thread and no side:remote thread ⇒ remote), default coordinator
+# (the localhost admin is the coordinator). Advisory only — it selects which skill the
+# Stop-gate suggests, so a wrong guess is low-harm.
+_rc_self_side() {
+  case "${RC_SELF_SIDE:-}" in coordinator|remote) printf '%s' "$RC_SELF_SIDE"; return;; esac
+  local cfg role
+  cfg="$( { type _tc_agent_dir >/dev/null 2>&1 && _tc_agent_dir; } 2>/dev/null)/config.json"
+  if [ -f "$cfg" ]; then
+    role="$(jq -r '.coordination.role // ""' "$cfg" 2>/dev/null || echo "")"
+    case "$role" in coordinator|remote) printf '%s' "$role"; return;; esac
+  fi
+  local rem=0 loc=0 d f s more
+  d="$(_rc_consults_dir)"
+  if [ -d "$d" ]; then
+    for f in "$d"/*.json; do [ -e "$f" ] || continue
+      s="$(jq -r '.side // ""' "$f" 2>/dev/null)"
+      [ "$s" = "remote" ] && rem=$((rem+1)); [ "$s" = "local" ] && loc=$((loc+1))
+    done
+  fi
+  more="$( { _rc_intents; _rc_splits; } | jq -s 'add // []' 2>/dev/null || echo '[]')"
+  rem=$((rem + $(printf '%s' "$more" | jq '[.[]|select(.side=="remote")]|length' 2>/dev/null || echo 0)))
+  loc=$((loc + $(printf '%s' "$more" | jq '[.[]|select(.side=="local")]|length' 2>/dev/null || echo 0)))
+  if [ "$rem" -eq 0 ] && [ "$loc" -gt 0 ]; then printf 'remote'; else printf 'coordinator'; fi
+}
+
+# _rc_advise_skill — the slash-command this instance runs to process pending peer traffic.
+_rc_advise_skill() {
+  case "$(_rc_self_side)" in remote) printf '/consult-coordinator';; *) printf '/coordinator-advise';; esac
+}
+
 rc_emit() {
   local env="$1"; shift
   local to="" all=0
@@ -799,10 +867,6 @@ rc_emit() {
   local kind; kind="$(jq -r '.kind' <<<"$env")"
   local helper=""; type _tc_sphere_helper >/dev/null 2>&1 && helper="$(_tc_sphere_helper)"
   local ident=""; type team_identity_path >/dev/null 2>&1 && ident="$(team_identity_path)"
-  # Point NODE_PATH at the framework clone's node_modules (helper dir → ../node_modules) so
-  # the transport helper loads @unicitylabs/sphere-sdk even when invoked from outside the
-  # clone (mirrors sphere-daemon.mjs).
-  local nodepath=""; [ -n "$helper" ] && nodepath="$(cd "$(dirname "$helper")/.." 2>/dev/null && pwd)/node_modules:${NODE_PATH:-}"
   # Transport preflight: a MISSING helper or identity must FAIL LOUD — never masquerade as a
   # successful DRY-RUN. Folding "no transport" into the DRY-RUN branch made a fresh peer's
   # every consult/claim/intent silently vanish while reporting success (#20). Only an explicit
@@ -829,10 +893,25 @@ rc_emit() {
     fi
     if [ "${TEAM_DRY_RUN:-0}" = "1" ]; then
       printf 'DRY-RUN send → %s : %s\n' "$n" "$kind"
-    elif NODE_PATH="$nodepath" node "$helper" send-dm "$n" "$env" --identity "$ident" >/dev/null 2>&1; then
-      printf 'sent → %s : %s\n' "$n" "$kind"
     else
-      printf 'FAILED send → %s : %s\n' "$n" "$kind" >&2; rc=1
+      # Capture the helper's result instead of discarding it (>/dev/null 2>&1 turned a real
+      # send failure into an undiagnosable "FAILED send" — the live wedge). The SDK throws
+      # on "no connected relays" and rejects on an explicit ["OK",id,false] NACK (both →
+      # non-zero); a zero exit means the relay socket accepted the event and did not NACK
+      # within the SDK's 5s window — NOT that it was durably stored.
+      local reason src
+      reason="$(_tc_send_dm "$helper" "$ident" "$n" "$env")"; src=$?
+      if [ "$src" -ne 0 ]; then
+        printf 'FAILED send → %s : %s — %s\n' "$n" "$kind" "${reason:-node exited $src, no output}" >&2; rc=1
+      elif _rc_reply_awaited "$kind"; then
+        # This verb elicits a return envelope (consult.advise / area.ack), so a dropped send
+        # is caught by the missing reply — report it plainly as sent.
+        printf 'sent → %s : %s\n' "$n" "$kind"
+      else
+        # Fire-and-forget verb: no reply can catch a 5s-silent drop, so exit-0 is only
+        # "relay-accepted", not confirmed delivery — say so honestly.
+        printf 'sent (unconfirmed) → %s : %s\n' "$n" "$kind"
+      fi
     fi
   done
   return $rc
@@ -861,6 +940,9 @@ rc_ingest() {  # <event-json-or-file-or-->  (event = the queued wrapper OR a raw
   fi
   payload="$(jq -c '.payload // {}' <<<"$env")"
   [ -n "$kind" ] || { echo "ERR: no kind" >&2; return 1; }
+  # Side-aware Stop-gate hint: a coordinator runs /coordinator-advise; a remote peer runs
+  # /consult-coordinator (dmytro #10). Computed once from this instance's role.
+  local advise_skill; advise_skill="$(_rc_advise_skill)"
   if [ -n "$mid" ] && rc_seen_check "$mid"; then echo "DUP: $mid ($kind) ignored"; return 0; fi
   # SECURITY (item 15): track durable-write failures across the handler. A non-zero
   # value at the end means a lock timeout / jq error lost the write → we must NOT mark
@@ -905,7 +987,7 @@ rc_ingest() {  # <event-json-or-file-or-->  (event = the queued wrapper OR a raw
           && mv "$cf.tmp.$$" "$cf" || { rm -f "$cf.tmp.$$" 2>/dev/null; wrc=1; }
       fi
       rc_render >/dev/null 2>&1 || true
-      echo "CONSULT opened: $cid from $from_npub — advise via /coordinator-advise";;
+      echo "CONSULT opened: $cid from $from_npub — advise via $advise_skill";;
     consult.advise)
       # A coordinator answered a consult WE opened (side:local). SECURITY (item 3): only
       # the peer we ACTUALLY consulted may advise it — gate on peerNpub == sender. The
@@ -932,7 +1014,7 @@ rc_ingest() {  # <event-json-or-file-or-->  (event = the queued wrapper OR a raw
         _rc_split_patch "$acksid" '.status="agreed" | .agreedAt=$now | .agreeNote=($p.note // "") | .agreedByNpub=$from' \
           --arg now "$(rc_now)" --arg from "$from_npub" --argjson p "$payload" >/dev/null 2>&1 || wrc=$?
         rc_render >/dev/null 2>&1 || true
-        echo "SPLIT ack recorded on $acksid (status only — apply via /coordinator-advise)"
+        echo "SPLIT ack recorded on $acksid (status only — apply via $advise_skill)"
       fi
       if [ -n "$cid" ] && [ "$cid" != "null" ]; then
         local aowner; aowner="$(rc_consult_get "$cid" 2>/dev/null | jq -r '.peerNpub // ""' 2>/dev/null)"
@@ -974,7 +1056,7 @@ rc_ingest() {  # <event-json-or-file-or-->  (event = the queued wrapper OR a raw
       local qscope; qscope="$(jq -r '(.scope // []) | join(",")' <<<"$payload")"
       local mine; mine="$(rc_area_check "$qscope")"
       local myint; myint="$(rc_intent_check "$qscope")"
-      echo "WORK-INTENT from $from_npub: $(jq -r '.subject // .intent // "?"' <<<"$payload") — reply via /coordinator-advise (or /consult-coordinator)"
+      echo "WORK-INTENT from $from_npub: $(jq -r '.subject // .intent // "?"' <<<"$payload") — reply via $advise_skill"
       [ "$(jq 'length' <<<"$mine" 2>/dev/null || echo 0)" -gt 0 ] \
         && echo "  ⚠ we hold overlapping active area(s): $(jq -r 'map(.areaId) | join(", ")' <<<"$mine")"
       [ "$(jq 'length' <<<"$myint" 2>/dev/null || echo 0)" -gt 0 ] \
@@ -1005,7 +1087,7 @@ rc_ingest() {  # <event-json-or-file-or-->  (event = the queued wrapper OR a raw
       local clash; clash="$(rc_area_check "$(jq -r '(.scope // []) | join(",")' <<<"$payload")" | jq -c --arg id "$aid" 'map(select(.areaId != $id))')"
       echo "AREA claimed (advisory): $aid by $from_npub"
       [ "$(jq 'length' <<<"$clash" 2>/dev/null || echo 0)" -gt 0 ] \
-        && echo "  ⚠ OVERLAP notice — coordinate with holders of: $(jq -r 'map(.areaId + " (" + ((.holderName // .holderNpub[0:12])) + ")") | join(", ")' <<<"$clash") — ack via /coordinator-advise";;
+        && echo "  ⚠ OVERLAP notice — coordinate with holders of: $(jq -r 'map(.areaId + " (" + ((.holderName // .holderNpub[0:12])) + ")") | join(", ")' <<<"$clash") — ack via $advise_skill";;
     area.ack)
       # Advisory response to OUR claim. SECURITY (item 3): only patch an area WE hold
       # (side:local). SECURITY (item 17): payload passed via --argjson, never interpolated.
@@ -1084,7 +1166,7 @@ rc_ingest() {  # <event-json-or-file-or-->  (event = the queued wrapper OR a raw
         _rc_split_patch "$sid" '.status="agreed" | .agreedAt=$now | .agreeNote=($p.note // "") | .agreedByNpub=$from' \
           --arg now "$(rc_now)" --arg from "$from_npub" --argjson p "$payload" >/dev/null 2>&1 || wrc=$?
         rc_render >/dev/null 2>&1 || true
-        echo "SPLIT agreed on our proposal $sid (status only — materialize via /coordinator-advise)"
+        echo "SPLIT agreed on our proposal $sid (status only — materialize via $advise_skill)"
       fi;;
     conflict.open)
       # SECURITY (item 3): namespace a colliding kid so a peer can't overwrite our or a
@@ -1101,7 +1183,7 @@ rc_ingest() {  # <event-json-or-file-or-->  (event = the queued wrapper OR a raw
             status:"open", receivedAt:$now}]' \
         --arg kid "$kid" --arg from "$from_npub" --argjson p "$payload" --arg now "$(rc_now)" || wrc=$?
       rc_render >/dev/null 2>&1 || true
-      echo "CONFLICT opened: $kid on $(jq -r '(.paths // []) | join(", ")' <<<"$payload") — reconcile via /coordinator-advise (ladder: clean → auto-merge → ai-resolve → re-plan)";;
+      echo "CONFLICT opened: $kid on $(jq -r '(.paths // []) | join(", ")' <<<"$payload") — reconcile via $advise_skill (ladder: clean → auto-merge → ai-resolve → re-plan)";;
     conflict.resolve)
       # SECURITY (item 3): a conflict.resolve from a NON-PARTY is ignored — only a party
       # to the conflict (in .parties, or the peer who opened it) may advance its stage.
@@ -1291,7 +1373,12 @@ _rc_cli() {
       for f in "$CONSULT_EVENTS_DIR"/*.json; do [ -e "$f" ] || continue
         [ "$(jq -r '.status // "queued"' "$f")" = "queued" ] && out="$(jq -c --slurpfile e "$f" '. + [$e[0] | {id,kind,consult,area,from_pubkey,npub,unicityName}]' <<<"$out")"; done
       printf '%s\n' "$out";;
-    event-done) local f="$CONSULT_EVENTS_DIR/${1:-}.json"; [ -f "$f" ] && { jq '.status="done"|.processedAt=(now|todate)' "$f" > "$f.t" && mv "$f.t" "$f"; echo done; };;
+    event-done) local f="$CONSULT_EVENTS_DIR/${1:-}.json"; [ -f "$f" ] && { jq '.status="done"|.processedAt=(now|todate)' "$f" > "$f.t" && mv "$f.t" "$f"; echo done; }
+      # Opportunistic TTL reap so agent-consult-events/ stays bounded without a manual `reap`.
+      local _ec; _ec="$(date -u -d "-${RC_EVENT_REAP_HOURS:-24} hours" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "1970-01-01T00:00:00Z")"
+      _rc_reap_event_dir "$CONSULT_EVENTS_DIR" "$_ec";;
+    self-side) _rc_self_side; echo;;
+    advise-skill) _rc_advise_skill; echo;;
     enqueue-event) rc_enqueue_event "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}"; echo;;
     render) rc_render; echo "rendered $(coord_root)/coord.md";;
     *)
@@ -1318,10 +1405,10 @@ Commands:
   edge-add <from> duplicates|supersedes|blocks|conflicts-with <to> [note] | edges [filter]
   peers | envelope <kind> [--consult C --area A --payload JSON]
   emit <env-json> --to <npub|nametag> | --to-all-peers   (nametag → npub via sphere-helper, cached in registry)
-  ingest <event-json|file|-> | events | event-done <id>
+  ingest <event-json|file|-> | events | event-done <id> | self-side | advise-skill
   enqueue-event <from_pubkey> <ts> <envelope-json> [npub] [name]
   render
-Env: COORD_ROOT, RC_AREA_TTL_HOURS, TEAM_SELF_NPUB, TEAM_SELF_NAME, TEAM_IDENTITY_FILE, TEAM_DRY_RUN=1
+Env: COORD_ROOT, RC_AREA_TTL_HOURS, RC_EVENT_REAP_HOURS, RC_SELF_SIDE, TEAM_SELF_NPUB, TEAM_SELF_NAME, TEAM_IDENTITY_FILE, TEAM_DRY_RUN=1
 EOF
       return 1;;
   esac
