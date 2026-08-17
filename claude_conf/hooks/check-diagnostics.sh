@@ -121,7 +121,7 @@ if [ -f "$MSG_STATE" ]; then
 fi
 
 # --- Inbound agent authorization gate (owner-in-the-loop, DEFAULT-DENY) ---------
-# Master-manager coordination: unknown agents that have made contact must be
+# Agent coordination: unknown agents that have made contact must be
 # authorized (or denied) by the owner before anything they ask is acted upon.
 DIAG_HOOK_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo .)"
 # Refresh the pending surface from the registry so /authorize-agent · /deny-agent

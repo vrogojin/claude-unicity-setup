@@ -378,11 +378,22 @@ IDENTITY_FILE="$CLAUDE_DIR/agent/identity.json"
 if [ -f "$IDENTITY_FILE" ] && [ "$DRY_RUN" != "true" ]; then
   EXISTING_NPUB=$(jq -r '.npub // "unknown"' "$IDENTITY_FILE" 2>/dev/null)
   info "Existing identity found: $EXISTING_NPUB"
-  if ! prompt_yn "  Create a new identity? (existing will be overwritten)"; then
+  # GUARD: this identity is the agent's keypair + EVERY peer authorization. Overwriting it
+  # silently — a non-interactive shell where `read` hits EOF and takes the default, or a
+  # careless Enter on a [Y/n] prompt — would DESTROY them. So: default to KEEP, refuse to
+  # overwrite when there's no TTY, and require an explicit affirmative (or FORCE_NEW_IDENTITY=1)
+  # to regenerate.
+  if [ "${FORCE_NEW_IDENTITY:-}" = "1" ]; then
+    warn "FORCE_NEW_IDENTITY=1 — regenerating (existing identity + all peer authorizations will be DESTROYED)"
+    IDENTITY_CREATED=true
+  elif [ ! -t 0 ]; then
+    ok "Keeping existing identity (non-interactive shell — refusing to overwrite; set FORCE_NEW_IDENTITY=1 to override)"
+    IDENTITY_CREATED=false
+  elif prompt_yn "  Overwrite it with a NEW identity? This DESTROYS the current keypair + all peer authorizations" "n"; then
+    IDENTITY_CREATED=true
+  else
     ok "Keeping existing identity"
     IDENTITY_CREATED=false
-  else
-    IDENTITY_CREATED=true
   fi
 else
   IDENTITY_CREATED=true
