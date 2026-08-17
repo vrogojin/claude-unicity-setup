@@ -124,7 +124,7 @@ the same `--relay` (the string no longer carries relay hints; issue prints a war
   "v": 1,
   "tid": "t8f3a1c92be07",
   "iss": "npub1abc…",
-  "issName": "concierge-coord",
+  "issName": "<coordinator-nametag>",
   "relays": ["wss://nostr-relay.testnet.unicity.network"],
   "secret": "8_Qy1u-…43-chars-base64url…",
   "caps": ["self-directed", "consult", "claim-area"],
@@ -244,7 +244,7 @@ flock timeout fails the redeem (nothing authorized, event not marked seen → re
 ```json
 { "redemptions": [ {
     "tid": "t8f3a1c92be07",
-    "issuerNpub": "npub1abc…", "issuerHex": "<decoded>", "issuerName": "concierge-coord",
+    "issuerNpub": "npub1abc…", "issuerHex": "<decoded>", "issuerName": "<coordinator-nametag>",
     "grantBack": ["self-directed","consult","claim-area"],
     "expectCaps": ["self-directed","consult","claim-area"],
     "exp": "2026-08-15T10:00:00Z",
@@ -300,7 +300,7 @@ redeem is **bound to the redeemer's identity by the transport**, not by any payl
     "status": "granted",
     "caps": ["…granted to the redeemer…"],
     "grantBack": ["…echo of what the issuer asks back…"],
-    "issuerName": "concierge-coord"
+    "issuerName": "<coordinator-nametag>"
 } }
 ```
 
