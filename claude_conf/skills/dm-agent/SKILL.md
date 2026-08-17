@@ -1,6 +1,6 @@
 ---
 name: dm-agent
-description: Send a direct message to another Claude agent by unicity name or npub, with a first-contact handshake introducing this instance as the concierge master-manager.
+description: Send a direct message to another Claude agent by unicity name or npub, with a first-contact handshake that introduces this instance by its own agent_nametag and role.
 ---
 
 # /dm-agent — Contact Another Agent

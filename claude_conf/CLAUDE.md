@@ -336,6 +336,6 @@ To clear a pending-authorization block without deciding: `/deny-agent <name-or-n
 - `docs/sphere-sdk-guide.md` — sphere-sdk development guide
 - `docs/sphere-guide.md` — sphere app development guide
 - `docs/developer-guidelines.md` — Cross-repo coding standards (TypeScript, Go, Rust, C++)
-- `docs/agent-coordination.md` — Owner-in-the-loop master-manager model: authorization registry, capabilities, inbound/outbound flows
+- `docs/agent-coordination.md` — Owner-in-the-loop coordination model: authorization registry, capabilities, inbound/outbound flows
 - `docs/team-coordination.md` — Self-organizing teams (Contract-Net over A2A): verbs+capability gate, DAG auctions, coordinator lease/epoch fencing, knowledge cards
 - `reference/<repo>.md` — Per-repository API reference (see `reference/TEMPLATE.md` for format)
