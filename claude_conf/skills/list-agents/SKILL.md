@@ -5,7 +5,7 @@ description: List all known remote agents in the authorized-agents registry with
 
 # /list-agents — Show the Authorized-Agents Registry
 
-Displays every remote Claude agent this master-manager instance knows about, with its
+Displays every remote Claude agent this instance knows about, with its
 status (`authorized` / `pending` / `denied` / `peer`), granted capabilities, and claimed
 unicity name.
 

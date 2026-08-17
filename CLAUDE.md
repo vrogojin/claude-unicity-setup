@@ -115,15 +115,17 @@ The skills support a parallel agent development workflow:
 7. `/check-messages` — read agent messages (group + DMs)
 8. `/dm-owner <message>` — send a DM to the configured owner
 
-### Cross-Host Agent Coordination (master manager)
+### Cross-Host Agent Coordination
 
-This instance (**cryptohog-concierge-dev**) is the **master manager** of the concierge
-project. Agents on other hosts coordinate through it under an owner-in-the-loop,
-**default-deny** model: unknown agents are queued for your authorization and never acted
-upon; authorized agents' requests are dispatched to subagents scoped to their granted
-capabilities. Owner commands: `/list-agents`, `/authorize-agent <name-or-npub> <caps>`,
-`/deny-agent <name-or-npub>`, `/dm-agent <name-or-npub> <message>`,
-`/process-agent-requests`. Full model: [`docs/agent-coordination.md`](docs/agent-coordination.md).
+Agents on other hosts coordinate under an owner-in-the-loop, **default-deny** model:
+unknown agents are queued for your authorization and never acted upon; authorized agents'
+requests are dispatched to subagents scoped to their granted capabilities. **Whether a
+given instance is the coordinator or an ordinary participant comes from its own
+`.claude/agent/config.json`** (`agent_nametag`, plus the recorded coordinator) — never
+assume the hub role from this document. Owner commands: `/list-agents`,
+`/authorize-agent <name-or-npub> <caps>`, `/deny-agent <name-or-npub>`,
+`/dm-agent <name-or-npub> <message>`, `/process-agent-requests`. Full model:
+[`docs/agent-coordination.md`](docs/agent-coordination.md).
 
 **Self-organizing teams (Contract-Net over A2A).** Authorized peers can form goal-scoped
 teams that decompose work, auction tasks (cfp → bid → award-under-lease → result → review),

@@ -1,13 +1,13 @@
 ---
 name: dm-agent
-description: Send a direct message to another Claude agent by unicity name or npub, with a first-contact handshake introducing this instance as the concierge master-manager.
+description: Send a direct message to another Claude agent by unicity name or npub, with a first-contact handshake that introduces this instance by its own agent_nametag and role.
 ---
 
 # /dm-agent — Contact Another Agent
 
 Send a NIP-17 encrypted DM to a remote Claude agent. On first contact we introduce
-ourselves as **cryptohog-concierge-dev, master manager of the concierge project**, so
-the remote knows who is reaching out and why.
+ourselves using **this instance's own `agent_nametag`** (from `.claude/agent/config.json`)
+and its actual role, so the remote knows who is reaching out and why.
 
 ## Usage
 
@@ -39,10 +39,17 @@ the remote knows who is reaching out and why.
    - If neither yields an npub, tell the caller you need the recipient's npub and stop.
 
 3. Decide whether this is **first contact** (no prior authorized/peer exchange with this
-   npub). If so, prefix a one-line intro so the message is self-describing:
+   npub). If so, prefix a one-line intro built from the `agent_nametag` you read in step 1
+   — never a hardcoded name, and never claim the coordinator role unless this instance
+   actually holds it:
    ```
-   [cryptohog-concierge-dev · concierge master-manager] <message>
+   [<agent_nametag> · <role>] <message>
    ```
+   `<role>` is `concierge coordinator` when this instance IS the recorded coordinator, and
+   `concierge agent` otherwise. The name MUST match the identity that signs the DM: the
+   transport authenticates by pubkey, so a claimed name that does not match the signing key
+   is exactly what a careful peer should reject.
+
    For an ongoing thread, send `<message>` as-is.
 
 4. **Egress content-guard (SIF).** Before sending, run the final message body through the

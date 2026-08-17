@@ -1,6 +1,6 @@
 ---
 name: authorize-agent
-description: Authorize a remote Claude agent (by unicity name or npub) to coordinate with this master-manager instance, granting an explicit set of capabilities.
+description: Authorize a remote Claude agent (by unicity name or npub) to coordinate with this instance, granting an explicit set of capabilities.
 ---
 
 # /authorize-agent — Grant a Remote Agent Coordination Rights

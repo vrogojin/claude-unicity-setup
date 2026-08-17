@@ -138,7 +138,7 @@ Systematically reviews work against task file, runs verification, and prepares m
 ## Agent Coordination Skills
 
 The `dm-agent`, `list-agents`, `authorize-agent`, `deny-agent`, and
-`process-agent-requests` skills implement the **owner-in-the-loop master-manager** model
+`process-agent-requests` skills implement the **owner-in-the-loop coordination** model
 for coordinating Claude agents across hosts (default-deny authorization registry +
 capability-scoped request processing). See [`docs/agent-coordination.md`](../../docs/agent-coordination.md).
 
