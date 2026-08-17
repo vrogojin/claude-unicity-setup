@@ -32,11 +32,12 @@ redeems it with a single command; both end up **mutually authorized** with the a
 capabilities — zero further manual steps on either side.
 
 ```
-issuer:   ticket.sh issue --caps consult,claim-area --ttl 24h --name dev-2
-          → prints  unicity-ticket:v1.eyJra…   (one line, copy-pasteable)
+issuer:   ticket.sh issue --caps consult,claim-area --ttl 2h --name dev-2
+          → prints  ut2_pQ7hT…47 chars…   (one short line; the signed authorization
+            event is published to the relay — see §3.0)
 
-redeemer: ./setup.sh <project> --ticket 'unicity-ticket:v1.eyJra…'
-          (or, post-setup:  ticket.sh redeem 'unicity-ticket:v1.eyJra…'  /  /redeem-ticket)
+redeemer: ./setup.sh <project> --ticket 'ut2_pQ7hT…'
+          (or, post-setup:  ticket.sh redeem 'ut2_pQ7hT…'  /  /redeem-ticket)
 
 end state: issuer registry:   redeemer hex → authorized, caps = ticket.caps
            redeemer registry: issuer hex   → authorized, caps = ticket.grantBack
@@ -58,9 +59,65 @@ redeem message). Same trust model, moved one step earlier and made replay/race-s
 
 ---
 
-## 3. Ticket format
+## 3. Ticket formats
 
-### 3.1 Payload (canonical JSON, minified, sorted keys)
+### 3.0 v2 — short relay-backed tickets (current default)
+
+v1's string self-contained the whole signed event (~1.1 KB) — copy-paste routinely mangled
+it. v2 splits the two roles the string was serving:
+
+```
+ticket string  =  ut2_<43 alphanumeric chars>          (47 chars total, ≤64)
+                  → ONLY a bearer secret: 43 uniform [A-Za-z0-9] chars from /dev/urandom
+                    (43·log2(62) ≈ 256 bits — same strength as v1's 32-byte secret)
+
+authorization  =  issuer-signed kind-30777 event PUBLISHED to the relay at issue time,
+                  addressable by  d = SHA-256(secret)  (hex), with a NIP-40
+                  ["expiration", exp] tag. content = base64url( 12-byte nonce ‖
+                  AES-256-GCM(key, payload-JSON) ‖ 16-byte tag ) where
+                  key = HKDF-SHA256(ikm=secret, salt="unicity-ticket-v2",
+                  info="content-enc") and AAD = "ut2|30777|<d>".
+```
+
+The payload inside the encrypted content is the v1 payload **minus `secret`** plus
+`{v:2, sh:<d>, tid:"t"+d[0:12]}` (the helper derives `sh`/`tid` from the secret itself, so
+the commitment cannot drift from what is signed). Because the content is encrypted under a
+secret-derived key, the public relay learns only the issuer pubkey and the hash — never
+caps/grantBack/bind/label — restoring the metadata privacy v1 had by never touching a relay.
+
+**Issue** (`ticket.sh issue`, v2 default; `--v1` keeps the legacy emit): mint secret →
+`ticket2-sign` → `relay-publish` and **wait for the relay's OK** (publish failure fails the
+issue loudly and records nothing) → record hash-only ledger row (`v:2`, `eventId`, `relay`)
+→ print `ut2_<secret>`.
+
+**Redeem** (`ticket.sh redeem <ut2_…> [--relay url]`): shape-check the string (mangled
+paste dies with a clear reason) → `d = SHA-256(secret)` → `relay-fetch` kind-30777 events by
+`#d` → `ticket2-verify` picks the ONE candidate passing the full chain:
+
+1. `kind == 30777` and the `d` tag equals `SHA-256(secret)` (the tag is signed under NIP-01);
+2. the schnorr signature verifies over the recomputed NIP-01 id;
+3. the content decrypts under the secret-derived key (GCM auth; AAD binds kind+d) — only
+   the holder of the right secret gets a payload at all;
+4. `payload.sh == d` and `payload.tid == "t"+d[0:12]` (hash commitment);
+5. `payload.iss` decodes to `event.pubkey` — an attacker who copies the ciphertext+tags
+   into an event signed by their own key fails exactly here (kind-3xxxx addresses are
+   per-author, so they can never *replace* the issuer's event either);
+6. back in `ticket.sh`: `payload.v == 2`, `exp` in the future, caps within the known set.
+
+From there the flow is **identical to v1** (§6): show the mutual-grant summary, record the
+redemption locally, send the signed `ticket.redeem {tid, secret}` DM to the issuer, poll for
+the grant. The issuer-side ingest (atomic consume, bind, rate limit, grant-back) is shared
+verbatim between the formats — the issuer's ledger, not the relay event, remains the only
+thing that authorizes; a relay event with no matching `pending` ledger row is inert, which
+is also why `revoke` stays a purely local act.
+
+Relay dependency: redemption now needs one relay *read* before the redeem DM — the same
+relay the redeem DM itself needs, so no new availability class. A fetch failure or empty
+result fails closed with the likely causes spelled out (connectivity, expired+relay-reaped,
+non-default relay ⇒ `--relay`). Tickets issued with `--relay <url>` must be redeemed with
+the same `--relay` (the string no longer carries relay hints; issue prints a warning).
+
+### 3.1 v1 payload (legacy, canonical JSON, minified, sorted keys)
 
 ```json
 {
@@ -92,7 +149,7 @@ redeem message). Same trust model, moved one step earlier and made replay/race-s
 | `bind` | optional: npub that alone may redeem (`--bind <npub>`); checked against the **transport-authenticated sender hex**, not any claimed field |
 | `label` | free-text label for the issuer's ledger |
 
-### 3.2 Encoding + signature
+### 3.2 v1 encoding + signature (legacy)
 
 The ticket string is a **signed Nostr event** wrapping the payload, so verification reuses
 the exact signing machinery the SDK already uses for publishing (no new crypto surface):
@@ -529,6 +586,25 @@ Everything below either narrows that window or bounds the damage.
   *drop* messages — which surfaces as a loud redeem timeout / Stop-gate nudge, never a
   silent half-authorized state (each side's grant is recorded only on its own verified
   step).
+
+**v2-specific threats (the published kind-30777 event).**
+- *Relay reads the authorization:* content is AES-256-GCM under a secret-derived HKDF key —
+  the relay (or anyone querying) learns only issuer pubkey + SHA-256(secret) + expiry tag.
+  Publishing the hash is equivalent to v1's hash-at-rest posture: with ≈256 bits of secret
+  entropy it is not invertible or guessable, and knowing it only lets you *fetch* the
+  (opaque) event, never redeem — redemption still requires presenting the secret itself to
+  the issuer, whose ledger does the one-time consume.
+- *Event forgery / clutter under the same `d`:* addressable-event addresses are
+  (kind, pubkey, d) — nobody can replace the issuer's event. An attacker can publish their
+  own event with the same `d` after observing it, including a verbatim copy of the
+  ciphertext re-signed under their key: sig+decrypt pass, but `payload.iss == event.pubkey`
+  fails (the iss binding is inside the GCM-authenticated ciphertext, unmodifiable without
+  the key). The redeemer verifies every candidate and proceeds only with the one that passes
+  the full chain; hostile clutter can at worst emit a specific rejection reason.
+- *Relay drops/loses the event:* issue fails loudly unless the relay ACKed the publish; a
+  later fetch miss fails the redeem closed with actionable causes. No silent states.
+- *Hash pre-image linking:* the `d` value is derived with plain SHA-256 (no salt) — fine,
+  because the pre-image is itself a 256-bit-entropy secret, never a low-entropy value.
 
 **Fail-closed inventory** (the #21/#23 "fail loud, never silent" rule): unknown version,
 bad sig, sig-key ≠ iss, expired, unknown tid, hash mismatch, bind mismatch, lost consume

@@ -6,6 +6,15 @@
 # and ends up MUTUALLY authorized with the issuer — no npub-copying, no operator step on
 # either side. Symmetric: "issuer" is just whoever ran `issue`.
 #
+# Two ticket formats:
+#   v2 (default): `ut2_<43 alnum chars>` — 47 chars, paste-proof. The string is ONLY a
+#     ~256-bit bearer secret; the issuer-signed kind-30777 authorization event (caps, exp,
+#     bind, issuer pubkey — content encrypted under a secret-derived key) is PUBLISHED to
+#     the relay addressed by `d` = SHA-256(secret). Redeem = hash → fetch by #d → verify
+#     signature/commitment/expiry → the same mutual-auth flow as v1.
+#   v1 (legacy, `issue --v1`): `unicity-ticket:v1.<b64url(signed event)>` — self-contained
+#     (~1.1 KB). Still redeemable; issue it only for peers running pre-v2 framework code.
+#
 # The admin decision happens at ISSUE time (running `issue --caps …` IS the authorization
 # act, exactly like `onboard-teammate.sh <npub>` today); redemption merely binds that
 # already-made decision to the transport-authenticated sender of the redeem message. So a
@@ -120,11 +129,12 @@ tk_issue() {
   # two non-destructive coordination caps and expires in minutes, not a full-capability
   # day-long ticket. Both stay overridable via --caps / --ttl.
   local caps="consult,claim-area"
-  local grantBack="" ttl="15m" bind="" label="" relay=""
+  local grantBack="" ttl="15m" bind="" label="" relay="" fmt=2
   while [ $# -gt 0 ]; do case "$1" in
     --caps) caps="$2"; shift 2;; --grant-back) grantBack="$2"; shift 2;;
     --ttl) ttl="$2"; shift 2;; --bind) bind="$2"; shift 2;;
     --name|--label) label="$2"; shift 2;; --relay) relay="$2"; shift 2;;
+    --v1) fmt=1; shift;;
     *) shift;; esac; done
   [ -n "$grantBack" ] || grantBack="$caps"
   # Validate caps against the known set (space-joined; reuse the registry validator).
@@ -138,46 +148,74 @@ tk_issue() {
   iss="$(rc_self_npub)"; [ -n "$iss" ] || { _tk_err "no self identity (run setup.sh)"; return 1; }
   issName="$(rc_self_name 2>/dev/null || echo agent)"
   exp="$(_tk_ttl_to_exp "$ttl")" || return 1
-  secret="$(openssl rand 32 2>/dev/null | basenc --base64url 2>/dev/null | tr -d '=' )"
-  [ -n "$secret" ] || secret="$(head -c32 /dev/urandom | basenc --base64url | tr -d '=')"
-  [ -n "$secret" ] || { _tk_err "could not generate secret"; return 1; }
+  # 43 uniform alphanumeric chars from /dev/urandom = 43·log2(62) ≈ 256 bits of entropy —
+  # same strength as the old openssl-rand-32 secret, but paste-proof (no punctuation) and
+  # short enough that `ut2_<secret>` is 47 chars. Rejection sampling via tr keeps it uniform.
+  secret="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 43)"
+  [ "${#secret}" -eq 43 ] || { _tk_err "could not generate secret"; return 1; }
   tid="t$(_tk_sha256 "$secret" | cut -c1-12)"
   # bind (if given) must be a decodable npub → store as hex for unspoofable compare.
   local bindHex=""
   if [ -n "$bind" ]; then bindHex="$(_ar_npub_to_hex "$bind")" || { _tk_err "--bind must be a valid npub"; return 1; }; fi
 
-  local capsJson grantJson relaysJson
+  local capsJson grantJson relaysJson relayUrl
   capsJson="$(printf '%s\n' $vcaps | jq -R . | jq -sc .)"
   grantJson="$(printf '%s\n' $vgrant | jq -R . | jq -sc .)"
-  relaysJson="$(jq -nc --arg r "${relay:-${RELAY_URL:-wss://nostr-relay.testnet.unicity.network}}" '[$r]')"
+  relayUrl="${relay:-${RELAY_URL:-wss://nostr-relay.testnet.unicity.network}}"
+  relaysJson="$(jq -nc --arg r "$relayUrl" '[$r]')"
 
-  # Canonical payload (embedded + signed into the event content).
-  local payload
-  payload="$(jq -nc --argjson v 1 --arg tid "$tid" --arg iss "$iss" --arg issName "$issName" \
-      --argjson relays "$relaysJson" --arg secret "$secret" --argjson caps "$capsJson" \
-      --argjson grantBack "$grantJson" --argjson exp "$exp" --arg bind "$bindHex" --arg label "$label" \
-      '{v:$v, tid:$tid, iss:$iss, issName:$issName, relays:$relays, secret:$secret, caps:$caps, grantBack:$grantBack, exp:$exp, bind:$bind, label:$label}')"
-
-  # Sign the kind-30777 event over the payload.
-  local event
-  event="$(_tk_run_helper_stdin "$payload" ticket-sign --identity "$(_tk_identity)")" || { _tk_err "ticket-sign failed"; return 1; }
+  local event eventId=""
+  if [ "$fmt" = "1" ]; then
+    # ── v1 (legacy, self-contained): payload embeds the secret; nothing touches the relay.
+    local payload
+    payload="$(jq -nc --argjson v 1 --arg tid "$tid" --arg iss "$iss" --arg issName "$issName" \
+        --argjson relays "$relaysJson" --arg secret "$secret" --argjson caps "$capsJson" \
+        --argjson grantBack "$grantJson" --argjson exp "$exp" --arg bind "$bindHex" --arg label "$label" \
+        '{v:$v, tid:$tid, iss:$iss, issName:$issName, relays:$relays, secret:$secret, caps:$caps, grantBack:$grantBack, exp:$exp, bind:$bind, label:$label}')"
+    event="$(_tk_run_helper_stdin "$payload" ticket-sign --identity "$(_tk_identity)")" || { _tk_err "ticket-sign failed"; return 1; }
+  else
+    # ── v2 (default, short): the SECRET stays out of the payload — the helper derives the
+    # d-tag/tid/sh commitment from it and encrypts the payload under a secret-derived key,
+    # so the published event reveals only issuer pubkey + hash. Publish MUST confirm (relay
+    # OK) BEFORE we record or print anything: a ticket whose event never landed is dead on
+    # arrival at redeem time, and that failure belongs HERE, loud (fail-closed).
+    local payload signIn pub
+    payload="$(jq -nc --arg iss "$iss" --arg issName "$issName" --argjson relays "$relaysJson" \
+        --argjson caps "$capsJson" --argjson grantBack "$grantJson" --argjson exp "$exp" \
+        --arg bind "$bindHex" --arg label "$label" \
+        '{iss:$iss, issName:$issName, relays:$relays, caps:$caps, grantBack:$grantBack, exp:$exp, bind:$bind, label:$label}')"
+    # The secret rides into jq via the ENVIRONMENT (env.TKSEC), not --arg: argv is
+    # world-readable through /proc/<pid>/cmdline for the process's lifetime, environ is not.
+    signIn="$(TKSEC="$secret" jq -nc --argjson p "$payload" '{secret:env.TKSEC, payload:$p}')"
+    event="$(_tk_run_helper_stdin "$signIn" ticket2-sign --identity "$(_tk_identity)")" || { _tk_err "ticket2-sign failed"; return 1; }
+    pub="$(_tk_run_helper_stdin "$event" relay-publish --relay "$relayUrl")" \
+      || { _tk_err "relay publish FAILED ($relayUrl) — ticket NOT issued (nothing recorded)"; return 1; }
+    eventId="$(printf '%s' "$pub" | jq -r '.id // ""')"
+  fi
 
   # Record HASH-ONLY (never the secret) in the pending ledger, under flock.
   _rc_write "$(_tk_tickets_file)" '
     .tickets = ((.tickets // []) + [{
-      tid:$tid, secretHash:$sh, caps:$caps, grantBack:$grantBack, bind:$bind, label:$label,
-      exp:$exp, status:"pending", createdAt:$now, redeemedBy:null, redeemedAt:"", grantSentAt:""
+      tid:$tid, v:($v|tonumber), secretHash:$sh, caps:$caps, grantBack:$grantBack, bind:$bind, label:$label,
+      exp:$exp, status:"pending", createdAt:$now, redeemedBy:null, redeemedAt:"", grantSentAt:"",
+      eventId:$eid, relay:$relay
     }])
-  ' --arg tid "$tid" --arg sh "$(_tk_sha256 "$secret")" --argjson caps "$capsJson" --argjson grantBack "$grantJson" \
+  ' --arg tid "$tid" --arg v "$fmt" --arg sh "$(_tk_sha256 "$secret")" --argjson caps "$capsJson" --argjson grantBack "$grantJson" \
     --arg bind "$bindHex" --arg label "$label" --arg exp "$(_tk_epoch_to_iso "$exp")" --arg now "$(_tk_now_iso)" \
+    --arg eid "$eventId" --arg relay "$relayUrl" \
     || { _tk_err "could not record ticket"; return 1; }
 
-  # Emit the ticket string. Keep base64url padding (basenc --decode needs it) and -w0 to
-  # produce a single unwrapped line — stripping '=' broke decode for events whose length was
-  # not a multiple of 3.
-  local eventB64; eventB64="$(printf '%s' "$event" | jq -c . | basenc --base64url -w0)"
-  printf 'unicity-ticket:v1.%s\n' "$eventB64"
-  _tk_warn "ticket $tid issued (caps: $(echo "$vcaps" | tr ' ' ','); ttl: $ttl$( [ -n "$bind" ] && echo "; bound"))." >&2
+  if [ "$fmt" = "1" ]; then
+    # Emit the self-contained v1 string. Keep base64url padding (basenc --decode needs it)
+    # and -w0 for a single unwrapped line.
+    local eventB64; eventB64="$(printf '%s' "$event" | jq -c . | basenc --base64url -w0)"
+    printf 'unicity-ticket:v1.%s\n' "$eventB64"
+  else
+    printf 'ut2_%s\n' "$secret"
+    [ "$relayUrl" = "${RELAY_URL:-wss://nostr-relay.testnet.unicity.network}" ] \
+      || _tk_warn "published to NON-DEFAULT relay $relayUrl — redeemer must pass --relay $relayUrl" >&2
+  fi
+  _tk_warn "ticket $tid issued (v$fmt; caps: $(echo "$vcaps" | tr ' ' ','); ttl: $ttl$( [ -n "$bind" ] && echo "; bound"))." >&2
   _tk_warn "This string is a BEARER credential — send it over a private channel; 'ticket.sh revoke $tid' if it leaks." >&2
 }
 
@@ -195,10 +233,11 @@ _tk_decode() {  # <ticket-string>
 # REDEEM  (redeemer side; the whole flow, works PRE-daemon via its own poll)
 # ════════════════════════════════════════════════════════════════════════════════════
 tk_redeem() {
-  local ticket="" ticketFile="" yes=0 timeout=120
+  local ticket="" ticketFile="" yes=0 timeout=120 relayOpt=""
   while [ $# -gt 0 ]; do case "$1" in
     --yes) yes=1; shift;; --timeout) timeout="$2"; shift 2;;
     --ticket-file) ticketFile="$2"; shift 2;;
+    --relay) relayOpt="$2"; shift 2;;
     -*) shift;; *) [ -z "$ticket" ] && ticket="$1"; shift;; esac; done
   # A ticket string embeds the SECRET. Prefer reading it from a file (kept 0600 by the
   # caller, e.g. setup.sh) so it never lands on this process's argv or any child's.
@@ -208,18 +247,52 @@ tk_redeem() {
   fi
   [ -n "$ticket" ] || { _tk_err "usage: redeem <ticket-string>|--ticket-file <path> [--yes] [--timeout N]"; return 1; }
 
-  local event; event="$(_tk_decode "$ticket")" || return 1
-  # Verify sig ∧ pubkey==iss BEFORE any network send (fail-closed).
-  local vf; vf="$(_tk_run_helper_stdin "$event" ticket-verify)" || { _tk_err "ticket signature INVALID — refusing to redeem"; return 1; }
-  [ "$(printf '%s' "$vf" | jq -r '.valid')" = "true" ] || { _tk_err "ticket invalid: $(printf '%s' "$vf" | jq -r '.reason // "?"')"; return 1; }
-  local payload; payload="$(printf '%s' "$vf" | jq -c '.payload')"
-  # Hard-fail an unknown ticket VERSION on the embedded payload (not just the string prefix):
-  # a v2 ticket may carry different fields/semantics we don't understand — refuse it.
-  local pv; pv="$(jq -r '.v // ""' <<<"$payload")"
-  [ "$pv" = "1" ] || { _tk_err "unsupported ticket version '${pv:-none}' (this build understands v1 only)"; return 1; }
-  local tid iss issName secret expEpoch nowEpoch
+  # Format dispatch → a verified issuer-signed payload + the bearer secret. Both paths are
+  # fail-closed BEFORE any network send to the issuer; both end in the SAME mutual-auth flow.
+  local payload="" secret="" pv=""
+  case "$ticket" in
+    ut2_*)
+      # v2 short ticket: the string IS the secret. Hard-validate the shape first so a
+      # paste-mangled ticket dies here with a human-readable reason, not a relay miss.
+      printf '%s' "$ticket" | grep -Eq '^ut2_[A-Za-z0-9]{43}$' \
+        || { _tk_err "malformed v2 ticket (want ut2_ + exactly 43 alphanumerics — paste mangled?)"; return 1; }
+      secret="${ticket#ut2_}"
+      # hash → fetch the issuer-signed kind-30777 event by #d → verify the full commitment
+      # chain (sig, d==SHA-256(secret), decrypt, sh/tid, iss==event.pubkey) in the helper.
+      local dhash relayUrl evs nEv vin vf2
+      dhash="$(_tk_sha256 "$secret")"
+      relayUrl="${relayOpt:-${RELAY_URL:-wss://nostr-relay.testnet.unicity.network}}"
+      evs="$(_tk_run_helper relay-fetch --relay "$relayUrl" --dtag "$dhash")" \
+        || { _tk_err "relay fetch FAILED ($relayUrl) — cannot resolve the ticket event (connectivity? non-default relay ⇒ pass --relay)"; return 1; }
+      nEv="$(printf '%s' "$evs" | jq '.events | length' 2>/dev/null || echo 0)"
+      [ "${nEv:-0}" -gt 0 ] \
+        || { _tk_err "no ticket event on $relayUrl for this secret (wrong/expired ticket, or issued against another relay ⇒ --relay)"; return 1; }
+      vin="$(printf '%s' "$evs" | TKSEC="$secret" jq -c '{secret:env.TKSEC, events:.events}')"  # secret via env, never argv
+      vf2="$(_tk_run_helper_stdin "$vin" ticket2-verify)" \
+        || { _tk_err "ticket event INVALID (${vf2:+reason: $(printf '%s' "$vf2" | jq -r '.reason // "?"' 2>/dev/null)}) — refusing to redeem"; return 1; }
+      [ "$(printf '%s' "$vf2" | jq -r '.valid')" = "true" ] || { _tk_err "ticket invalid: $(printf '%s' "$vf2" | jq -r '.reason // "?"')"; return 1; }
+      payload="$(printf '%s' "$vf2" | jq -c '.payload')"
+      pv="$(jq -r '.v // ""' <<<"$payload")"
+      [ "$pv" = "2" ] || { _tk_err "unsupported ticket version '${pv:-none}' on a ut2_ string"; return 1; }
+      ;;
+    unicity-ticket:v1.*)
+      # v1 legacy self-contained ticket — verify sig ∧ pubkey==iss, secret from the payload.
+      local event; event="$(_tk_decode "$ticket")" || return 1
+      local vf; vf="$(_tk_run_helper_stdin "$event" ticket-verify)" || { _tk_err "ticket signature INVALID — refusing to redeem"; return 1; }
+      [ "$(printf '%s' "$vf" | jq -r '.valid')" = "true" ] || { _tk_err "ticket invalid: $(printf '%s' "$vf" | jq -r '.reason // "?"')"; return 1; }
+      payload="$(printf '%s' "$vf" | jq -c '.payload')"
+      # Hard-fail an unknown ticket VERSION on the embedded payload (not just the string
+      # prefix): a payload we don't fully understand must be refused, not half-honored.
+      pv="$(jq -r '.v // ""' <<<"$payload")"
+      [ "$pv" = "1" ] || { _tk_err "unsupported ticket version '${pv:-none}' inside a v1 wrapper"; return 1; }
+      secret="$(jq -r '.secret' <<<"$payload")"
+      ;;
+    *) _tk_err "not a recognized ticket (expected ut2_… or unicity-ticket:v1.…)"; return 1;;
+  esac
+  [ -n "$secret" ] && [ -n "$payload" ] || { _tk_err "internal: empty secret/payload after verify"; return 1; }
+  local tid iss issName expEpoch nowEpoch
   tid="$(jq -r '.tid' <<<"$payload")"; iss="$(jq -r '.iss' <<<"$payload")"
-  issName="$(jq -r '.issName' <<<"$payload")"; secret="$(jq -r '.secret' <<<"$payload")"
+  issName="$(jq -r '.issName' <<<"$payload")"
   expEpoch="$(jq -r '.exp' <<<"$payload")"; nowEpoch="$(_tk_now_epoch)"
   [ "$expEpoch" -gt "$nowEpoch" ] 2>/dev/null || { _tk_err "ticket EXPIRED"; return 1; }
   local issHex; issHex="$(_ar_npub_to_hex "$iss")" || { _tk_err "ticket issuer npub undecodable"; return 1; }
@@ -449,8 +522,18 @@ tk_self_test() {
   local p; p="$(jq -nc --arg iss "$iss" '{v:1,tid:"tselftest0001",iss:$iss,issName:"self",relays:["wss://x"],secret:"x",caps:["consult"],grantBack:["consult"],exp:9999999999,bind:"",label:"self"}')"
   local ev; ev="$(_tk_run_helper_stdin "$p" ticket-sign --identity "$id")"
   local ok; ok="$(_tk_run_helper_stdin "$ev" ticket-verify | jq -r .valid)"
+  # v2: sign → stub-publish → stub-fetch → verify, entirely inside the temp dir.
+  local sec2 p2 ev2 evs2 ok2
+  sec2="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 43)"
+  p2="$(TKSEC="$sec2" jq -nc --arg iss "$iss" '{secret:env.TKSEC, payload:{iss:$iss,issName:"self",relays:["wss://x"],caps:["consult"],grantBack:["consult"],exp:9999999999,bind:"",label:"self2"}}')"
+  ev2="$(_tk_run_helper_stdin "$p2" ticket2-sign --identity "$id")"
+  TICKET_RELAY_STUB="$tmp/relay" _tk_run_helper_stdin "$ev2" relay-publish >/dev/null 2>&1
+  evs2="$(TICKET_RELAY_STUB="$tmp/relay" _tk_run_helper relay-fetch --dtag "$(_tk_sha256 "$sec2")" 2>/dev/null)"
+  ok2="$(_tk_run_helper_stdin "$(printf '%s' "$evs2" | jq -c --arg s "$sec2" '{secret:$s,events:.events}')" ticket2-verify 2>/dev/null | jq -r .valid)"
   rm -rf "$tmp"
-  [ "$ok" = "true" ] && echo "self-test OK (sign→verify round-trip)" || { echo "self-test FAILED"; return 1; }
+  [ "$ok" = "true" ] && [ "$ok2" = "true" ] \
+    && echo "self-test OK (v1 sign→verify + v2 sign→publish→fetch→verify round-trips)" \
+    || { echo "self-test FAILED (v1=$ok v2=$ok2)"; return 1; }
 }
 
 # ── CLI dispatch (only when executed directly, not when sourced) ──────────────────────
@@ -467,7 +550,7 @@ _tk_cli() {
     ingest-deny)   tk_ingest_deny   "${1:--}";;
     self-test)     tk_self_test;;
     decode)        _tk_decode "${1:-}";;
-    *) echo "usage: ticket.sh {issue|redeem|list|revoke|reap|ingest-redeem|ingest-grant|ingest-deny|self-test} …" >&2; return 1;;
+    *) echo "usage: ticket.sh {issue [--v1]|redeem [--relay url]|list|revoke|reap|ingest-redeem|ingest-grant|ingest-deny|self-test} …" >&2; return 1;;
   esac
 }
 if [ "${BASH_SOURCE[0]:-$0}" = "${0}" ]; then
