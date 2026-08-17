@@ -253,26 +253,42 @@ Messages are delivered through three channels with automatic fallback:
 - **`/team-publish [teamId] <fact>`** — Distill + broadcast a knowledge card to the team
 - **`/team-dissolve <teamId>`** — Retire a team with a retrospective
 
-### Master-Manager Coordination (owner-in-the-loop, default-deny)
+### Agent Coordination (owner-in-the-loop, default-deny)
 
-This instance (**cryptohog-concierge-dev**) is the **master manager** of the concierge
-project: Claude agents on other hosts coordinate through it. Every inbound agent message
-is routed by `classify-inbound.sh` against an **authorized-agents registry**
-(`.claude/hooks/agent-registry.sh`, keyed by the sender's unspoofable **pubkey**):
+**Who this instance is comes from `.claude/agent/config.json`** — `agent_nametag` is this
+agent's own name, and a recorded coordinator (if any) names the peer that holds the
+holistic full-stack view. Read that file before acting on coordination traffic; do **not**
+assume this instance is the hub. Two roles exist, and the mechanism below is identical for
+both:
+
+- **Coordinator** — peers consult it; it answers with `/coordinator-advise`, arbitrates
+  splits, and reconciles conflicts as integrator.
+- **Participant** — coordinates peer-to-peer and escalates holistic or cross-repo
+  questions to the recorded coordinator with `/consult-coordinator`.
+
+Every inbound agent message is routed by `classify-inbound.sh` against an
+**authorized-agents registry** (`.claude/hooks/agent-registry.sh`, keyed by the sender's
+unspoofable **pubkey**):
 
 - **Unknown/pending** → surfaced to you for a decision; **nothing is acted upon**.
 - **Authorized** → the request is queued and dispatched (via `/process-agent-requests`)
   to a subagent scoped to *only* that agent's granted capabilities.
 - **Denied** → dropped.
 
-Capabilities are an explicit enum: `read-status`, `chat`, `dev-advice`,
-`rebuild-reload-service`, `review-merge-pr` (the last two are request-only — they still
-need your confirmation to execute), plus the team caps `team-coordinate`, `task-bid`,
-`knowledge-share` (non-destructive; see below). Inbound (pre-dispatch) and outbound
-(`/dm-agent`) message bodies are also run through the **SIF content-guard**
-(`sif-guard.sh`) — flagged inbound is quarantined for your review, flagged outbound is not
-sent; off by default, fail-open on dev / fail-closed in prod. Full model:
-**`docs/agent-coordination.md`**.
+Capabilities are an explicit enum. The authoritative list is `AGENT_CAPABILITIES` in
+`.claude/hooks/agent-registry.sh`; it falls into three groups:
+
+- **Direct** — `read-status`, `chat`, `dev-advice`, plus `rebuild-reload-service` and
+  `review-merge-pr`. The last two are request-only: they still need your confirmation to
+  execute.
+- **Remote coordination** — `self-directed`, `consult`, `claim-area`. These drive
+  peer-to-peer consults and advisory work-area claims; claims are soft and never forbid.
+- **Teams** — `team-coordinate`, `task-bid`, `knowledge-share` (non-destructive; see below).
+
+Inbound (pre-dispatch) and outbound (`/dm-agent`) message bodies are also run through the
+**SIF content-guard** (`sif-guard.sh`) — flagged inbound is quarantined for your review,
+flagged outbound is not sent; off by default, fail-open on dev / fail-closed in prod. Full
+model: **`docs/agent-coordination.md`**.
 
 ### Self-Organizing Teams (Contract-Net over A2A)
 
