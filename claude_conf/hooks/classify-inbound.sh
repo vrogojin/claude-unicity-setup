@@ -60,6 +60,18 @@ if [ -f "$CONFIG_FILE" ]; then
   OWNER_NAMETAG=$(jq -r '.owner_nametag // ""' "$CONFIG_FILE" 2>/dev/null || echo "")
 fi
 
+# --- Resolve OUR OWN transport pubkey (identity.json sits beside config.json) ---
+# `a2a verify` with no --peer round-trips a probe DM to our OWN npub as a liveness self-test.
+# That self-DM is not a peer and not an authorization request, so it must be dropped before
+# the authz pipeline — otherwise every self-test raises a phantom unknown-agent gate.
+SELF_HEX=""
+IDENTITY_FILE="$(dirname "$CONFIG_FILE")/identity.json"
+if [ -f "$IDENTITY_FILE" ]; then
+  SELF_HEX=$(jq -r '.public_key // ""' "$IDENTITY_FILE" 2>/dev/null || echo "")
+  # x-only (Nostr) pubkey = drop the 33-byte compressed-secp256k1 prefix (02/03) if present
+  [ "${#SELF_HEX}" -eq 66 ] && SELF_HEX="${SELF_HEX:2}"
+fi
+
 now_iso() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 
 # Rebuild the owner-facing pending-authorization surface from the registry (source
@@ -234,6 +246,13 @@ while [ "$i" -lt "$TOTAL" ]; do
   fi
 
   AUTHZJSON=""
+
+  # --- Self: a self-DM (our own transport pubkey) is the `a2a verify` probe, not a peer.
+  # Skip it entirely — no authz stamp, no pending entry, no gate. Prevents the phantom
+  # unknown-agent authorization request that the no-peer self-test would otherwise raise. ---
+  if [ -n "$SELF_HEX" ] && [ "$FROM" = "$SELF_HEX" ]; then
+    continue
+  fi
 
   # --- Owner: never enters the agent-authorization pipeline ---
   if [ "$PRI" = "true" ] \
