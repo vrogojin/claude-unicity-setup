@@ -14,6 +14,7 @@ Custom slash commands for managing parallel agent workflows across the Unicity e
 | `/update-issue <number> [message]` | Push branch and post progress update on a GitHub issue |
 | `/steelman [branch]` | Adversarial review — try to break code before it ships |
 | `/roadmap-sync [--dry-run]` | Reconcile `docs/ROADMAP.md` ⇄ the GitHub Project board (four-state model) |
+| `/a2a <op> …` | **Turnkey A2A** — one exact command per op (issue/redeem/ingest/check/dm/consult/advise/verify/authorize/onboard); all resolution baked in. Umbrella over the coordination skills below |
 | `/check-messages` | Read agent messages (owner DMs + `UNICITY_DEV_AGENTS` group) |
 | `/dm-owner <message>` | Send a DM to the configured owner |
 | `/dm-agent <name-or-npub> <message>` | DM another Claude agent (first-contact handshake) |
