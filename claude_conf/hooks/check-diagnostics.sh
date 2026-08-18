@@ -120,18 +120,20 @@ fi
 TL_STATE="$STATE_DIR/task-lifecycle.json"
 if [ -f "$TL_STATE" ]; then
   TL_TTL="${RC_STOP_TTL_HOURS:-72}"; case "$TL_TTL" in ''|*[!0-9]*) TL_TTL=72;; esac
-  TL_CUTOFF="$(date -u -d "-${TL_TTL} hours" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "1970-01-01T00:00:00Z")"
-  TL_PENDING="$(jq -r --arg c "$TL_CUTOFF" '
-    [ .tasks[]?
-      | select((.status=="open" or .status=="ticketed")
-               and (.pr != null)
-               and ((.started_at // "") == "" or (.started_at) > $c)) ]
-    | length' "$TL_STATE" 2>/dev/null)"
+  # GNU date first, BSD/macOS `-v` second, epoch last. Without a BSD fallback the
+  # cutoff would collapse to 1970 on macOS and OVER-block every shipped task
+  # forever (open records are never reaped) — defeating the anti-wedge TTL.
+  TL_CUTOFF="$(date -u -d "-${TL_TTL} hours" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+    || date -u -v-"${TL_TTL}"H +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+    || echo "1970-01-01T00:00:00Z")"
+  # A record blocks only if: still live, actually shipped (PR present and NOT a
+  # rejected/closed PR), and FRESH (a missing started_at is treated as stale, not
+  # fresh — it must never bypass the TTL and wedge Stop indefinitely).
+  TL_SEL='(.status=="open" or .status=="ticketed") and (.pr != null) and ((.pr_state // "") != "CLOSED") and ((.started_at // "") != "" and (.started_at) > $c)'
+  TL_PENDING="$(jq -r --arg c "$TL_CUTOFF" "[ .tasks[]? | select($TL_SEL) ] | length" "$TL_STATE" 2>/dev/null)"
   if [ "${TL_PENDING:-0}" -gt 0 ] 2>/dev/null; then
-    TL_DETAILS="$(jq -r --arg c "$TL_CUTOFF" '
-      .tasks[]?
-      | select((.status=="open" or .status=="ticketed") and (.pr != null)
-               and ((.started_at // "") == "" or (.started_at) > $c))
+    TL_DETAILS="$(jq -r --arg c "$TL_CUTOFF" "
+      .tasks[]? | select($TL_SEL)"'
       | "  • " + (.title_guess // .task_id) + " — branch " + (.branch // "?")
         + " · PR #" + ((.pr)|tostring)
         + (if (.ticket != null) then " · ticket #" + ((.ticket)|tostring) else " · no ticket yet" end)' \

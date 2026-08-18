@@ -12,7 +12,8 @@
 #       Search open+closed issues for an existing ticket. Marker match first
 #       (exact, survives title edits), then keyword match (>= half the keywords
 #       present in title/body). Prints matching issue number(s), one per line,
-#       most-recent first.  Exit 0 = at least one match printed; 1 = none.
+#       most-recent first.  Exit 0 = at least one match printed; 1 = none;
+#       2 = usage / gh absent.
 #
 #   ticketer.sh create  --title T (--body-file F | --body S) --task-id <id> [--label L]
 #       Idempotent create. FIRST runs `find --task-id`; on a hit it degrades to a
@@ -22,7 +23,8 @@
 #       `agent:auto` label (+ any --label); bumps the day counter. Prints the new
 #       issue number.
 #       Exit 0 = created or deduped-to-comment; 3 = daily cap reached (nothing
-#       created — caller should fall back to ONE digest, per §4.4); 2 = usage.
+#       created — caller should fall back to ONE digest, per §4.4); 2 = usage;
+#       5 = gh create failed/unparseable (reservation rolled back).
 #
 #   ticketer.sh comment <n> (--body-file F | --body S)
 #       Post a progress comment. Exit 0 ok, 2 usage, 5 gh failure.
@@ -70,20 +72,47 @@ _tk_max_per_day() {
 }
 _tk_today() { printf '%s' "${TICKETER_TODAY:-$(date -u +%F)}"; }
 _tk_counter_file() { printf '%s/automation/tickets-created-%s' "$STATE_DIR" "$(_tk_today)"; }
-_tk_count_used() { local f; f="$(_tk_counter_file)"; [ -f "$f" ] && tr -dc '0-9' < "$f" 2>/dev/null || printf '0'; }
+# Empty / corrupt (non-digit) counter file normalizes to 0 — an empty file must
+# not read as "" (which would make the cap comparison error out and be treated as
+# under-cap, silently bypassing the cap).
+_tk_count_used() {
+  local f v; f="$(_tk_counter_file)"
+  v="$( [ -f "$f" ] && tr -dc '0-9' < "$f" 2>/dev/null )"
+  printf '%s' "${v:-0}"
+}
 
-# Atomically bump today's counter under flock. Prints the new value.
-_tk_count_bump() {
-  local f lock cur new
+# Atomically RESERVE one slot against today's cap: the read, the cap check, AND the
+# bump all happen inside ONE flock'd critical section, so two concurrent creators
+# (F2 task work + an F3 nightly sweep is exactly this) can't both slip past the cap
+# via a check-then-act TOCTOU. Returns 0 = reserved (counter bumped), 1 = cap
+# already reached (counter untouched).
+_tk_reserve() {
+  local f lock cur max new
   f="$(_tk_counter_file)"; mkdir -p "$(dirname "$f")" 2>/dev/null || true
-  lock="$f.lock"
-  exec 8>"$lock" 2>/dev/null || { _tk_err "cannot lock counter"; return 1; }
+  lock="$f.lock"; max="$(_tk_max_per_day)"
+  exec 8>"$lock" 2>/dev/null || { _tk_err "cannot open counter lock — refusing create"; return 1; }
   flock 8 2>/dev/null || true
-  cur="$( [ -f "$f" ] && tr -dc '0-9' < "$f" 2>/dev/null || printf '0' )"; [ -n "$cur" ] || cur=0
+  cur="$( [ -f "$f" ] && tr -dc '0-9' < "$f" 2>/dev/null )"; [ -n "$cur" ] || cur=0
+  if [ "$cur" -ge "$max" ] 2>/dev/null; then flock -u 8 2>/dev/null; return 1; fi
   new=$((cur + 1))
-  printf '%s' "$new" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" 2>/dev/null || { _tk_err "counter write failed"; flock -u 8 2>/dev/null; return 1; }
+  printf '%s' "$new" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" 2>/dev/null \
+    || { _tk_err "counter write failed"; flock -u 8 2>/dev/null; return 1; }
   flock -u 8 2>/dev/null || true
-  printf '%s' "$new"
+  return 0
+}
+
+# Roll back a reservation when the create that consumed it fails (floor 0), so a
+# committed side effect (issue) and the counter never skew.
+_tk_unreserve() {
+  local f lock cur new
+  f="$(_tk_counter_file)"; lock="$f.lock"
+  exec 8>"$lock" 2>/dev/null || return 0
+  flock 8 2>/dev/null || true
+  cur="$( [ -f "$f" ] && tr -dc '0-9' < "$f" 2>/dev/null )"; [ -n "$cur" ] || cur=0
+  new=$((cur - 1)); [ "$new" -lt 0 ] && new=0
+  printf '%s' "$new" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" 2>/dev/null
+  flock -u 8 2>/dev/null || true
+  return 0
 }
 
 # --- helpers to read a --flag value out of the remaining argv ---
@@ -130,9 +159,11 @@ _tk_find() {
   local all; all="$(_tk_list_all)"
   local hits=""
 
-  # 1. Marker match (exact) — the authoritative dedup key.
+  # 1. Marker match — the authoritative dedup key. Match the FULLY-DELIMITED marker
+  #    ("unicity-task: <id> -->") so a prefix id can't collide with a longer one
+  #    (searching bare "unicity-task: t1" would also hit "unicity-task: t10 -->").
   if [ -n "$task_id" ]; then
-    hits="$(printf '%s' "$all" | jq -r --arg m "unicity-task: $task_id" \
+    hits="$(printf '%s' "$all" | jq -r --arg m "unicity-task: $task_id -->" \
       '[.[] | select((.body // "") | contains($m))] | sort_by(.number) | reverse | .[].number' 2>/dev/null)"
   fi
 
@@ -198,28 +229,32 @@ _tk_create() {
   existing="$(_tk_find --task-id "$task_id" 2>/dev/null | head -1)"
   if [ -n "$existing" ]; then
     _tk_err "dedup: task $task_id already tracked by #$existing → commenting"
-    local cbody
-    cbody="$(printf '%s\n\n%s' "${body:-work continues}" "$MARKER_PREFIX $task_id -->")"
-    printf '%s' "$cbody" | gh issue comment "$existing" --body-file - >/dev/null 2>&1 || true
+    printf '%s' "${body:-work continues}" | gh issue comment "$existing" --body-file - >/dev/null 2>&1 || true
     printf '%s\n' "$existing"
     return 0
   fi
 
-  # CAP: refuse beyond the shared daily cap (distinct exit 3 → digest fallback).
-  local used max; used="$(_tk_count_used)"; max="$(_tk_max_per_day)"
-  if [ "$used" -ge "$max" ] 2>/dev/null; then
-    _tk_err "daily cap reached ($used/$max) — not creating; caller should digest"
+  # CAP: atomically reserve a slot (check+bump in one locked section) BEFORE the
+  # create, so two concurrent creators can't both slip past the cap. Distinct exit
+  # 3 → the caller falls back to a single digest (§4.4).
+  if ! _tk_reserve; then
+    _tk_err "daily cap reached ($(_tk_count_used)/$(_tk_max_per_day)) — not creating; caller should digest"
     return 3
   fi
 
   # Embed the marker so future find --task-id dedups even after a title edit.
   local full; full="$(printf '%s\n\n%s' "$body" "$MARKER_PREFIX $task_id -->")"
-  local url num
-  url="$(printf '%s' "$full" | gh issue create --title "$title" --body-file - 2>/dev/null | tail -1)"
-  num="$(printf '%s' "$url" | grep -oE '[0-9]+$')"
-  [ -n "$num" ] || { _tk_err "gh issue create failed (no issue number in output: '$url')"; return 5; }
+  local out num
+  out="$(printf '%s' "$full" | gh issue create --title "$title" --body-file - 2>/dev/null)"
+  # Parse the issue number defensively: pick the issues/<n> path segment (immune to
+  # a trailing slash or extra gh stdout lines), not just a trailing integer.
+  num="$(printf '%s' "$out" | grep -oE 'issues/[0-9]+' | grep -oE '[0-9]+' | tail -1)"
+  if [ -z "$num" ]; then
+    _tk_err "gh issue create failed / unparseable (output: '$out') — rolling back reservation"
+    _tk_unreserve
+    return 5
+  fi
 
-  _tk_count_bump >/dev/null || true
   _tk_ensure_label "agent:auto"; _tk_add_label "$num" "agent:auto"
   if [ -n "$extra_label" ]; then _tk_ensure_label "$extra_label"; _tk_add_label "$num" "$extra_label"; fi
 
@@ -279,7 +314,8 @@ _tk_board() {
     | ( [ $o[] | select((.name|ascii_downcase)==$wl) ][0]
         // ( if ($wl|test("progress")) then [ $o[] | select((.name|ascii_downcase)|test("progress")) ][0]
              elif ($wl|test("done|complete|merged")) then [ $o[] | select((.name|ascii_downcase)|test("done|complete")) ][0]
-             elif ($wl|test("paus|hold|review|block")) then [ $o[] | select((.name|ascii_downcase)|test("paus|hold|review|block")) ][0]
+             elif ($wl|test("review")) then [ $o[] | select((.name|ascii_downcase)|test("review")) ][0]
+             elif ($wl|test("paus|hold|block")) then [ $o[] | select((.name|ascii_downcase)|test("paus|hold|block|review")) ][0]
              elif ($wl|test("backlog|todo|open")) then [ $o[] | select((.name|ascii_downcase)|test("backlog|todo")) ][0]
              else null end ) )
     | .id // empty' 2>/dev/null)"

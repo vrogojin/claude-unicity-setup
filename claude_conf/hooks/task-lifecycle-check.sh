@@ -50,32 +50,41 @@ if [ -z "$EVENT" ]; then
   if printf '%s' "$INPUT" | jq -e '.prompt' >/dev/null 2>&1; then EVENT="UserPromptSubmit"; else EVENT="PostToolUse"; fi
 fi
 
-# Read the current state (or an empty machine). Emitted on stdout.
+# CRITICAL SECTION: the whole read-modify-write must be serialized, not just the
+# write — a UserPromptSubmit and an async PostToolUse can run concurrently, and a
+# write-only lock would let them read one baseline and clobber each other (lost
+# update: a branch-binding or a fresh task record vanishes). Callers _tl_lock
+# before _tl_read and _tl_unlock after _tl_write; the lock is held across the
+# entire section. flock is released automatically on process death.
+_tl_lock()   { exec 7>"$LOCK" 2>/dev/null || return 1; flock 7 2>/dev/null || true; return 0; }
+_tl_unlock() { flock -u 7 2>/dev/null || true; exec 7>&- 2>/dev/null || true; }
+
+# Read the current state (or an empty machine). Caller holds the lock. On stdout.
 _tl_read() {
   if [ -f "$STATE_FILE" ]; then jq -c '.' "$STATE_FILE" 2>/dev/null || echo '{"tasks":[]}'
   else echo '{"tasks":[]}'; fi
 }
 
-# Write state atomically under flock. Reads new JSON from stdin.
+# Write state (caller holds the lock). Unique tmp per pid so a lock-less fallback
+# can never interleave two writers into one tmp file. Reads new JSON from stdin.
 _tl_write() {
-  local new; new="$(cat)"
+  local new tmp; new="$(cat)"
   printf '%s' "$new" | jq -e '.' >/dev/null 2>&1 || return 1
-  exec 7>"$LOCK" 2>/dev/null || return 1
-  flock 7 2>/dev/null || true
-  printf '%s' "$new" > "$STATE_FILE.tmp" 2>/dev/null && mv "$STATE_FILE.tmp" "$STATE_FILE" 2>/dev/null
-  local rc=$?
-  flock -u 7 2>/dev/null || true
-  return $rc
+  tmp="$STATE_FILE.$$.tmp"
+  printf '%s' "$new" > "$tmp" 2>/dev/null && mv "$tmp" "$STATE_FILE" 2>/dev/null
 }
 
-# Reap terminal (complete|dismissed) records older than 14 days. Operates on a
-# JSON string arg, prints the reaped JSON.
+# Reap terminal (complete|dismissed) records older than 14 days. A single
+# malformed timestamp must not abort the whole reap (try/catch per record → treat
+# an unparseable stamp as "now", i.e. keep it rather than drop it). JSON string
+# arg in, reaped JSON out.
 _tl_reap() {
   printf '%s' "$1" | jq --arg now "$NOW" '
-    def age($t): (($now|fromdateiso8601) - (($t // $now)|fromdateiso8601));
+    ($now|fromdateiso8601) as $n
+    | def epoch($t): (try (($t // $now)|fromdateiso8601) catch $n);
     .tasks |= map(select(
       (.status != "complete" and .status != "dismissed")
-      or (age(.completed_at // .started_at) < (14*86400))
+      or (epoch(.completed_at // .started_at) > ($n - 14*86400))
     ))' 2>/dev/null || printf '%s' "$1"
 }
 
@@ -92,6 +101,10 @@ if [ "$EVENT" = "UserPromptSubmit" ]; then
   KW_JSON="$(printf '%s' "$KEYWORDS" | sed '/^$/d' | jq -R . 2>/dev/null | jq -s -c . 2>/dev/null)"
   [ -n "$KW_JSON" ] || KW_JSON='[]'
 
+  # One locked critical section around read→decide→write. If we cannot take the
+  # lock at all, skip silently (advisory hook) — nudging WITHOUT recording would
+  # re-fire on every prompt, which is worse than staying quiet this once.
+  _tl_lock || exit 0
   STATE="$(_tl_read)"
   STATE="$(_tl_reap "$STATE")"
 
@@ -100,14 +113,16 @@ if [ "$EVENT" = "UserPromptSubmit" ]; then
   if [ -n "$REC" ]; then
     ST="$(printf '%s' "$REC" | jq -r '.status // "open"' 2>/dev/null)"
     if [ "$ST" = "dismissed" ]; then
-      # Suppress re-prompting for these keywords for 24 h after a dismissal.
+      # Suppress re-prompting for these keywords for 24 h after a dismissal. If the
+      # stamp can't be parsed (non-GNU date), treat as still-suppressed rather than
+      # spam a re-nudge.
       DIS="$(printf '%s' "$REC" | jq -r '.completed_at // .started_at // ""' 2>/dev/null)"
       DTS=0; [ -n "$DIS" ] && DTS="$(date -d "$DIS" +%s 2>/dev/null || echo 0)"
-      if [ $((NOW_TS - DTS)) -lt 86400 ] 2>/dev/null; then exit 0; fi
+      if [ "$DTS" = 0 ] || [ $((NOW_TS - DTS)) -lt 86400 ] 2>/dev/null; then _tl_unlock; exit 0; fi
       # Older than 24 h → allow re-open below by treating as new.
     else
       # Already tracked and live → nudge exactly once (already nudged on open).
-      exit 0
+      _tl_unlock; exit 0
     fi
   fi
 
@@ -119,6 +134,7 @@ if [ "$EVENT" = "UserPromptSubmit" ]; then
                branch:null, ticket:null, pr:null, pr_state:null,
                started_at:$now, completed_at:null, nudged_at:$now} ])' 2>/dev/null)"
   [ -n "$NEW" ] && printf '%s' "$NEW" | _tl_write
+  _tl_unlock
 
   KW_HINT="$(printf '%s' "$KEYWORDS" | sed '/^$/d' | head -3 | tr '\n' ' ' | sed 's/ $//')"
   CTX="TASK-LIFECYCLE (advisory): this prompt reads as a new task. Run /task-start to (1) judge whether it is really a task, (2) recall prior work on it (/recall-prior-work $KW_HINT), (3) if prior art exists, build ON TOP of it rather than replicate, and (4) find or open its tracking ticket. Skip if this is a question or a trivial tweak."
@@ -135,15 +151,21 @@ HEAD_SHA="$(git rev-parse HEAD 2>/dev/null)"
 
 # HEAD-move dedup: the full evaluation (git + gh) only runs when HEAD moves — cheap
 # on the overwhelming majority of Bash calls (same trick as roadmap-sync-check.sh).
+# The marker is advanced only AFTER the work completes (bottom of the file), so a
+# crash/timeout mid-run leaves this HEAD un-marked and the bind/PR-detect retryable.
 LAST_HEAD=""; [ -f "$HEAD_MARK" ] && LAST_HEAD="$(cat "$HEAD_MARK" 2>/dev/null)"
 [ "$LAST_HEAD" = "$HEAD_SHA" ] && exit 0
-printf '%s' "$HEAD_SHA" > "$HEAD_MARK" 2>/dev/null || true
 
 # Only tasks currently in flight matter.
-[ -f "$STATE_FILE" ] || exit 0
+[ -f "$STATE_FILE" ] || { printf '%s' "$HEAD_SHA" > "$HEAD_MARK" 2>/dev/null || true; exit 0; }
+_tl_lock || exit 0
 STATE="$(_tl_read)"; STATE="$(_tl_reap "$STATE")"
 HAS_LIVE="$(printf '%s' "$STATE" | jq -r '[.tasks[] | select(.status=="open" or .status=="ticketed")] | length' 2>/dev/null)"
-[ "${HAS_LIVE:-0}" -gt 0 ] 2>/dev/null || { printf '%s' "$STATE" | _tl_write; exit 0; }
+if [ "${HAS_LIVE:-0}" -le 0 ] 2>/dev/null; then
+  printf '%s' "$STATE" | _tl_write; _tl_unlock
+  printf '%s' "$HEAD_SHA" > "$HEAD_MARK" 2>/dev/null || true
+  exit 0
+fi
 
 # Base ref + current branch.
 BASE_REF=""
@@ -156,10 +178,12 @@ CHANGED=false
 if [ -n "$BRANCH" ] && [ "$BRANCH" != "HEAD" ] && [ "$BRANCH" != "$BASE_REF" ]; then
   # Confirm the branch actually carries commits vs the base (real work, not just a
   # checkout) — mirrors roadmap-sync's three-dot scoping.
-  HAS_COMMITS=1
+  # Require a discoverable base AND real commits over it — a bare checkout of an
+  # empty feature branch must not bind a task. No base ref → don't bind.
+  HAS_COMMITS=0
   if [ -n "$BASE_REF" ]; then
     CNT="$(git rev-list --count "$BASE_REF..HEAD" 2>/dev/null || echo 0)"
-    [ "${CNT:-0}" -gt 0 ] 2>/dev/null || HAS_COMMITS=0
+    [ "${CNT:-0}" -gt 0 ] 2>/dev/null && HAS_COMMITS=1
   fi
   if [ "$HAS_COMMITS" = "1" ]; then
     # Is this branch already bound to some task?
@@ -180,7 +204,9 @@ if command -v gh >/dev/null 2>&1; then
   # Every live task with a bound branch we haven't already resolved a PR for.
   while IFS= read -r tb; do
     [ -n "$tb" ] || continue
-    PRJSON="$(gh pr view "$tb" --json number,state 2>/dev/null)"
+    # `timeout` bounds a hung gh so we never hold the state lock past the hook's
+    # own timeout. (git forbids refnames starting with '-', so no option injection.)
+    PRJSON="$(timeout 8 gh pr view "$tb" --json number,state 2>/dev/null)"
     PNUM="$(printf '%s' "$PRJSON" | jq -r '.number // empty' 2>/dev/null)"
     PSTATE="$(printf '%s' "$PRJSON" | jq -r '.state // empty' 2>/dev/null)"
     [ -n "$PNUM" ] || continue
@@ -194,6 +220,10 @@ EOF
 fi
 
 printf '%s' "$STATE" | _tl_write
+_tl_unlock
+# Work committed — NOW advance the HEAD marker so a crash before here would have
+# left this HEAD retryable rather than silently skipped.
+printf '%s' "$HEAD_SHA" > "$HEAD_MARK" 2>/dev/null || true
 
 # Notify once per HEAD when a shipped-but-unclosed task first appears (advisory;
 # the real enforcement is Stop gate #15). Keyed on HEAD so we nudge only on change.

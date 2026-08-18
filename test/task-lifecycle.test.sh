@@ -181,6 +181,12 @@ chk "dedup returns the existing number (#7)" "[ \"\$OUTC\" = 7 ]"
 chk "dedup exit 0" "[ $RCC -eq 0 ]"
 chk "dedup did NOT call issue create" "! grep -q 'issue create' \"$TMP/gh/calls.log\""
 chk "dedup DID call issue comment" "grep -q 'issue comment' \"$TMP/gh/calls.log\""
+# Substring-collision guard: task id "t1" must NOT dedup onto issue carrying "t10".
+: > "$TMP/gh/calls.log"; echo '200' > "$TMP/gh/next-issue"
+printf '[{"number":8,"title":"ten","body":"x <!-- unicity-task: t10 --> y","state":"open"}]' > "$TMP/gh/issue-list.json"
+OUTS="$(bash "$TICKETER" create --title "One" --body "b" --task-id t1)"
+chk "prefix id t1 does NOT dedup onto t10 (creates #200)" "[ \"\$OUTS\" = 200 ]"
+chk "prefix id t1 DID call issue create" "grep -q 'issue create' \"$TMP/gh/calls.log\""
 
 echo "== T6: ticketer daily cap — exit 3 beyond max_new_tickets_per_day =="
 echo '[]' > "$TMP/gh/issue-list.json"      # no dedup matches → real creates
@@ -216,6 +222,14 @@ OLD="$(date -u -d '-100 hours' +%FT%TZ 2>/dev/null || echo 2000-01-01T00:00:00Z)
 printf '{"tasks":[{"task_id":"g3","title_guess":"t","keywords":["x"],"status":"open","branch":"feat/x","ticket":9,"pr":42,"pr_state":"OPEN","started_at":"%s","completed_at":null}]}' "$OLD" > "$TL"
 D4="$(printf '%s' "$STOP" | bash "$DIAG" 2>/dev/null)"
 chk "stale shipped task past TTL does not wedge" "! printf '%s' \"\$D4\" | grep -q task-complete"
+# A CLOSED (rejected) PR is not "shipped" → must NOT block.
+printf '{"tasks":[{"task_id":"g4","title_guess":"t","keywords":["x"],"status":"open","branch":"feat/x","ticket":9,"pr":42,"pr_state":"CLOSED","started_at":"%s","completed_at":null}]}' "$NOW" > "$TL"
+D5="$(printf '%s' "$STOP" | bash "$DIAG" 2>/dev/null)"
+chk "closed (rejected) PR does not block" "! printf '%s' \"\$D5\" | grep -q task-complete"
+# A record with a missing started_at is treated as STALE, not fresh → must NOT wedge.
+printf '{"tasks":[{"task_id":"g5","title_guess":"t","keywords":["x"],"status":"open","branch":"feat/x","ticket":9,"pr":42,"pr_state":"OPEN","completed_at":null}]}' > "$TL"
+D6="$(printf '%s' "$STOP" | bash "$DIAG" 2>/dev/null)"
+chk "missing started_at treated as stale (no wedge)" "! printf '%s' \"\$D6\" | grep -q task-complete"
 
 echo
 if [ "$FAIL" -eq 0 ]; then printf '\033[32mALL TASK-LIFECYCLE TESTS PASSED\033[0m\n'; else printf '\033[31mSOME TESTS FAILED\033[0m\n'; fi
