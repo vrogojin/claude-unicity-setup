@@ -323,7 +323,9 @@ a2a_emit() {  # <kind> --to <peer|--to-all-peers> [--payload J] [--consult C] [-
 # registry / peers — list / authorize / deny / onboard / caps.
 # ══════════════════════════════════════════════════════════════════════════════════════
 a2a_peers()     { bash "$A2A_REGISTRY" list "$@"; }
-a2a_authorize() { bash "$A2A_REGISTRY" authorize "$@"; }
+# `a2a authorize` is an OWNER-driven CLI (invoked from the /a2a skill, never by auto code),
+# so it carries owner-explicit intent: append --owner so it can also un-deny a denied peer.
+a2a_authorize() { bash "$A2A_REGISTRY" authorize "$@" --owner; }
 a2a_deny()      { bash "$A2A_REGISTRY" deny "$@"; }
 a2a_caps()      { bash "$A2A_REGISTRY" caps; }
 a2a_onboard()   { bash "$A2A_ONBOARD" "$@"; }
