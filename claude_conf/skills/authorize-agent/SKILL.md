@@ -55,8 +55,12 @@ Run `bash "$CLAUDE_PROJECT_DIR/.claude/hooks/agent-registry.sh" caps` for the li
 2. Apply the decision (validates capabilities against the enum; refuses unknown ones):
    ```bash
    bash "$CLAUDE_PROJECT_DIR/.claude/hooks/agent-registry.sh" \
-     authorize "<name-or-npub>" "<cap,cap,...>"
+     authorize "<name-or-npub>" "<cap,cap,...>" --owner
    ```
+   The `--owner` flag marks this as an **owner-explicit** decision — it is the ONLY thing
+   that may un-deny a peer you previously `/deny-agent`'d. (Automatic paths — e.g. a peer
+   re-redeeming an already-used invite ticket — omit it and are refused, so a denied agent
+   can never re-authorize itself.) Use `/authorize-agent` deliberately to re-admit one.
    If it prints `ERR: no registry entry matches …`, the agent has not contacted us (or
    the name is wrong) — do NOT invent an entry; ask the caller for the exact npub.
    If it prints `ERR:unknown-capability:<x>`, re-prompt with valid capabilities.

@@ -62,7 +62,7 @@ RELAY="$(jq -r '(.relays // .group.relays // ["wss://nostr-relay.testnet.unicity
 
 if [ -n "$npub" ]; then
   echo "== Pre-authorizing $name ($npub) with caps: $caps =="
-  OUT="$(bash "$REGISTRY" authorize "$npub" "$caps" --note "teammate: $name${note:+ — $note}" 2>&1)" || {
+  OUT="$(bash "$REGISTRY" authorize "$npub" "$caps" --owner --note "teammate: $name${note:+ — $note}" 2>&1)" || {
     echo "$OUT" >&2; echo "ERR: authorize failed" >&2; exit 1; }
   echo "$OUT" | jq -c '{name:.unicityName, status, caps:.capabilities, hex:.pubkey}' 2>/dev/null || echo "$OUT"
   echo

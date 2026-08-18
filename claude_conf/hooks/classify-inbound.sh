@@ -94,7 +94,14 @@ rebuild_pending_surface() {
 enqueue_workitem() {  # args: from ts body type group name npub caps_json [skill]
   local from="$1" ts="$2" body="$3" type="$4" group="$5" name="$6" npub="$7" caps="$8" skill="${9:-}"
   local id wf
-  id="$(printf '%s|%s|%s' "$from" "$ts" "$body" | sha1sum 2>/dev/null | cut -c1-16)"
+  # CONTENT-dedup key = sha1(from|body) — the TIMESTAMP is deliberately EXCLUDED.
+  # The same DM can arrive via BOTH the daemon path and the poll fallback with DIFFERENT
+  # receivedAt timestamps (live evidence: byte-identical body + md5, two `receivedAt`s →
+  # two work items). Keying on from|body collapses those to ONE item, so a duplicated
+  # consult/team-verb/ticket is never double-processed. Distinct control messages from the
+  # same sender carry distinct bodies (the verb + payload IS the body), so this never
+  # collapses genuinely-different intents.
+  id="$(printf '%s|%s' "$from" "$body" | sha1sum 2>/dev/null | cut -c1-16)"
   [ -n "$id" ] || return 0
   wf="$WORKITEMS_DIR/$id.json"
   [ -f "$wf" ] && return 0   # already queued (or already processed & left in place)

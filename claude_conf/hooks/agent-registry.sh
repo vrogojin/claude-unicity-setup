@@ -236,6 +236,71 @@ _ar_replay_deferred_for() {  # <hex>
   [ "${n:-0}" != "0" ] && echo "replayed ${n} deferred envelope(s) for ${hex}" >&2 || true
 }
 
+# --- Deny-stickiness surface (owner-in-the-loop) ----------------------------------
+# When an AUTOMATIC / ticket-driven authorize is REFUSED because the peer is currently
+# `denied`, record the blocked attempt so the Stop gate (check-diagnostics.sh) prompts the
+# owner. A denied agent can NEVER un-deny itself; only an explicit owner authorize does.
+_ar_resolve_state_dir() {  # (re)derive the per-repo STATE_DIR the SAME way every other hook does
+  # DERIVE via state-dir.sh (from the hooks path), never trust an inherited env value —
+  # check-diagnostics.sh and classify-inbound.sh both source it unconditionally, so the
+  # surface MUST land exactly where the Stop gate reads it. (An inherited STATE_DIR can be a
+  # STALE value: ticket.sh sources remote-coord → state-dir, mutating the exported var before
+  # it spawns `authorize`.) Always mkdir so a first write never fails on a missing dir.
+  local sd; sd="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)/state-dir.sh"
+  if [ -f "$sd" ]; then . "$sd" 2>/dev/null || true; fi
+  [ -n "${STATE_DIR:-}" ] || STATE_DIR="/tmp/claude"
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+}
+
+_ar_surface_denied_reauth() {  # <hex> [context-note]
+  local hex="$1" ctx="${2:-}"
+  [ -n "$hex" ] || return 0
+  _ar_resolve_state_dir
+  # NB: declare $sf on its own line — a single `local a=$X b=$a` expands $a from the OUTER
+  # scope (unset here) BEFORE the assignment, tripping `set -u`.
+  local sf="$STATE_DIR/agent-denied-reauth.json"
+  local lock="$sf.lock" tmp="$sf.tmp.$$" now name
+  now="$(_ar_now)"
+  name="$(_ar_read -r --arg k "$hex" '.agents[$k].unicityName // ""' 2>/dev/null || echo "")"
+  (
+    flock -w 5 9 2>/dev/null || true
+    [ -f "$sf" ] || printf '%s\n' '{"count":0,"items":[],"updated_at":""}' > "$sf" 2>/dev/null || true
+    if jq --arg k "$hex" --arg name "$name" --arg ctx "$ctx" --arg now "$now" '
+        ( (.items // [] | map(select(.pubkey == $k)) | first)
+          // {pubkey:$k, attempts:0, firstAt:$now} ) as $prev
+        | .items = ((.items // []) | map(select(.pubkey != $k)))
+            + [ $prev | .pubkey=$k | .unicityName=$name | .lastContext=$ctx | .lastAt=$now
+                      | .attempts=((.attempts // 0)+1) ]
+        | .count = (.items | length) | .updated_at = $now
+      ' "$sf" > "$tmp" 2>/dev/null; then
+      mv "$tmp" "$sf" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+    else rm -f "$tmp" 2>/dev/null || true; fi
+  ) 9>"$lock"
+  # Best-effort desktop / push notification (never fatal).
+  local nf; nf="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)/notify.sh"
+  if [ -f "$nf" ]; then
+    ( . "$nf" 2>/dev/null && notify "Denied agent re-auth blocked" \
+        "Denied ${hex:0:12}… attempted re-authorization via an automatic path. Explicitly re-authorize to allow." \
+        "critical" ) 2>/dev/null || true
+  fi
+}
+
+_ar_clear_denied_reauth() {  # <hex> — drop a resolved deny-reauth surface entry
+  local hex="$1"; [ -n "$hex" ] || return 0
+  _ar_resolve_state_dir
+  local sf="$STATE_DIR/agent-denied-reauth.json"
+  local lock="$sf.lock" tmp="$sf.tmp.$$"
+  [ -f "$sf" ] || return 0
+  (
+    flock -w 5 9 2>/dev/null || true
+    if jq --arg k "$hex" '
+        .items = ((.items // []) | map(select(.pubkey != $k))) | .count = (.items | length)
+      ' "$sf" > "$tmp" 2>/dev/null; then
+      mv "$tmp" "$sf" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+    else rm -f "$tmp" 2>/dev/null || true; fi
+  ) 9>"$lock"
+}
+
 # ================================================================================
 # CLI dispatch (only when executed directly, not when sourced)
 # ================================================================================
@@ -333,11 +398,23 @@ _ar_cli() {
         && registry_status "$pubkey"
       ;;
 
-    authorize)  # authorize <query> [caps] [--note <text>]
+    authorize)  # authorize <query> [caps] [--note <text>] [--owner]
+      # --owner marks an OWNER-EXPLICIT authorization — the ONLY thing that may un-deny a
+      # denied peer. Without it (every AUTOMATIC / ticket-driven caller) a currently-denied
+      # peer is REFUSED, so a denied agent can never re-authorize itself (e.g. by re-redeeming
+      # an already-used invite ticket). This default-safe posture means new auto paths inherit
+      # the block for free; only the owner skills pass --owner.
       local q="${1:-}"; shift || true
-      local caps="" note=""
-      if [ $# -gt 0 ] && [ "${1:-}" != "--note" ]; then caps="$1"; shift || true; fi
-      [ "${1:-}" = "--note" ] && { note="${2:-}"; shift 2 || true; }
+      local caps="" note="" owner=0
+      # First non-flag token after the query is the (optional) positional caps list.
+      if [ $# -gt 0 ] && [ "${1#--}" = "${1:-}" ]; then caps="${1:-}"; shift || true; fi
+      while [ $# -gt 0 ]; do
+        case "${1:-}" in
+          --note)  note="${2:-}"; shift 2 || true;;
+          --owner) owner=1; shift || true;;
+          *) shift || true;;
+        esac
+      done
       local key; key="$(_ar_resolve_key "$q")"
       [ "$key" = "__AMBIGUOUS__" ] && { echo "ERR: '$q' is ambiguous (matches multiple pubkeys — possible impersonation) — authorize by the exact pubkey or npub, not the name" >&2; return 1; }
       # PRE-AUTHORIZE-BY-NPUB: no existing entry, but the query is an npub → decode it to
@@ -357,6 +434,17 @@ _ar_cli() {
             ;;
         esac
       fi
+      # DENY IS STICKY. If this key is currently `denied`, only an OWNER-EXPLICIT authorize
+      # (--owner) may un-deny it. Every automatic path (ticket redeem / finalize-grant /
+      # re-redeem, and any future non-owner auto-auth) omits --owner, so it is REFUSED here
+      # and the attempt is surfaced to the owner. This is the un-bypassable chokepoint: the
+      # check is the DEFAULT for `authorize`, so no auto caller can route around it.
+      local curstatus; curstatus="$(_ar_read -r --arg k "$key" '.agents[$k].status // "unknown"')"
+      if [ "$curstatus" = "denied" ] && [ "$owner" != "1" ]; then
+        _ar_surface_denied_reauth "$key" "$note"
+        echo "REFUSED: ${key:0:12}… is DENIED — automatic re-authorization blocked; the owner must explicitly re-authorize (denied agent attempted re-authorization, e.g. via ticket re-redeem)." >&2
+        return 3
+      fi
       local vcaps; vcaps="$(_ar_validate_caps "$caps")" || return 1
       # shellcheck disable=SC2206
       local capsjson; capsjson="$(printf '%s\n' $vcaps | jq -R . | jq -sc .)"
@@ -370,7 +458,7 @@ _ar_cli() {
         | .agents[$k].decidedAt=$now
         | (if $note != "" then .agents[$k].note=$note else . end)
       ' --arg k "$key" --argjson caps "$capsjson" --arg note "$note" --arg pnpub "$preauth_npub" --arg now "$(_ar_now)" \
-        && { _ar_read --arg k "$key" '.agents[$k]'; _ar_replay_deferred_for "$key"; }
+        && { _ar_clear_denied_reauth "$key"; _ar_read --arg k "$key" '.agents[$k]'; _ar_replay_deferred_for "$key"; }
       ;;
 
     deny)  # deny <query> [--note <text>]
@@ -449,7 +537,9 @@ Usage: agent-registry.sh <command> [args]
   list [status]                          JSON array (optionally filtered by status)
   upsert-pending --pubkey <hex> [--npub --name --intro --type --group]
   upsert-peer  --npub <npub> [--name --pubkey]
-  authorize <query> [cap,cap,...] [--note <text>]
+  authorize <query> [cap,cap,...] [--note <text>] [--owner]
+                                         --owner = owner-explicit (the ONLY thing that
+                                         un-denies a denied peer; auto paths omit it)
   deny <query> [--note <text>]
   set-name <query> <name>
 
