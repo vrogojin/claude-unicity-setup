@@ -174,6 +174,30 @@ mk_claude fail
 bash "$RJ" syncup >/dev/null 2>&1
 chk "crash + retry_once=true → claude ran TWICE (crash retry intact)" "[ \"\$(wc -l < \"$TMP/claude-calls.log\")\" -eq 2 ]"
 
+echo "== T12: two same-second fires get distinct PID-qualified journals =="
+mk_claude ok
+cfg '{"automation":{"syncup":{"enabled":true}}}'
+rm -rf "$STATE_DIR/automation/syncup"; mkdir -p "$STATE_DIR/automation/syncup"
+# Freeze the clock so both fires compute the SAME second — without the PID
+# qualifier they'd share one filename and clobber each other.
+cat > "$TMP/bin/date" <<'EOF'
+#!/bin/bash
+echo "20260101T000000"
+EOF
+chmod +x "$TMP/bin/date"
+# fire A: hold the lock externally → this run journals skipped_overlap (its own PID)
+exec 8>"$STATE_DIR/automation/syncup.lock"; flock -n 8
+bash "$RJ" syncup >/dev/null 2>&1
+exec 8>&-
+# fire B: normal completed run, same frozen second, different PID
+bash "$RJ" syncup >/dev/null 2>&1
+rm -f "$TMP/bin/date"
+NJ="$(find "$STATE_DIR/automation/syncup" -maxdepth 1 -name 'run-*.json' | wc -l | tr -d ' ')"
+chk "same-second fires → two distinct journal files (no clobber)" "[ \"$NJ\" -eq 2 ]"
+chk "last-run.json valid JSON (no shared-tmp corruption)" "jq -e . \"$(LR syncup)\" >/dev/null 2>&1"
+chk "both a skipped_overlap and a completed journal survive" \
+  "[ \"\$(grep -l skipped_overlap \"$STATE_DIR/automation/syncup\"/run-*.json | wc -l)\" -ge 1 ] && [ \"\$(grep -l completed \"$STATE_DIR/automation/syncup\"/run-*.json | wc -l)\" -ge 1 ]"
+
 echo
 if [ "$FAIL" = 0 ]; then echo "ALL CHECKS PASSED"; else echo "SOME CHECKS FAILED"; fi
 exit "$FAIL"

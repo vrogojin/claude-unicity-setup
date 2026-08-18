@@ -82,7 +82,12 @@ mkdir -p "$JOB_DIR" 2>/dev/null || true
 # reap journals older than 14 days at the start of every run (§2.3.4)
 find "$JOB_DIR" -maxdepth 1 -name 'run-*.json' -mtime +14 -delete 2>/dev/null || true
 
-STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+# PID-qualify the stamp: `date` is 1-second resolution, so two fires in the same
+# clock second (catch-up + a manual `scheduler.sh run`, or two terminals) would
+# otherwise share one filename and clobber each other's journal. flock serializes
+# EXECUTION, but the skipped_overlap record is written by the fire that LOST the
+# lock — a distinct process — so its journal must not collide with the winner's.
+STAMP="$(date -u +%Y%m%dT%H%M%S)Z-$$"
 JOURNAL="$JOB_DIR/run-$STAMP.json"
 LASTRUN="$JOB_DIR/last-run.json"
 STARTED_AT="$(date -u +%FT%TZ)"
@@ -100,7 +105,8 @@ _write_journal() {
          artifacts:$artifacts, reported:false}' \
        > "$JOURNAL.tmp" 2>/dev/null; then
     mv "$JOURNAL.tmp" "$JOURNAL"
-    cp "$JOURNAL" "$LASTRUN.tmp" 2>/dev/null && mv "$LASTRUN.tmp" "$LASTRUN"
+    # per-PID temp so two processes' last-run writes never share a tmp (atomic mv).
+    cp "$JOURNAL" "$LASTRUN.tmp.$$" 2>/dev/null && mv "$LASTRUN.tmp.$$" "$LASTRUN"
   else
     rm -f "$JOURNAL.tmp"
     _rj_log "warn: could not write journal $JOURNAL"
