@@ -141,11 +141,18 @@ export PATH="${PATH:-}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/
 # --- 6. job → skill prompt + per-job flags ------------------------------------
 # All real logic lives in the skill; scheduled == interactive code path. The
 # housekeeping worktree/post-phase (Group D) extends this path.
+#
+# acceptEdits SEAM (Group D handoff): housekeeping runs with acceptEdits — but the
+# flag is set ONLY by the §6b worktree-engagement block below, i.e. ONLY when the
+# session's cwd is the disposable, secret-free sweep worktree on a sweep/* branch
+# the wrapper alone can publish. It is NEVER set here for the bare-launch path, so
+# acceptEdits can never touch the LIVE checkout. (The pre-D AUTOMATION_HK_ACCEPT_EDITS
+# env placeholder is intentionally gone now that the isolating worktree exists —
+# keeping it would have been the one way to grant acceptEdits in the live tree.)
 EXTRA=()
 case "$JOB" in
   syncup)       PROMPT="/syncup" ;;
-  housekeeping) PROMPT="/housekeeping"
-                [ "${AUTOMATION_HK_ACCEPT_EDITS:-0}" = "1" ] && EXTRA=(--permission-mode acceptEdits) ;;
+  housekeeping) PROMPT="/housekeeping" ;;   # acceptEdits set in §6b, worktree-only
 esac
 
 # Wall cap: minutes → `timeout` duration; AUTOMATION_WALL_OVERRIDE lets tests
@@ -155,12 +162,16 @@ SESSION_LOG="$JOB_DIR/last-session.log"
 
 # --- 6b. housekeeping: run the session in a disposable worktree off origin/main
 # (Group D §5.2/§5.3). The sweep NEVER edits the live checkout. When
-# sweep-worktree.sh is present AND origin/main resolves, create the worktree, run
-# with cwd = worktree + acceptEdits (safe: secret-free, sweep/* branch only the
-# wrapper can publish, PreToolUse gates still live), then hand off to the
-# deterministic post-phase. Absent the machinery or origin/main → fall back to
-# the generic in-place launch (keeps Group A's contract + tests intact; an early
-# enable still can't edit the live checkout without AUTOMATION_HK_ACCEPT_EDITS=1).
+# sweep-worktree.sh is present AND origin/main resolves, create the worktree, set
+# cwd = worktree and turn acceptEdits ON — this is the ONLY place acceptEdits is
+# granted, and it is safe precisely because of the isolation established here:
+# secret-free worktree (no .env/.secrets/agent), a sweep/* branch only the wrapper
+# can publish, and the PreToolUse gates (branch-guard, pre-commit) still live.
+# Then hand off to the deterministic post-phase (push + PR + secret-scan; the model
+# never pushes). Absent the machinery or origin/main → fall back to a bare in-place
+# launch WITHOUT acceptEdits (keeps Group A's contract + tests intact); the
+# /housekeeping skill then sees it is not on a sweep/* branch and self-aborts, so
+# the live checkout is never edited.
 RUN_CWD=""; SWEEP_WT=""; SUMMARY_EXTRA=""
 SWEEP_WT_SH="$RJ_HOOK_DIR/sweep-worktree.sh"
 SWEEP_POST_SH="$RJ_HOOK_DIR/sweep-post.sh"
