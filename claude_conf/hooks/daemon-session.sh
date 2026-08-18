@@ -103,15 +103,23 @@ _ds_spawn_detached() {
   # already covers SIGHUP, which is all setsid was buying here.
   local detach=""
   command -v setsid >/dev/null 2>&1 && detach="setsid"
+  # shellcheck disable=SC2086 # $detach must stay unquoted: empty must expand to NOTHING, not ''
   ( ${detach} nohup env NODE_PATH="$np" node "$daemon" start --project "$proj" --live \
       </dev/null >>"$logf" 2>&1 & ) >/dev/null 2>&1
   # Verify before claiming success — the unconditional log line was how the missing setsid
-  # stayed invisible on Windows.
-  local i
+  # stayed invisible on Windows. Wait on the PIDFILE the daemon writes at startup (a cheap
+  # stat) rather than polling `node … status` in a loop: this hook runs on SessionStart, so
+  # ten node spawns would be ten process launches of latency on every start. Then pay for
+  # exactly ONE authoritative status call.
+  local i pidf; pidf="$(_ds_state_dir)/sphere-daemon.pid"
   for i in 1 2 3 4 5 6 7 8 9 10; do
-    if _ds_daemon_running; then _ds_log "started detached daemon for $proj (log: $logf)"; return 0; fi
+    [ -s "$pidf" ] && break
     sleep 1
   done
+  if _ds_daemon_running; then
+    _ds_log "started detached daemon for $proj (log: $logf)"
+    return 0
+  fi
   _ds_log "daemon did NOT come up for $proj within 10s — see $logf"
   return 1
 }
