@@ -202,6 +202,27 @@ else
   echo "  SKIP: @unicitylabs/sphere-sdk not resolvable — run npm install in $REPO"
 fi
 
+echo "== T8: a malformed daemon.json groups member does not hard-abort the upgrade =="
+P8="$SBX/proj8"; seed_configured "$P8"
+# Poison subscriptions.groups with a non-object member (a bare string) — must NOT
+# throw in unique_by(.id) and abort the whole --yes upgrade; it is filtered out.
+cat > "$P8/.claude/agent/daemon.json" <<'EOF'
+{
+  "relays": ["wss://custom.relay.example"],
+  "subscriptions": {
+    "groups": ["oops-a-bare-string", {"id": "realgroup123", "name": "UNICITY_DEV_AGENTS"}],
+    "dm_contacts": ["npub1owner"]
+  },
+  "hooks": {"on_dm": ".claude/hooks/on-dm.sh"}
+}
+EOF
+OUT8="$(bash "$SETUP" "$P8" --yes </dev/null 2>&1)"; RC8=$?
+D8="$P8/.claude/agent/daemon.json"
+check "[ $RC8 -eq 0 ]" "malformed groups member did not abort the upgrade (exit 0)"
+check "! grep -q 'daemon.json merge failed' <<< \"\$OUT8\"" "no daemon.json merge-failed die was reached"
+check "jq -e '.subscriptions.groups | index(\"oops-a-bare-string\")' '$D8' >/dev/null; [ \$? -ne 0 ]" "bare-string groups member filtered out"
+check "jq -e '.subscriptions.groups | map(select(type==\"object\")) | any(.id == \"realgroup123\")' '$D8' >/dev/null" "valid group object preserved"
+
 echo ""
 echo "== setup-idempotency: $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]

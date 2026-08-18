@@ -1202,7 +1202,8 @@ else
          def obj(f): f | if type == "object" then . else {} end;
          .relays = ((arr(.relays) + $new.relays) | unique)
          | .subscriptions = (obj(.subscriptions)
-             | .groups = ((arr(.groups) + $new.subscriptions.groups) | unique_by(.id))
+             | .groups = ((arr(.groups) + $new.subscriptions.groups)
+                          | map(select(type == "object")) | unique_by(.id))
              | .dm_contacts = ((arr(.dm_contacts) + $new.subscriptions.dm_contacts)
                                | map(select(. != "")) | unique))
          | .hooks = (obj(.hooks) * $new.hooks)
