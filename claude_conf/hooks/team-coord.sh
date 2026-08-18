@@ -570,8 +570,13 @@ _tc_sphere_helper() {
   local cands=(
     "${CLAUDE_PROJECT_DIR:-}/../lib/sphere-helper.mjs"
     "${CLAUDE_PROJECT_DIR:-}/lib/sphere-helper.mjs"
+    # Clone nested INSIDE the project — the standalone-framework-repo layout, where
+    # claude-unicity-setup is checked out as a sibling of the product repos under one
+    # container directory. None of the candidates above reach it.
+    "${CLAUDE_PROJECT_DIR:-}/claude-unicity-setup/lib/sphere-helper.mjs"
     "$TC_HOOK_DIR/../../lib/sphere-helper.mjs"
     "$TC_HOOK_DIR/../../../lib/sphere-helper.mjs"
+    "$TC_HOOK_DIR/../../claude-unicity-setup/lib/sphere-helper.mjs"
     "${HOME:-/root}/claude_unicity_setup/lib/sphere-helper.mjs"
     "${HOME:-/root}/claude-unicity-setup/lib/sphere-helper.mjs"
   )
