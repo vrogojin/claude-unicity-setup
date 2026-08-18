@@ -15,7 +15,12 @@
 #   • READ-ONLY. It never writes a repo, never mutates coordination state.
 #   • METADATA ONLY. It NEVER reads .env / .secrets / config secrets / key material —
 #     only git history, `gh` metadata, docs/ROADMAP.md, and the coord ledger. This is
-#     why a report can be sent to peers without leaking anything.
+#     why a report can be sent to peers without leaking anything. (Residual risk: a secret
+#     a human committed INTO git metadata — a branch name or merge subject — is faithfully
+#     reported; the builder cannot distinguish it from normal text. Keep secrets out of
+#     branch names / commit messages, per the standing rule.)
+#   • DETERMINISM is over report CONTENT (completed/in_progress/commitments) for a fixed
+#     period — the `period.to` envelope field defaults to "now" and so varies per run.
 #
 # Output: the ENVELOPE PAYLOAD object (period/repo/completed/in_progress/commitments/
 # asks/notes) on stdout — NOT a wire envelope. The caller wraps it:
@@ -60,8 +65,12 @@ if [ -z "$FROM" ] && [ -n "$SINCE_SHA" ]; then
 fi
 
 # git revision range / window flags (sha range is the most precise; matches the marker).
+# Guard the sha range with an ANCESTRY check: a marker sha that is known locally but NOT an
+# ancestor of HEAD (diverged branch / partial rewrite) would make `<sha>..HEAD` span the
+# whole divergence — potentially all of history. Only range from an actual ancestor.
 GITRANGE=()
-if [ -n "$SINCE_SHA" ] && _git cat-file -e "${SINCE_SHA}^{commit}" 2>/dev/null; then
+if [ -n "$SINCE_SHA" ] && _git cat-file -e "${SINCE_SHA}^{commit}" 2>/dev/null \
+   && _git merge-base --is-ancestor "$SINCE_SHA" HEAD 2>/dev/null; then
   GITRANGE=("${SINCE_SHA}..HEAD")
 elif [ -n "$FROM" ]; then
   GITRANGE=(--since="$FROM" --until="$TO")
@@ -80,7 +89,7 @@ fi
 COMPLETED_GIT="$(_git log "${GITRANGE[@]}" --merges --pretty=format:"%H${US}%s" 2>/dev/null \
   | jq -R -s --arg us "$US" '
       split("\n") | map(select(length>0) | split($us))
-      | map({title: (.[1] // ""), ref: ((.[0] // "")[0:12])})' 2>/dev/null)"
+      | map({title: ((.[1:] | join($us))), ref: ((.[0] // "")[0:12])})' 2>/dev/null)"
 [ -n "$COMPLETED_GIT" ] || COMPLETED_GIT='[]'
 
 COMPLETED_GH='[]'
@@ -90,8 +99,11 @@ if [ "${SYNCUP_REPORT_NO_GH:-0}" != "1" ] && command -v gh >/dev/null 2>&1; then
   # failure (no auth, no network, not a GH repo) leaves the git-only list intact.
   GHDATE="${FROM%%T*}"
   if [ -n "$GHDATE" ]; then
-    COMPLETED_GH="$(cd "$PROJ" && gh pr list --state merged --search "merged:>=$GHDATE" \
-        --limit "$MAX" --json title,url 2>/dev/null \
+    # HARD timeout: `gh` uses Go's default HTTP client (no request timeout); a black-hole
+    # network would otherwise hang — bounded only by the runner's wall cap in the scheduled
+    # path, and UNBOUNDED in an interactive run. Cap it; any failure keeps the git-only list.
+    COMPLETED_GH="$(cd "$PROJ" && timeout "${SYNCUP_GH_TIMEOUT:-20}" gh pr list --state merged \
+        --search "merged:>=$GHDATE" --limit "$MAX" --json title,url 2>/dev/null \
         | jq 'map({title: (.title // ""), ref: (.url // "")})' 2>/dev/null)"
     [ -n "$COMPLETED_GH" ] || COMPLETED_GH='[]'
   fi
@@ -113,6 +125,7 @@ ROADMAP_WIP='[]'
 RM="$PROJ/docs/ROADMAP.md"
 if [ -f "$RM" ]; then
   ROADMAP_WIP="$(awk '
+      { sub(/\r$/, "") }                                  # tolerate CRLF line endings
       /^## / { insec = ($0 ~ /🚧/) ? 1 : 0; next }
       insec && /^[-*] / { sub(/^[-*][ \t]+/, ""); print }
     ' "$RM" 2>/dev/null \

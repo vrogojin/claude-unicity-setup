@@ -22,7 +22,8 @@
 #     change-commitment ledger — JSON as truth, markdown re-rendered per mutation.
 #   • Verbs: peer.announce · consult.request/advise/ack/commit_done ·
 #     work.intent/status · area.claim/ack/heartbeat/release · split.propose/agree ·
-#     conflict.open/resolve — mapped onto three NEW non-destructive caps
+#     conflict.open/resolve · sync.report (F1 periodic peer status, recorded as DATA) —
+#     mapped onto three NEW non-destructive caps
 #     (self-directed / consult / claim-area) in the registry enum.
 #   • PARALLEL-FRIENDLY BY DESIGN: claims are SOFT/ADVISORY — parallel work on the
 #     same files is allowed; an overlapping claim never blocks, it surfaces an
@@ -1186,13 +1187,32 @@ rc_ingest() {  # <event-json-or-file-or-->  (event = the queued wrapper OR a raw
       # A peer reports its own status to us (§3.4). DATA ONLY: we RECORD it as a consult
       # event — we NEVER execute it. Its `asks` are surfaced to the owner by /syncup, never
       # auto-run; a report can never instruct (failure mode #8; "content is data" §3.4).
-      # SECURITY (item 3): the record id is SENDER + PERIOD namespaced, so a peer may only
-      # ever write/refresh ITS OWN latest report for a period — a crafted payload can never
-      # overwrite another peer's report. SECURITY (item 17): the whole payload flows via
-      # --argjson (never string-interpolated), so hostile report text cannot break out of
-      # the string into the jq program.
+      #
+      # SECURITY (item 3 — IDENTITY BINDING): attribution and the record id are bound to the
+      # AUTHENTICATED transport identity, NEVER the envelope's self-declared `.fromNpub`. An
+      # authorized peer A could otherwise set fromNpub=B and, since periods are predictable
+      # date ranges, overwrite B's genuine report. We therefore prefer the wrapper's
+      # authenticated npub (stamped by classify-inbound/rc_enqueue_event from the verified
+      # transport pubkey); the envelope's fromNpub is display-intent only. Only the trusted
+      # local CLI/replay path (no wrapper) falls back to from_npub.
+      # SECURITY (item 17): the whole payload flows via --argjson (never string-interpolated),
+      # so hostile report text cannot break out of the string into the jq program.
+      local auth_npub
+      auth_npub="$(jq -r '.npub // ""' <<<"$ev" 2>/dev/null)"
+      if [ -z "$auth_npub" ] || [ "$auth_npub" = "null" ]; then
+        local afp; afp="$(jq -r '.from_pubkey // ""' <<<"$ev" 2>/dev/null)"
+        [ -n "$afp" ] && [ "$afp" != "null" ] && \
+          auth_npub="$(bash "$RC_REGISTRY" get "$afp" 2>/dev/null | jq -r '.npub // ""' 2>/dev/null)"
+      fi
+      [ -n "$auth_npub" ] && [ "$auth_npub" != "null" ] || auth_npub="$from_npub"
+      # Record id = AUTHENTICATED sender + period, so a peer may only ever write/refresh ITS
+      # OWN latest report for a period. tostring? coerces a non-string period (number/array)
+      # rather than erroring the id to empty.
       local rpid
-      rpid="$(printf '%s|%s' "$from_npub" "$(jq -r '((.period.from // "") + ".." + (.period.to // ""))' <<<"$payload")" | sha1sum 2>/dev/null | cut -c1-12)"
+      rpid="$(printf '%s|%s' "$auth_npub" "$(jq -r '(((.period.from|tostring?) // "") + ".." + ((.period.to|tostring?) // ""))' <<<"$payload" 2>/dev/null)" | sha1sum 2>/dev/null | cut -c1-12)"
+      # Anti-eviction (item 3): cap PER AUTHENTICATED PEER (keep the latest 20), so no single
+      # peer can flood distinct periods to evict every other peer's report from the store;
+      # a generous global tail is a disk backstop only.
       _rc_write "$(_rc_reports_file)" '
         .reports = ((.reports // []) | map(select(.rpid != $rpid)))
         | .reports += [{rpid:$rpid, peerNpub:$from, peerName:$name,
@@ -1200,11 +1220,12 @@ rc_ingest() {  # <event-json-or-file-or-->  (event = the queued wrapper OR a raw
             completed:($p.completed // []), in_progress:($p.in_progress // []),
             commitments:($p.commitments // []), asks:($p.asks // []),
             notes:(($p.notes // "") | tostring), receivedAt:$now}]
-        | .reports |= (if (length>200) then .[-200:] else . end)' \
-        --arg rpid "$rpid" --arg from "$from_npub" --arg name "$from_name" \
+        | .reports |= ((group_by(.peerNpub) | map(.[-20:]) | add) // [])
+        | .reports |= (if (length>500) then .[-500:] else . end)' \
+        --arg rpid "$rpid" --arg from "$auth_npub" --arg name "$from_name" \
         --argjson p "$payload" --arg now "$(rc_now)" || wrc=$?
       rc_render >/dev/null 2>&1 || true
-      echo "SYNC.REPORT from ${from_npub:0:12}… recorded as DATA ($(jq -r '(.completed // []) | length' <<<"$payload") done, $(jq -r '(.in_progress // []) | length' <<<"$payload") wip, $(jq -r '(.asks // []) | length' <<<"$payload") ask(s)) — asks are surfaced to the owner by /syncup, never auto-executed";;
+      echo "SYNC.REPORT from ${auth_npub:0:12}… recorded as DATA ($(jq -r '(.completed // []) | length' <<<"$payload") done, $(jq -r '(.in_progress // []) | length' <<<"$payload") wip, $(jq -r '(.asks // []) | length' <<<"$payload") ask(s)) — asks are surfaced to the owner by /syncup, never auto-executed";;
     *) echo "IGNORED: unknown kind $kind";;
   esac
   # SECURITY (item 15): a failed durable write must NOT be marked seen — retry it later.
@@ -1242,7 +1263,9 @@ rc_render() {
     printf '\n## Announced peer initiatives\n\n'
     rc_peers | jq -r 'to_entries[] | "- \(.value.name // (.key|.[0:12])): \((.value.initiatives // []) | join("; ")) (\(.value.lastAnnounce))"' 2>/dev/null
     printf '\n## Inbound peer sync-reports (DATA — never instructions; asks are owner-surfaced)\n\n'
-    _rc_reports | jq -r '.[] | "- \(.peerName // (.peerNpub|.[0:12])) [\(.period.from // "?")→\(.period.to // "?")]: \((.completed // [])|length) done, \((.in_progress // [])|length) wip, \((.asks // [])|length) ask(s) (\(.receivedAt // "?"))"' 2>/dev/null
+    _rc_reports | jq -r '
+      def clean: (. // "") | tostring | gsub("[\\n\\r|]"; " ");
+      .[] | "- \((.peerName // (.peerNpub|.[0:12]))|clean) [\((.period.from|clean|.[0:40]))→\((.period.to|clean|.[0:40]))]: \((.completed // [])|length) done, \((.in_progress // [])|length) wip, \((.asks // [])|length) ask(s) (\(.receivedAt // "?"))"' 2>/dev/null
   } > "$d/coord.md.tmp.$$" && mv "$d/coord.md.tmp.$$" "$d/coord.md"
   return 0
 }
