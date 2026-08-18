@@ -115,11 +115,17 @@ enqueue_workitem() {  # args: from ts body type group name npub caps_json [skill
 }
 
 # Quarantine an authorized message the content-guard (SIF) flagged: it is NOT dispatched.
-# Recorded for owner review; deterministic id ⇒ no duplicates.
+# Recorded for owner review. CONTENT-dedup key = sha1(from|body) — the TIMESTAMP is
+# deliberately EXCLUDED (same rationale as enqueue_workitem above): a SIF-flagged message
+# can arrive via BOTH the daemon path and the poll fallback with DIFFERENT receivedAt
+# timestamps; keying on from|ts|body would then quarantine it TWICE, doubling the owner-
+# review surface. Keying on from|body collapses the two delivery paths to ONE quarantine
+# entry. Distinct flagged messages from the same sender carry distinct bodies, so this
+# never collapses genuinely-different intents.
 quarantine_message() {  # args: from ts body type group name npub sif_verdict_json
   local from="$1" ts="$2" body="$3" type="$4" group="$5" name="$6" npub="$7" sif="$8"
   local id qf
-  id="$(printf '%s|%s|%s' "$from" "$ts" "$body" | sha1sum 2>/dev/null | cut -c1-16)"
+  id="$(printf '%s|%s' "$from" "$body" | sha1sum 2>/dev/null | cut -c1-16)"
   [ -n "$id" ] || return 0
   qf="$QUARANTINE_DIR/$id.json"
   [ -f "$qf" ] && return 0
@@ -151,7 +157,13 @@ stash_deferred() {  # from ts body npub name kind eventid
   # BOTH as hex BEFORE they touch any path, so a crafted `.id` (e.g. "../../x") or a
   # bogus pubkey can never escape agent-deferred/.
   [[ "$from" =~ ^[0-9a-f]{64}$ ]] || { echo "stash: rejecting non-hex from '$from'" >&2; return 0; }
-  [ -n "$eid" ] || eid="$(printf '%s|%s|%s' "$from" "$ts" "$body" | sha1sum 2>/dev/null | cut -c1-16)"
+  # When the real Nostr event id is present it is the natural dedup key. Its ABSENCE falls
+  # back to a CONTENT key = sha1(from|body) — the TIMESTAMP is deliberately EXCLUDED (same
+  # rationale as enqueue_workitem/quarantine_message): the same first-contact envelope can
+  # arrive via BOTH the daemon path and the poll fallback with DIFFERENT receivedAt
+  # timestamps; keying on from|ts|body would then stash it TWICE and replay it twice on a
+  # later authorize. Keying on from|body collapses the two delivery paths to ONE stash.
+  [ -n "$eid" ] || eid="$(printf '%s|%s' "$from" "$body" | sha1sum 2>/dev/null | cut -c1-16)"
   [ -n "$eid" ] || return 0
   [[ "$eid" =~ ^[0-9a-f]{1,64}$ ]] || { echo "stash: rejecting non-hex eid '$eid'" >&2; return 0; }
 
