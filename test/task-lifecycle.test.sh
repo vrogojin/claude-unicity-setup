@@ -231,6 +231,36 @@ printf '{"tasks":[{"task_id":"g5","title_guess":"t","keywords":["x"],"status":"o
 D6="$(printf '%s' "$STOP" | bash "$DIAG" 2>/dev/null)"
 chk "missing started_at treated as stale (no wedge)" "! printf '%s' \"\$D6\" | grep -q task-complete"
 
+# ── T8: OD-4 default-OFF gate ─────────────────────────────────────────────────
+echo "== T8: OD-4 — F2 does nothing unless .automation.lifecycle.enabled=true =="
+# Disabled: a task prompt creates NO state and emits NO nudge.
+cfg '{"automation":{"lifecycle":{"enabled":false,"ticket_mode":"auto","max_new_tickets_per_day":3}}}'
+rm -f "$TL"
+OUT8="$(printf '%s' '{"hook_event_name":"UserPromptSubmit","prompt":"add a brand new export-to-csv feature to reports"}' | bash "$HOOK")"
+chk "disabled: task prompt emits no nudge" "[ -z \"\$OUT8\" ]"
+chk "disabled: no state file created" "[ ! -f \"$TL\" ]"
+# Disabled: gate #15 does not fire even with a shipped-unclosed record present.
+printf '{"tasks":[{"task_id":"g6","title_guess":"t","keywords":["x"],"status":"open","branch":"feat/x","ticket":9,"pr":42,"pr_state":"OPEN","started_at":"%s","completed_at":null}]}' "$(date -u +%FT%TZ)" > "$TL"
+D8="$(printf '%s' "$STOP" | bash "$DIAG" 2>/dev/null)"
+chk "disabled: gate #15 does not fire on a stale/pending state file" "! printf '%s' \"\$D8\" | grep -q task-complete"
+# Config absent entirely → fail-closed to OFF.
+mv "$PROJ/.claude/agent/config.json" "$PROJ/.claude/agent/config.json.bak"
+OUT8B="$(printf '%s' '{"hook_event_name":"UserPromptSubmit","prompt":"add a brand new export-to-csv feature to reports"}' | bash "$HOOK")"
+chk "no config: fail-closed, no nudge" "[ -z \"\$OUT8B\" ]"
+D8B="$(printf '%s' "$STOP" | bash "$DIAG" 2>/dev/null)"
+chk "no config: gate #15 does not fire" "! printf '%s' \"\$D8B\" | grep -q task-complete"
+mv "$PROJ/.claude/agent/config.json.bak" "$PROJ/.claude/agent/config.json"
+# Re-enable → tracking + gate work again (proves the flag is the switch, not a one-way break).
+cfg '{"automation":{"lifecycle":{"enabled":true,"ticket_mode":"auto","max_new_tickets_per_day":3}}}'
+rm -f "$TL" "$STATE_DIR/task-lifecycle-head"
+OUT8C="$(printf '%s' '{"hook_event_name":"UserPromptSubmit","prompt":"add a brand new export-to-csv feature to reports"}' | bash "$HOOK")"
+chk "re-enabled: task prompt emits the nudge again" "printf '%s' \"\$OUT8C\" | grep -q task-start"
+chk "re-enabled: state file created" "[ -f \"$TL\" ]"
+# TASK_LIFECYCLE_DISABLE=1 is the hard kill even when enabled=true.
+rm -f "$TL"
+OUT8D="$(printf '%s' '{"hook_event_name":"UserPromptSubmit","prompt":"add a brand new export-to-csv feature to reports"}' | TASK_LIFECYCLE_DISABLE=1 bash "$HOOK")"
+chk "enabled but TASK_LIFECYCLE_DISABLE=1: hard kill, no state" "[ -z \"\$OUT8D\" ] && [ ! -f \"$TL\" ]"
+
 echo
 if [ "$FAIL" -eq 0 ]; then printf '\033[32mALL TASK-LIFECYCLE TESTS PASSED\033[0m\n'; else printf '\033[31mSOME TESTS FAILED\033[0m\n'; fi
 exit $FAIL

@@ -118,7 +118,17 @@ fi
 # clearing this gate also clears gate #6 in one run (no deadlock). Only tasks fresh
 # within RC_STOP_TTL_HOURS block — a stale record is left for review, never a wedge.
 TL_STATE="$STATE_DIR/task-lifecycle.json"
-if [ -f "$TL_STATE" ]; then
+# OD-4: only enforce when F2 is explicitly enabled (fail-closed). This also means a
+# stale task-lifecycle.json left over from a previously-enabled period can never
+# wedge Stop once the user turns F2 off — the config flag is the master switch, the
+# TTL + rm hatch below are the second layer.
+TL_CONFIG="$CLAUDE_PROJECT_DIR/.claude/agent/config.json"
+TL_ON=false
+if command -v jq >/dev/null 2>&1 && [ -f "$TL_CONFIG" ] \
+   && [ "$(jq -r '.automation.lifecycle.enabled // false' "$TL_CONFIG" 2>/dev/null)" = "true" ]; then
+  TL_ON=true
+fi
+if [ "$TL_ON" = "true" ] && [ -f "$TL_STATE" ]; then
   TL_TTL="${RC_STOP_TTL_HOURS:-72}"; case "$TL_TTL" in ''|*[!0-9]*) TL_TTL=72;; esac
   # GNU date first, BSD/macOS `-v` second, epoch last. Without a BSD fallback the
   # cutoff would collapse to 1970 on macOS and OVER-block every shipped task

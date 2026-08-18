@@ -27,7 +27,18 @@
 #   Escape hatch for the gate:  rm -f /tmp/claude/*/task-lifecycle.json
 set -uo pipefail
 
+# Hard kill-switch (works even when enabled=true).
 [ "${TASK_LIFECYCLE_DISABLE:-0}" = "1" ] && exit 0
+
+# OD-4: F2 is OFF by default. Run ONLY when config explicitly enables it, so a
+# fresh framework install (hooks wired unconditionally into settings.json) tracks
+# NOTHING — no state file, no nudge — until the user flips the flag. Fail CLOSED:
+# missing/unreadable config, or no jq, means disabled (silent exit 0). Flip on with
+# .automation.lifecycle.enabled=true (same key run-job.sh gates the scheduled jobs on).
+TL_CONFIG="${CLAUDE_PROJECT_DIR:-.}/.claude/agent/config.json"
+command -v jq >/dev/null 2>&1 || exit 0
+[ -f "$TL_CONFIG" ] || exit 0
+[ "$(jq -r '.automation.lifecycle.enabled // false' "$TL_CONFIG" 2>/dev/null)" = "true" ] || exit 0
 
 TL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo .)"
 . "$TL_DIR/state-dir.sh" 2>/dev/null || STATE_DIR="/tmp/claude"
