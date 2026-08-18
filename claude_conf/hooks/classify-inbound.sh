@@ -248,14 +248,14 @@ while [ "$i" -lt "$TOTAL" ]; do
   AUTHZJSON=""
 
   # --- Self: a self-DM (our own transport pubkey) is the `a2a verify` probe, not a peer.
-  # Skip it entirely — no authz stamp, no pending entry, no gate. Prevents the phantom
-  # unknown-agent authorization request that the no-peer self-test would otherwise raise. ---
+  # Stamp it 'self' — classified, so it is NEVER reprocessed. (A bare `continue` left it
+  # .authz==null forever, which defeated the UNCLASSIFIED>0 early-exit above and forced a
+  # full O(messages) rescan on every daemon hook / poll.) It still creates NO pending entry
+  # and no gate, so the no-peer self-test never raises a phantom unknown-agent request. ---
   if [ -n "$SELF_HEX" ] && [ "$FROM" = "$SELF_HEX" ]; then
-    continue
-  fi
-
+    AUTHZJSON='{"role":"self","status":"self","classified":true}'
   # --- Owner: never enters the agent-authorization pipeline ---
-  if [ "$PRI" = "true" ] \
+  elif [ "$PRI" = "true" ] \
      || { [ -n "$OWNER_NPUB" ] && [ "$FROM" = "$OWNER_NPUB" ]; } \
      || { [ -n "$OWNER_NAMETAG" ] && [ "$FROMNAME" = "$OWNER_NAMETAG" ]; }; then
     AUTHZJSON='{"role":"owner","status":"authorized","classified":true}'
