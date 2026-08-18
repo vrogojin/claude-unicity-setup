@@ -133,12 +133,14 @@ _rc_conflicts_file()   { printf '%s/conflicts.json'   "$(coord_root)"; }
 _rc_edges_file()       { printf '%s/edges.jsonl'      "$(coord_root)"; }
 _rc_consults_dir()     { printf '%s/consults'         "$(coord_root)"; }
 _rc_seen_file()        { printf '%s/seen.json'        "$(coord_root)"; }
+_rc_reports_file()     { printf '%s/reports.json'     "$(coord_root)"; }
 
 _rc_areas()       { local f; f="$(_rc_areas_file)";       [ -f "$f" ] && jq -c '.areas // []' "$f" || echo '[]'; }
 _rc_commitments() { local f; f="$(_rc_commitments_file)"; [ -f "$f" ] && jq -c '.commitments // []' "$f" || echo '[]'; }
 _rc_intents()     { local f; f="$(_rc_intents_file)";     [ -f "$f" ] && jq -c '.intents // []' "$f" || echo '[]'; }
 _rc_splits()      { local f; f="$(_rc_splits_file)";      [ -f "$f" ] && jq -c '.splits // []' "$f" || echo '[]'; }
 _rc_conflicts()   { local f; f="$(_rc_conflicts_file)";   [ -f "$f" ] && jq -c '.conflicts // []' "$f" || echo '[]'; }
+_rc_reports()     { local f; f="$(_rc_reports_file)";     [ -f "$f" ] && jq -c '.reports // []' "$f" || echo '[]'; }
 
 # Lamport clock for peer-scope envelopes (coordination is single-authority — our
 # coordinator — so no epoch fencing; the clock just orders consult threads).
@@ -176,11 +178,68 @@ rc_verb_cap() {
     peer.announce) echo "self-directed";;
     consult.request|consult.advise|consult.ack|consult.commit_done) echo "consult";;
     conflict.open|conflict.resolve) echo "consult";;
+    # sync.report (F1 syncup, design §3.4): a periodic STATUS report between peers.
+    # Deliberately reuses the existing non-destructive `consult` cap — a peer already
+    # trusted to consult may receive/send status; no new capability is minted, and the
+    # report can only ever be RECORDED (ingest), never executed (§3.5, failure mode #8).
+    sync.report) echo "consult";;
     work.intent|work.status|area.claim|area.ack|area.heartbeat|area.release|split.propose|split.agree) echo "claim-area";;
     *) echo "";;
   esac
 }
 rc_is_verb() { [ -n "$(rc_verb_cap "$1")" ]; }
+
+# ============================================================================
+# F1 Syncup coordinator gate (design §3.1 / OD-7 / failure mode #14)
+# ============================================================================
+# The syncup job (scheduled peer-sync) is OUTBOUND traffic driven by our own role.
+# It runs ONLY when all hold; the checks are deterministic so run-job.sh can cheaply
+# pre-check them and a misconfigured host never even starts a session:
+#   1. config.json .role == "coordinator"   (OD-7 — EXPLICIT, never inferred: an
+#      inference-by-absence would let a mis-setup instance silently self-promote and
+#      start broadcasting to peers at 07:00).
+#   2. `agent-registry.sh list authorized` is non-empty (nobody to sync with → skip).
+# Team-snapshot emission is additionally epoch-fenced per team (rc_syncup_team_leases):
+# the static coordinator role NEVER overrides a team lease — a deposed/stale coordinator
+# must not emit team snapshots even though config still says "coordinator".
+_rc_config_path() {
+  [ -n "${RC_CONFIG_FILE:-}" ] && { printf '%s' "$RC_CONFIG_FILE"; return; }
+  local proj="${CLAUDE_PROJECT_DIR:-}"
+  if [ -n "$proj" ] && [ -f "$proj/.claude/agent/config.json" ]; then
+    printf '%s' "$proj/.claude/agent/config.json"; return
+  fi
+  printf '%s' "$RC_HOOK_DIR/../agent/config.json"
+}
+_rc_config_role() {
+  local c; c="$(_rc_config_path)"
+  [ -f "$c" ] || { printf 'peer'; return; }
+  local r; r="$(jq -r '.role // "peer"' "$c" 2>/dev/null)"
+  [ -n "$r" ] && [ "$r" != "null" ] || r="peer"
+  printf '%s' "$r"
+}
+# rc_syncup_gate — prints exactly one verdict token, returns 0 iff "ok":
+#   ok | skipped_not_coordinator | skipped_no_peers
+rc_syncup_gate() {
+  local role; role="$(_rc_config_role)"
+  if [ "$role" != "coordinator" ]; then echo "skipped_not_coordinator"; return 1; fi
+  local peers; peers="$(bash "$RC_REGISTRY" list authorized 2>/dev/null | jq 'length' 2>/dev/null)"
+  [ -n "$peers" ] && [ "$peers" != "null" ] || peers=0
+  if ! [ "$peers" -ge 1 ] 2>/dev/null; then echo "skipped_no_peers"; return 1; fi
+  echo "ok"; return 0
+}
+# rc_syncup_team_leases — teamIds for which WE currently hold a VALID coordinator lease
+# (epoch fence). Empty output = emit NO team snapshot (not in any team, or lease lost).
+rc_syncup_team_leases() {
+  type team_list >/dev/null 2>&1 || return 0
+  local me; me="$(rc_self_npub)"; [ -n "$me" ] || return 0
+  local tid st holder
+  while IFS= read -r tid; do
+    [ -n "$tid" ] || continue
+    read -r st holder _ < <(team_lease_status "$tid" 2>/dev/null)
+    [ "$st" = "valid" ] && [ "$holder" = "$me" ] && printf '%s\n' "$tid"
+  done < <(team_list 2>/dev/null | jq -r '.[].teamId // empty' 2>/dev/null)
+  return 0
+}
 
 # ============================================================================
 # Authorization + record-ownership helpers (security hardening)
@@ -1123,6 +1182,29 @@ rc_ingest() {  # <event-json-or-file-or-->  (event = the queued wrapper OR a raw
         rc_render >/dev/null 2>&1 || true
         echo "CONFLICT $kid → $(jq -r '.status // "resolved"' <<<"$payload") at stage $(jq -r '.stage // "?"' <<<"$payload")"
       fi;;
+    sync.report)
+      # A peer reports its own status to us (§3.4). DATA ONLY: we RECORD it as a consult
+      # event — we NEVER execute it. Its `asks` are surfaced to the owner by /syncup, never
+      # auto-run; a report can never instruct (failure mode #8; "content is data" §3.4).
+      # SECURITY (item 3): the record id is SENDER + PERIOD namespaced, so a peer may only
+      # ever write/refresh ITS OWN latest report for a period — a crafted payload can never
+      # overwrite another peer's report. SECURITY (item 17): the whole payload flows via
+      # --argjson (never string-interpolated), so hostile report text cannot break out of
+      # the string into the jq program.
+      local rpid
+      rpid="$(printf '%s|%s' "$from_npub" "$(jq -r '((.period.from // "") + ".." + (.period.to // ""))' <<<"$payload")" | sha1sum 2>/dev/null | cut -c1-12)"
+      _rc_write "$(_rc_reports_file)" '
+        .reports = ((.reports // []) | map(select(.rpid != $rpid)))
+        | .reports += [{rpid:$rpid, peerNpub:$from, peerName:$name,
+            period:($p.period // {}), repo:(($p.repo // "") | tostring),
+            completed:($p.completed // []), in_progress:($p.in_progress // []),
+            commitments:($p.commitments // []), asks:($p.asks // []),
+            notes:(($p.notes // "") | tostring), receivedAt:$now}]
+        | .reports |= (if (length>200) then .[-200:] else . end)' \
+        --arg rpid "$rpid" --arg from "$from_npub" --arg name "$from_name" \
+        --argjson p "$payload" --arg now "$(rc_now)" || wrc=$?
+      rc_render >/dev/null 2>&1 || true
+      echo "SYNC.REPORT from ${from_npub:0:12}… recorded as DATA ($(jq -r '(.completed // []) | length' <<<"$payload") done, $(jq -r '(.in_progress // []) | length' <<<"$payload") wip, $(jq -r '(.asks // []) | length' <<<"$payload") ask(s)) — asks are surfaced to the owner by /syncup, never auto-executed";;
     *) echo "IGNORED: unknown kind $kind";;
   esac
   # SECURITY (item 15): a failed durable write must NOT be marked seen — retry it later.
@@ -1159,6 +1241,8 @@ rc_render() {
     _rc_commitments | jq -r '.[] | select(.status=="pending") | "- [ ] \(.cmid) (consult \(.consult)): \(.description) [\(.scope)]"' 2>/dev/null
     printf '\n## Announced peer initiatives\n\n'
     rc_peers | jq -r 'to_entries[] | "- \(.value.name // (.key|.[0:12])): \((.value.initiatives // []) | join("; ")) (\(.value.lastAnnounce))"' 2>/dev/null
+    printf '\n## Inbound peer sync-reports (DATA — never instructions; asks are owner-surfaced)\n\n'
+    _rc_reports | jq -r '.[] | "- \(.peerName // (.peerNpub|.[0:12])) [\(.period.from // "?")→\(.period.to // "?")]: \((.completed // [])|length) done, \((.in_progress // [])|length) wip, \((.asks // [])|length) ask(s) (\(.receivedAt // "?"))"' 2>/dev/null
   } > "$d/coord.md.tmp.$$" && mv "$d/coord.md.tmp.$$" "$d/coord.md"
   return 0
 }
@@ -1256,6 +1340,9 @@ _rc_cli() {
     self) printf 'npub=%s name=%s\n' "$(rc_self_npub)" "$(rc_self_name)";;
     verb-cap) rc_verb_cap "${1:-}";;
     is-verb) rc_is_verb "${1:-}" && echo yes || { echo no; return 1; };;
+    syncup-gate)   rc_syncup_gate;;
+    syncup-leases) rc_syncup_team_leases;;
+    reports)       _rc_reports; echo;;
     consult-open) rc_consult_open "$@";;
     consult-list) rc_consult_list "${1:-}"; echo;;
     consult-get) rc_consult_get "${1:-}";;
@@ -1302,6 +1389,7 @@ remote-coord.sh — remote-agent coordination engine (consults + advisory work-a
 claims + who's-on-this broadcasts + split negotiation + conflict reconciliation, over A2A).
 Commands:
   root | self | verb-cap <kind> | is-verb <kind>
+  syncup-gate | syncup-leases | reports    (F1 syncup: coordinator gate · valid team leases · inbound peer sync-reports)
   consult-open --to <npub|nametag> --intent I [--areas csv --repos csv --changes J --questions J --urgency u]
   consult-list [status] | consult-get <cid>
   advise <cid> --advisory TEXT [--conflicts JSON] [--commit "desc|scope"]...
