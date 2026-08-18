@@ -1,0 +1,63 @@
+# LiteLLM proxy — main-thread provider failover for Claude Code.
+# See ../../docs/llm-fallback-routing.md for the design + rationale.
+#
+# OFF BY DEFAULT. This file is an EXAMPLE. Copy to litellm.yaml, fill the key
+# slots (env vars — never inline secrets), then launch (see README.md).
+#
+# Model-tier policy (the load-bearing convention):
+#   claude-sonnet-*  → main orchestration thread → Anthropic FIRST, then fail over
+#   claude-opus-*    → sub-agents (coding)        → Anthropic ONLY (no fallback)
+#   claude-fable-*   → sub-agents (heavy reason)  → Anthropic ONLY (no fallback)
+#   claude-haiku-*   → CC background chores        → Anthropic ONLY (no fallback)
+
+model_list:
+  # --- Main thread: Sonnet, Anthropic primary (failover-eligible) ---
+  - model_name: claude-sonnet-4-5           # the id Claude Code's main loop sends
+    litellm_params:
+      model: anthropic/claude-sonnet-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+      timeout: 30                            # fast-fail so failover can kick in (see design doc)
+      num_retries: 1
+
+  # --- Fallback providers for the main thread (fill keys to enable) ---
+  - model_name: gpt-fallback
+    litellm_params:
+      model: openai/gpt-4o                   # OpenAI fallback
+      api_key: os.environ/OPENAI_API_KEY     # SLOT — unset by default
+  - model_name: kimi-fallback
+    litellm_params:
+      model: openrouter/moonshotai/kimi-k2   # Kimi via OpenRouter fallback
+      api_key: os.environ/OPENROUTER_API_KEY # SLOT — unset by default
+
+  # --- Sub-agent tiers: Anthropic-only, NO fallback entry below ---
+  - model_name: claude-opus-4-8
+    litellm_params:
+      model: anthropic/claude-opus-4-1       # map to the current Anthropic Opus id
+      api_key: os.environ/ANTHROPIC_API_KEY
+      num_retries: 3                          # retry Anthropic; never leave the vendor
+  - model_name: claude-fable-5
+    litellm_params:
+      model: anthropic/claude-opus-4-1        # (no public Fable API id yet — map as appropriate)
+      api_key: os.environ/ANTHROPIC_API_KEY
+      num_retries: 3
+  - model_name: claude-haiku-4-5
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+      num_retries: 3
+
+litellm_settings:
+  # ONLY the main-thread Sonnet id carries a fallback list. Opus/Fable/Haiku are
+  # absent here → they stay Anthropic-only and simply retry through an outage.
+  fallbacks:
+    - claude-sonnet-4-5: ["gpt-fallback", "kimi-fallback"]
+  # Optional: on context overflow, widen instead of failing.
+  # context_window_fallbacks:
+  #   - claude-sonnet-4-5: ["kimi-fallback"]
+
+# Anthropic-format passthrough so Claude Code can point ANTHROPIC_BASE_URL here
+# and keep speaking the Anthropic wire protocol. LiteLLM translates to the
+# OpenAI/OpenRouter schema for the fallback providers.
+general_settings:
+  # master_key: os.environ/LITELLM_MASTER_KEY   # if you want to auth the proxy itself
+  anthropic_passthrough: true
