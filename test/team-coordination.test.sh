@@ -200,6 +200,49 @@ deliver_ts "$WORKER_PK" "a different request entirely" "2026-08-18T10:00:05Z"
 WI_FINAL=$(ls "$WI_DIR"/*.json 2>/dev/null | wc -l | tr -d ' ')
 chk "distinct body still enqueues its own work item" '[ "$(( WI_FINAL - WI_AFTER ))" = 1 ]'
 
+echo; echo "── Quarantine dedup: same SIF-flagged DM via two delivery paths (different ts) → ONE entry ──"
+# SAME failure mode as the work-item bug, now for quarantine_message: a SIF-flagged DM
+# arriving via BOTH the daemon path and the poll fallback with DIFFERENT receivedAt
+# timestamps must collapse to ONE quarantine entry (keying on from|ts|body double-quarantined
+# it, doubling the owner-review surface). Force the content-guard to quarantine by stubbing
+# sif-guard.sh (the real one passes these clean bodies); restore it right after.
+QUAR_DIR="$STATE_DIR/agent-quarantine"
+SIF_SAVED="$HOOKS/sif-guard.sh.real.$$"
+cp "$HOOKS/sif-guard.sh" "$SIF_SAVED"
+cat > "$HOOKS/sif-guard.sh" <<'SIFSTUB'
+#!/bin/bash
+# test stub: always quarantine (mirror real sif-guard: emit verdict JSON on stdout, exit 10)
+cat >/dev/null 2>&1
+printf '{"decision":"quarantine","rule":"test-forced"}\n'
+exit 10
+SIFSTUB
+chmod +x "$HOOKS/sif-guard.sh"
+QUAR_BODY="please action this flagged request now"
+QUAR_BEFORE=$(ls "$QUAR_DIR"/*.json 2>/dev/null | wc -l | tr -d ' ')
+deliver_ts "$WORKER_PK" "$QUAR_BODY" "2026-08-18T11:00:00Z"   # daemon path
+deliver_ts "$WORKER_PK" "$QUAR_BODY" "2026-08-18T11:00:04Z"   # poll path — SAME body, +4s ts
+QUAR_AFTER=$(ls "$QUAR_DIR"/*.json 2>/dev/null | wc -l | tr -d ' ')
+chk "duplicate flagged DM (differing ts) produced exactly ONE quarantine entry" '[ "$(( QUAR_AFTER - QUAR_BEFORE ))" = 1 ]'
+QEXP_ID="$(printf '%s|%s' "$WORKER_PK" "$QUAR_BODY" | sha1sum | cut -c1-16)"
+chk "quarantine entry keyed by sha1(from|body), not the timestamp" '[ -f "'"$QUAR_DIR/$QEXP_ID.json"'" ]'
+mv "$SIF_SAVED" "$HOOKS/sif-guard.sh"   # restore the real content-guard
+
+echo; echo "── Deferred-stash dedup: same pre-auth coord envelope via two delivery paths (different ts) → ONE stash ──"
+# SAME failure mode for the deferred-stash fallback: an unauthorized (pending) sender's
+# first-contact COORDINATION envelope is stashed (issue #14) for later replay. With NO Nostr
+# event id present, the stash id falls back to a CONTENT key — sha1(from|body), ts EXCLUDED —
+# so the same envelope arriving via the daemon AND the poll path collapses to ONE stash.
+DEF_DIR="$STATE_DIR/agent-deferred"
+DEF_PK="$(printf '%064x' 3735928559)"   # 64-char lowercase hex (…deadbeef); stash_deferred requires hex
+DEF_ENV="$(jq -nc '{a2a:"1",kind:"consult.request",consult:"cX",area:"y",payload:{note:"pre-auth hello"}}')"
+DEF_BEFORE=$(ls "$DEF_DIR/$DEF_PK"/*.json 2>/dev/null | wc -l | tr -d ' ')
+deliver_ts "$DEF_PK" "$DEF_ENV" "2026-08-18T12:00:00Z"   # daemon path (no event id → content key)
+deliver_ts "$DEF_PK" "$DEF_ENV" "2026-08-18T12:00:07Z"   # poll path — SAME body, +7s ts
+DEF_AFTER=$(ls "$DEF_DIR/$DEF_PK"/*.json 2>/dev/null | wc -l | tr -d ' ')
+chk "duplicate pre-auth envelope (differing ts) produced exactly ONE deferred stash" '[ "$(( DEF_AFTER - DEF_BEFORE ))" = 1 ]'
+DEXP_ID="$(printf '%s|%s' "$DEF_PK" "$DEF_ENV" | sha1sum | cut -c1-16)"
+chk "deferred stash keyed by sha1(from|body), not the timestamp" '[ -f "'"$DEF_DIR/$DEF_PK/$DEXP_ID.json"'" ]'
+
 echo; echo "── Rendered ledgers ──"
 bash "$TC" render demo >/dev/null
 chk "ledger.md rendered" '[ -f "$TEAM_ROOT/demo/ledger.md" ]'
