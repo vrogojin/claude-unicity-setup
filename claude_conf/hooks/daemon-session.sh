@@ -95,9 +95,25 @@ _ds_spawn_detached() {
   # setsid → new session (immune to the shell's SIGHUP); nohup defensive; stdio fully detached;
   # `&` background; the subshell returns immediately. The daemon writes its own pidfile and
   # refuses a double-start, so a race between two sessions leaves exactly one daemon.
-  ( setsid nohup env NODE_PATH="$np" node "$daemon" start --project "$proj" --live \
+  #
+  # setsid is util-linux and is ABSENT from Git Bash / MSYS2 on Windows. Calling it
+  # unconditionally aborted the pipeline before node ever ran, so the daemon never started on
+  # Windows hosts — silently, because the subshell's own redirect swallowed the error while the
+  # line below still logged "started". Probe for it and drop it when missing: nohup alone
+  # already covers SIGHUP, which is all setsid was buying here.
+  local detach=""
+  command -v setsid >/dev/null 2>&1 && detach="setsid"
+  ( ${detach} nohup env NODE_PATH="$np" node "$daemon" start --project "$proj" --live \
       </dev/null >>"$logf" 2>&1 & ) >/dev/null 2>&1
-  _ds_log "started detached daemon for $proj (log: $logf)"
+  # Verify before claiming success — the unconditional log line was how the missing setsid
+  # stayed invisible on Windows.
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    if _ds_daemon_running; then _ds_log "started detached daemon for $proj (log: $logf)"; return 0; fi
+    sleep 1
+  done
+  _ds_log "daemon did NOT come up for $proj within 10s — see $logf"
+  return 1
 }
 
 ds_start() {
