@@ -130,6 +130,10 @@ export CLAUDE_STREAM_IDLE_TIMEOUT_MS="${CLAUDE_STREAM_IDLE_TIMEOUT_MS:-1200000}"
 export CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS="${CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS:-1200000}"
 export AUTOMATION_JOB="$JOB"
 export CLAUDE_PROJECT_DIR="$PROJ"
+# Never let a git/gh op block on a credential prompt at 3 AM — it would hang while
+# holding the flock below and wedge every future run.
+export GIT_TERMINAL_PROMPT=0
+export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -oBatchMode=yes}"
 # APPEND the standard dirs (don't prepend): guarantees git/jq/etc. resolve at 3 AM
 # under a bare cron/systemd PATH, without demoting the caller's own PATH entries.
 export PATH="${PATH:-}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -166,6 +170,9 @@ if [ "$JOB" = housekeeping ] && [ -x "$SWEEP_WT_SH" ] \
   RC_WT=$?
   if [ "$RC_WT" -eq 3 ]; then
     _write_journal skipped_worktree_exists null "a prior sweep worktree still exists — skipped tonight (surface, don't stack)"
+    # notify so the crash the collision is surfacing is actually visible (a silent
+    # skip could repeat for up to 7 nights until the sweep-dir prune clears it).
+    notify "Automation: housekeeping skipped" "a prior sweep worktree still exists — investigate/clean it; journal: $JOURNAL" normal
     _rj_log "housekeeping: sweep worktree collision — skipping this fire"
     exit 0
   elif [ "$RC_WT" -ne 0 ] || [ -z "$SWEEP_WT" ] || [ ! -d "$SWEEP_WT" ]; then
@@ -223,9 +230,10 @@ if [ -n "$SWEEP_WT" ] && [ -x "$SWEEP_POST_SH" ]; then
     case "$PRC" in
       0)  SUMMARY_EXTRA="PR opened" ;;
       10) SUMMARY_EXTRA="nothing shipped" ;;
+      11) STATUS=failed; SUMMARY_EXTRA="hand-off anomaly (nothing pushed, worktree left)" ;;
       20) STATUS=failed; SUMMARY_EXTRA="aborted: red tests" ;;
       21) STATUS=failed; SUMMARY_EXTRA="aborted: secret detected" ;;
-      30) STATUS=failed; SUMMARY_EXTRA="push/PR failed" ;;
+      30) STATUS=failed; SUMMARY_EXTRA="push/PR/diff-cap failed" ;;
       *)  STATUS=failed; SUMMARY_EXTRA="post-phase rc=$PRC" ;;
     esac
     _rj_log "housekeeping post-phase rc=$PRC ($SUMMARY_EXTRA)"

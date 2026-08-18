@@ -37,8 +37,13 @@ fi
 _sw_log()  { echo "[sweep-worktree] $*" >&2; }
 _sw_die()  { _sw_log "$*"; exit 1; }
 
+# Never block on a credential prompt at 3 AM (would hang holding the run-job flock).
+export GIT_TERMINAL_PROMPT=0
+export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -oBatchMode=yes}"
+
 MAIN_REF="${SWEEP_MAIN_REF:-origin/main}"
 PRUNE_DAYS="${SWEEP_PRUNE_DAYS:-7}"
+NET_TO="${SWEEP_NET_TIMEOUT:-300}"
 HK_DIR="$STATE_DIR/automation/housekeeping"
 
 # --- helpers ------------------------------------------------------------------
@@ -69,11 +74,16 @@ _prune() { # <repo-abspath>
   git -C "$repo" worktree prune 2>/dev/null || true
 }
 
-# true if the repo already has a live sweep/* worktree (a prior night's crash).
-_has_sweep_worktree() { # <repo-abspath>
-  git -C "$1" worktree list --porcelain 2>/dev/null \
-    | awk '/^branch /{ if ($2 ~ /^refs\/heads\/sweep\//) { print; exit } }' \
-    | grep -q .
+# true if this repo already has a live sweep worktree under OUR sweep base dir
+# (a prior night's crash). Scoped to the base dir — NOT the global sweep/* branch
+# namespace — so a human's unrelated `sweep/foo` checkout never wedges the job,
+# and a crashed DETACHED worktree (create crashed before `switch`) is still caught.
+_has_sweep_worktree() { # <repo-abspath> <base-dir>
+  local repo="$1" bd="$2" p
+  while IFS= read -r p; do
+    case "$p" in "worktree "*) p="${p#worktree }"; case "$p" in "$bd"/*) return 0 ;; esac ;; esac
+  done < <(git -C "$repo" worktree list --porcelain 2>/dev/null)
+  return 1
 }
 
 # copy repo/.claude into the worktree, EXCLUDING agent/ and any secret material.
@@ -95,9 +105,16 @@ _copy_claude_min_agent() { # <repo-abspath> <worktree>
     esac
     cp -a "$entry" "$dst/" 2>/dev/null || cp -r "$entry" "$dst/" 2>/dev/null || true
   done
-  # belt-and-suspenders: scrub anything sensitive that slipped through a glob edge.
+  # belt-and-suspenders scrub (a name-based top-level filter is not enough):
+  #  1. drop the identity dir outright.
   rm -rf "$dst/agent" 2>/dev/null || true
-  find "$dst" -maxdepth 2 \( -name '.env' -o -name '.env.*' -o -name '.secrets' \) \
+  #  2. remove EVERY symlink — a link named innocently (cp -a preserves links,
+  #     never dereferences) could point at the real .secrets/$HOME outside the wt.
+  find "$dst" -type l -delete 2>/dev/null || true
+  #  3. scrub secret-bearing files at ANY depth (not just maxdepth 2).
+  find "$dst" \( -name '.env' -o -name '.env.*' -o -name '.secrets' -o -name 'agent' \
+       -o -name 'id_rsa' -o -name 'id_ed25519' -o -name 'id_ecdsa' \
+       -o -name '*.pem' -o -name '*.p12' -o -name '*.pfx' -o -name '*.jks' -o -name '*.keystore' \) \
     -exec rm -rf {} + 2>/dev/null || true
   return 0
 }
@@ -138,30 +155,28 @@ case "$cmd" in
     #    week-old crashed worktree can't wedge every future sweep.
     _prune "$repo"
 
-    # 2. refresh origin and require the base ref to resolve.
-    git -C "$repo" fetch origin --quiet 2>/dev/null || _sw_log "warn: git fetch origin failed — using cached refs"
+    # 2. refresh origin (bounded; never prompts) and require the base ref.
+    timeout "$NET_TO" git -C "$repo" fetch origin --quiet 2>/dev/null || _sw_log "warn: git fetch origin failed/timed out — using cached refs"
     git -C "$repo" rev-parse --verify -q "$MAIN_REF" >/dev/null 2>&1 \
       || _sw_die "create: $MAIN_REF does not resolve — cannot base a sweep on it"
 
     date="$(_date)"; bd="$(_base_dir "$repo")"; wt="$bd/$date"
 
-    # 3. collision → skip tonight (do not stack on a prior crashed run).
-    if _has_sweep_worktree "$repo"; then
-      _sw_log "a sweep/* worktree already exists for this repo — skip (collision)"; exit 3
+    # 3. collision → skip tonight (do not stack on a prior crashed run). Scoped to
+    #    OUR base dir, and catches a detached leftover too.
+    if _has_sweep_worktree "$repo" "$bd"; then
+      _sw_log "a sweep worktree already exists under $bd — skip (collision)"; exit 3
     fi
     if [ -e "$wt" ]; then
       _sw_log "sweep dir already exists ($wt) — skip (collision)"; exit 3
     fi
 
-    # 4. create the worktree off origin/main and switch to the dated sweep branch.
+    # 4. create the worktree off origin/main ON the dated sweep branch in ONE step
+    #    (no detached window a crash could leak; -B resets a stale same-date ref).
     mkdir -p "$bd" 2>/dev/null || _sw_die "create: cannot make sweep base $bd"
-    # Silence git's chatter entirely — stdout is reserved for the worktree path.
-    if ! git -C "$repo" worktree add --detach "$wt" "$MAIN_REF" >/dev/null 2>&1; then
+    if ! git -C "$repo" worktree add -B "sweep/$date" "$wt" "$MAIN_REF" >/dev/null 2>&1; then
+      git -C "$repo" worktree remove --force "$wt" 2>/dev/null || rm -rf "$wt" 2>/dev/null || true
       _sw_die "create: git worktree add failed"
-    fi
-    if ! git -C "$wt" switch -C "sweep/$date" >/dev/null 2>&1; then
-      git -C "$repo" worktree remove --force "$wt" 2>/dev/null || rm -rf "$wt"
-      _sw_die "create: could not switch to sweep/$date"
     fi
 
     # 5. materialize .claude (minus agent/secrets) so the safety hooks are LIVE.
@@ -174,21 +189,26 @@ case "$cmd" in
   destroy)
     [ -n "${1:-}" ] || _sw_die "destroy: need <worktree>"
     wt="$1"
-    # discover the owning repo from the worktree's gitdir so we can prune siblings.
-    repo=""
+    # discover the owning repo + branch from the worktree's gitdir BEFORE removal
+    # (so we can prune siblings and delete the branch ref, which otherwise piles up).
+    repo=""; br=""
     if [ -d "$wt" ]; then
       # --git-common-dir points at the MAIN repo's .git; its parent is the repo.
       cdir="$(git -C "$wt" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
       [ -n "$cdir" ] && repo="$(cd "$cdir/.." 2>/dev/null && pwd || echo "")"
+      br="$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null)"
     fi
+    # fall back to two-levels-up if git couldn't resolve the repo, so we still prune.
+    [ -z "$repo" ] && repo="$(cd "$(dirname "$(dirname "$wt")")" 2>/dev/null && pwd || echo "")"
     if [ -n "$repo" ] && [ -d "$repo" ]; then
       git -C "$repo" worktree remove --force "$wt" 2>/dev/null || true
       git -C "$repo" worktree prune 2>/dev/null || true
+      case "$br" in sweep/*) git -C "$repo" branch -D "$br" 2>/dev/null || true ;; esac
     fi
     rm -rf "$wt" 2>/dev/null || true
     # 7-day prune of the sibling sweep dirs for this repo.
     [ -n "$repo" ] && [ -d "$repo" ] && _prune "$repo"
-    _sw_log "destroyed sweep worktree $wt"
+    _sw_log "destroyed sweep worktree $wt${br:+ (branch $br)}"
     exit 0 ;;
 
   ""|-h|--help|help)

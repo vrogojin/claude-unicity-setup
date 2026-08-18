@@ -44,6 +44,9 @@ export GH_CALLS="$TMP/gh-calls.log"; : > "$GH_CALLS"
 # --- build a scratch repo with a bare origin on main --------------------------
 mk_repo() {
   rm -rf "$TMP/origin.git" "$TMP/repo"
+  # clear per-run state so one test can't inherit another's hand-off/marker
+  rm -rf "$AUTOMATION_STATE_DIR/automation/housekeeping/handoff" \
+         "$AUTOMATION_STATE_DIR/automation/housekeeping/last-sweep.json" 2>/dev/null
   git init -q --bare "$TMP/origin.git"
   git clone -q "$TMP/origin.git" "$TMP/repo" 2>/dev/null
   cd "$TMP/repo" || return 1
@@ -161,6 +164,7 @@ chk "report has the what/why one-liner"   "grep -q 'extracted duplicated retry h
 chk "report lists steelman verdict"       "grep -qi 'pass-with-notes' \"$RPT\""
 chk "gh pr create was invoked"            "grep -q 'pr create' \"$GH_CALLS\""
 chk "PR labeled sweep:auto"               "grep -q 'sweep:auto' \"$GH_CALLS\""
+chk "PR body prepended via gh api PATCH"  "grep -q 'api -X PATCH' \"$GH_CALLS\""
 chk "branch pushed to origin"             "[ -n \"\$(git -C \"$TMP/repo\" ls-remote origin refs/heads/sweep/20260301 2>/dev/null)\" ]"
 ART="$AUTOMATION_STATE_DIR/automation/housekeeping/artifacts.json"
 chk "artifacts.json has PR url"           "jq -e 'index(\"https://github.com/o/r/pull/42\")!=null' \"$ART\" >/dev/null"
@@ -211,6 +215,59 @@ WTG="$(bash "$WT_SH" create "$TMP/repo")"
 git -C "$WTG" switch -C notsweep >/dev/null 2>&1
 SWEEP_TEST_CMD=true SWEEP_GH_BIN="$TMP/bin/gh" bash "$POST_SH" "$WTG" "$TMP/repo" >/dev/null 2>&1
 chk "non-sweep branch → exit 20 (refused)" "[ \$? -eq 20 ]"
+
+echo "== T11: UNTRAILERED commit → hand-off anomaly (exit 11), NOTHING pushed, worktree LEFT =="
+export SWEEP_DATE=20260801; mk_repo
+WTU="$(bash "$WT_SH" create "$TMP/repo")"
+printf '// tidy\n' >> "$WTU/backend/src/app.ts"
+git -C "$WTU" add -A; git -C "$WTU" commit -q -m "refactor: no trailer"   # <-- NO Sweep-Theme trailer
+write_handoff "$AUTOMATION_STATE_DIR/automation/housekeeping/handoff" '[]'
+SWEEP_TEST_CMD=true SWEEP_GH_BIN="$TMP/bin/gh" bash "$POST_SH" "$WTU" "$TMP/repo" >/dev/null 2>&1
+chk "untrailered commit → exit 11"          "[ \$? -eq 11 ]"
+chk "untrailered commit → NOTHING pushed"   "[ -z \"\$(git -C \"$TMP/repo\" ls-remote origin refs/heads/sweep/20260801 2>/dev/null)\" ]"
+chk "untrailered commit → worktree LEFT (surface, don't destroy)" "[ -d \"$WTU\" ]"
+chk "untrailered commit → marker NOT advanced" "[ \"\$(bash \"$WT_SH\" marker-read \"$TMP/repo\")\" != \"\$(git -C \"$TMP/repo\" rev-parse origin/main)\" ]"
+bash "$WT_SH" destroy "$WTU" >/dev/null 2>&1
+
+echo "== T12: secret ONLY in the model's what_why prose → caught (exit 21) =="
+export SWEEP_DATE=20260802; mk_repo
+WTP="$(bash "$WT_SH" create "$TMP/repo")"
+commit_theme "$WTP" "backend/src" "backend/src/app.ts" "// clean change"
+write_handoff "$AUTOMATION_STATE_DIR/automation/housekeeping/handoff" \
+  '[{"theme":"backend/src","what_why":"pasted a key AKIAIOSFODNN7EXAMPLE into the note","status":"shipped"}]'
+SWEEP_TEST_CMD=true SWEEP_GH_BIN="$TMP/bin/gh" bash "$POST_SH" "$WTP" "$TMP/repo" >/dev/null 2>&1
+chk "secret in PR-body prose → exit 21"     "[ \$? -eq 21 ]"
+chk "secret in prose → NOTHING pushed"      "[ -z \"\$(git -C \"$TMP/repo\" ls-remote origin refs/heads/sweep/20260802 2>/dev/null)\" ]"
+
+echo "== T13: diff-cap revert CONFLICT → clean abort (exit 30), no push, tree not mid-revert =="
+export SWEEP_DATE=20260803; mk_repo
+( cd "$TMP/repo" && jq '.automation.housekeeping.max_diff_lines=1' .claude/agent/config.json > c && mv c .claude/agent/config.json )
+WTX="$(bash "$WT_SH" create "$TMP/repo")"
+# alpha is the LARGER (older) theme; beta later rewrites alpha's lines. diff-cap
+# drops the largest (alpha) FIRST → reverting the older commit whose lines beta
+# changed → merge conflict on revert → must clean-abort, not push a dirty branch.
+printf 'L1\nL2\nL3\n' > "$WTX/backend/src/shared.ts"
+printf 'a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n' > "$WTX/backend/src/big.ts"
+git -C "$WTX" add -A; git -C "$WTX" commit -q -m "theme A (large)" -m "Sweep-Theme: alpha"
+printf 'L1-x\nL2-x\nL3-x\n' > "$WTX/backend/src/shared.ts"; git -C "$WTX" add -A
+git -C "$WTX" commit -q -m "theme B" -m "Sweep-Theme: beta"
+write_handoff "$AUTOMATION_STATE_DIR/automation/housekeeping/handoff" \
+  '[{"theme":"alpha","what_why":"a","status":"shipped"},{"theme":"beta","what_why":"b","status":"shipped"}]'
+SWEEP_TEST_CMD=true SWEEP_GH_BIN="$TMP/bin/gh" bash "$POST_SH" "$WTX" "$TMP/repo" >/dev/null 2>&1
+rc=$?
+chk "revert conflict → exit 30 (clean abort)"    "[ $rc -eq 30 ]"
+chk "revert conflict → NOTHING pushed"           "[ -z \"\$(git -C \"$TMP/repo\" ls-remote origin refs/heads/sweep/20260803 2>/dev/null)\" ]"
+chk "revert conflict → tree NOT left mid-revert"  "[ ! -e \"$WTX/.git\" ] || ! git -C \"$WTX\" rev-parse -q --verify REVERT_HEAD >/dev/null 2>&1"
+bash "$WT_SH" destroy "$WTX" >/dev/null 2>&1
+
+echo "== T14: collision scoping — a human sweep/* worktree ELSEWHERE does NOT wedge the job =="
+export SWEEP_DATE=20260901; mk_repo
+HUMANWT="$TMP/human-sweep"
+git -C "$TMP/repo" worktree add -b sweep/human-experiment "$HUMANWT" >/dev/null 2>&1   # human's own sweep/* checkout, OUTSIDE our base dir
+WTH="$(bash "$WT_SH" create "$TMP/repo" 2>/dev/null)"; rc=$?
+chk "human sweep/* elsewhere → create still succeeds (rc 0)" "[ $rc -eq 0 ] && [ -d \"$WTH\" ]"
+git -C "$TMP/repo" worktree remove --force "$HUMANWT" >/dev/null 2>&1
+bash "$WT_SH" destroy "$WTH" >/dev/null 2>&1
 
 echo
 if [ "$FAIL" = 0 ]; then echo "ALL CHECKS PASSED"; else echo "SOME CHECKS FAILED"; fi

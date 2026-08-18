@@ -3,15 +3,20 @@
 # the nightly housekeeping sweep (design §5.4 wrapper post-phase + §5.6 report).
 #
 # This is the safety spine of F3: the MODEL never pushes and never opens a PR —
-# THIS wrapper does, and only after every gate passes. In order:
-#   1. branch guard      — refuse anything that isn't sweep/<date> (never main).
-#   2. shipped themes     — map commits→theme via the `Sweep-Theme:` trailer.
-#   3. FINAL green check   — build+test autodetect; red ⇒ ABORT, no PR (§5.4.5).
-#   4. SECRET-SCAN the diff — private-key blocks / AKIA / ghp_ / bearer / nsec /
-#                             .env|.secrets|agent additions ⇒ ABORT + CRITICAL
-#                             alert, no push (§6 row 9). NON-NEGOTIABLE.
-#   5. diff-cap            — over max_diff_lines ⇒ drop the LARGEST theme (revert,
-#                            never truncate a hunk) and journal it (§5.4).
+# THIS wrapper does, and only after every gate passes. In order (ORDER MATTERS —
+# a revert can re-expose deleted content and can break the build, so the green
+# check + secret scan run on the POST-diff-cap tree, immediately before push):
+#   1. branch guard        — refuse anything that isn't sweep/<date> (never main).
+#   2. nothing-shipped vs anomaly — every commit MUST carry a Sweep-Theme trailer;
+#                            untrailered/unmappable work is NOT pushed (fail-closed).
+#   3. diff-cap            — over max_diff_lines ⇒ drop the LARGEST theme (revert,
+#                            never truncate a hunk); revert conflict/merge ⇒ ABORT.
+#   4. FINAL green check   — build+test autodetect on the post-revert tree; red ⇒
+#                            ABORT, no PR (§5.4.5).
+#   5. SECRET-SCAN (NON-NEGOTIABLE, FAIL-CLOSED) — private-key blocks / AKIA /
+#                            ghp_ / bearer / nsec / .env|.secrets|agent|key-file
+#                            paths, over the post-revert diff AND the model-authored
+#                            PR body; a scan that cannot run ⇒ ABORT (§6 row 9).
 #   6. push sweep/* only   — the wrapper refuses to push any other ref (§6 row 5).
 #   7. gh pr create        — ≤ max_prs, label sweep:auto.
 #   8. morning-review report (§5.6): wrapper computes ALL numbers; the model only
@@ -28,7 +33,8 @@
 # indistinguishable from failure and is not allowed (§5.6).
 #
 # Exit codes (consumed by run-job.sh): 0 PR opened · 10 nothing shipped ·
-# 20 aborted:red-tests · 21 aborted:secret · 30 push/PR failed.
+# 11 hand-off anomaly (unmappable commits — nothing pushed, worktree LEFT) ·
+# 20 aborted:red-tests/branch · 21 aborted:secret/scan-failed · 30 push/PR/diff-cap.
 #
 # Test overrides: AUTOMATION_STATE_DIR, SWEEP_DATE, SWEEP_MAIN_REF,
 # SWEEP_HANDOFF_DIR, SWEEP_TEST_CMD (force the green check: `true`/`false`/cmd),
@@ -43,6 +49,11 @@ else
   . "$SP_HOOKS_PARENT/state-dir.sh" 2>/dev/null || STATE_DIR="/tmp/claude"
 fi
 . "$SP_HOOKS_PARENT/notify.sh" 2>/dev/null || notify() { :; }
+
+# Never let a git/gh op block on a credential prompt at 3 AM (it would hang while
+# holding the run-job flock and wedge every future run).
+export GIT_TERMINAL_PROMPT=0
+export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -oBatchMode=yes}"
 
 _sp_log() { echo "[sweep-post] $*" >&2; }
 
@@ -77,7 +88,7 @@ REPORT="$HK_DIR/report-$DATE.md"
 # commit→theme mapping via the `Sweep-Theme:` git trailer (robust; not body regex)
 _theme_commits() { # <theme> → shas (newest first) whose Sweep-Theme trailer == theme
   local t="$1" s
-  for s in $(git -C "$WT" rev-list "$MAIN_REF..HEAD" 2>/dev/null); do
+  for s in $(git -C "$WT" rev-list --no-merges "$MAIN_REF..HEAD" 2>/dev/null); do
     if git -C "$WT" show -s --format='%(trailers:key=Sweep-Theme,valueonly,separator=%x0A)' "$s" 2>/dev/null \
          | sed '/^$/d' | grep -Fxq "$t"; then printf '%s\n' "$s"; fi
   done
@@ -179,25 +190,98 @@ _advance_marker() {
 }
 _cleanup_wt() { [ -x "$WT_SH" ] && AUTOMATION_STATE_DIR="$STATE_DIR" bash "$WT_SH" destroy "$WT" >/dev/null 2>&1 || true; }
 
-# ===== 0. nothing shipped =====================================================
-if [ "$HAS_COMMITS" -eq 0 ] || [ "${#BRANCH_THEMES[@]}" -eq 0 ]; then
-  _sp_log "no commits / no themes on $BRANCH — nothing shipped"
+# reap dated reports older than 14 days (parity with the journal reap)
+find "$HK_DIR" -maxdepth 1 -name 'report-*.md' -mtime +14 -delete 2>/dev/null || true
+
+# ===== 0. nothing shipped vs. hand-off anomaly ================================
+# Every commit on the branch MUST carry a Sweep-Theme trailer (the wrapper maps
+# commits→theme by it, for diff-cap). Fail-closed on any deviation:
+#   • 0 commits                    → truly nothing shipped (advance marker, exit 10)
+#   • commits but some untrailered → the wrapper cannot safely diff-cap/attribute
+#     the work → DO NOT push, DO NOT advance the marker, LEAVE the worktree so the
+#     next night surfaces it (exit 11). This prevents silent work-loss and closes
+#     the "untrailered commit bypasses the cap" hole.
+TRAILERED=0
+while IFS= read -r s; do
+  [ -n "$s" ] || continue
+  git -C "$WT" show -s --format='%(trailers:key=Sweep-Theme,valueonly)' "$s" 2>/dev/null | grep -q . && TRAILERED=$((TRAILERED+1))
+done < <(git -C "$WT" rev-list "$MAIN_REF..HEAD" 2>/dev/null)
+
+if [ "$HAS_COMMITS" -eq 0 ]; then
+  _sp_log "no commits on $BRANCH — nothing shipped"
   _write_report "❌ nothing shipped" "**No qualifying changes tonight** — no themes met the no-churn/named-defect bar, or all were abandoned." "" ""
-  _emit_artifacts ""
-  _deliver_notify "❌ nothing shipped" ""
-  _advance_marker
-  _cleanup_wt
+  _emit_artifacts ""; _deliver_notify "❌ nothing shipped" ""
+  _advance_marker; _cleanup_wt
   exit 10
 fi
+if [ "${#BRANCH_THEMES[@]}" -eq 0 ] || [ "$TRAILERED" -ne "$HAS_COMMITS" ]; then
+  _sp_log "anomaly: $HAS_COMMITS commit(s), $TRAILERED trailered, ${#BRANCH_THEMES[@]} theme(s) — refusing to push unattributed work"
+  _write_report "⚠️ partial (hand-off anomaly)" "**Sweep made commits the wrapper cannot map to Sweep-Theme trailers** ($TRAILERED/$HAS_COMMITS trailered) — NOTHING pushed; worktree left for review." "" ""
+  _emit_artifacts ""
+  notify "Nightly sweep — $DATE" "⚠️ hand-off anomaly: $TRAILERED/$HAS_COMMITS commits trailered — nothing pushed, worktree left" critical
+  # do NOT advance marker, do NOT destroy — surface it.
+  exit 11
+fi
 
-# ===== 3. FINAL green check ===================================================
+# ===== 1. diff-cap FIRST — mutate history BEFORE we verify/scan/push ==========
+# (Order matters: a revert can re-expose deleted content and can break the build,
+#  so the green check + secret scan must run on the POST-revert tree.)
+_diff_total() { git -C "$WT" diff --numstat "$MAIN_REF...HEAD" 2>/dev/null | awk -F'\t' '{a+=$1; d+=$2} END{print a+d+0}'; }
+_theme_size() { # <theme> → added+deleted across that theme's (non-merge) commits
+  local total=0 s
+  for s in $(_theme_commits "$1"); do
+    total=$(( total + $(git -C "$WT" show --numstat --format= "$s" 2>/dev/null | awk -F'\t' '{a+=$1;d+=$2} END{print a+d+0}') ))
+  done
+  echo "$total"
+}
+declare -A REVERTED     # global dedup: a commit is reverted at most once
+_drop_theme() {         # revert this theme's commits newest-first; abort-on-conflict
+  local s
+  for s in $(_theme_commits "$1"); do
+    [ -n "${REVERTED[$s]:-}" ] && continue         # already reverted for another theme
+    if git -C "$WT" rev-list --no-walk --merges "$s" 2>/dev/null | grep -q .; then
+      _sp_log "cannot revert merge commit $s — aborting diff-cap"; return 1
+    fi
+    if ! git -C "$WT" revert --no-edit "$s" >/dev/null 2>&1; then
+      git -C "$WT" revert --abort >/dev/null 2>&1 || true    # never leave a dirty tree
+      _sp_log "revert $s conflicted — aborting diff-cap"; return 1
+    fi
+    REVERTED["$s"]=1
+  done
+  return 0
+}
+CAP_ABORT=0
+TOTAL="$(_diff_total)"
+while [ "$TOTAL" -gt "$MAX_DIFF" ] && [ "${#BRANCH_THEMES[@]}" -gt 1 ]; do
+  big=""; bigsz=-1
+  for th in "${BRANCH_THEMES[@]}"; do
+    sz="$(_theme_size "$th")"
+    if [ "$sz" -gt "$bigsz" ]; then bigsz="$sz"; big="$th"; fi
+  done
+  [ -n "$big" ] || break
+  _sp_log "diff-cap: total=$TOTAL > $MAX_DIFF — dropping largest theme '$big' ($bigsz lines)"
+  if ! _drop_theme "$big"; then CAP_ABORT=1; break; fi
+  DROPPED+=("$big")
+  new=(); for th in "${BRANCH_THEMES[@]}"; do [ "$th" = "$big" ] || new+=("$th"); done
+  BRANCH_THEMES=(${new[@]+"${new[@]}"})
+  TOTAL="$(_diff_total)"
+done
+if [ "$CAP_ABORT" = 1 ]; then
+  _sp_log "diff-cap could not converge cleanly (revert conflict/merge) — aborting, no push"
+  _write_report "⚠️ partial (diff-cap could not converge)" "**A theme revert conflicted; the branch was left un-pushed for review.**" "" ""
+  _emit_artifacts ""
+  notify "Nightly sweep — $DATE" "⚠️ diff-cap revert conflict — nothing pushed, worktree left" critical
+  exit 30    # leave worktree, do not advance marker
+fi
+[ "$TOTAL" -gt "$MAX_DIFF" ] && _sp_log "note: single remaining theme still > cap ($TOTAL) — kept, not truncated"
+
+# ===== 2. FINAL green check — on the POST-diff-cap tree =======================
 TEST_LOG="$HK_DIR/last-test.log"
 _run_tests() {
   : > "$TEST_LOG"
   if [ -n "${SWEEP_TEST_CMD:-}" ]; then
     ( cd "$WT" && eval "$SWEEP_TEST_CMD" ) >>"$TEST_LOG" 2>&1; return $?
   fi
-  # autodetect (mirrors pre-commit-check.sh / check-diagnostics.sh)
   if   [ -f "$WT/Cargo.toml" ];   then ( cd "$WT" && cargo test --workspace ) >>"$TEST_LOG" 2>&1
   elif [ -f "$WT/package.json" ]; then
         if jq -e '.scripts.test' "$WT/package.json" >/dev/null 2>&1; then ( cd "$WT" && npm test --silent ) >>"$TEST_LOG" 2>&1
@@ -207,88 +291,16 @@ _run_tests() {
 }
 if ! _run_tests; then
   _sp_log "FINAL green check RED — aborting, no PR (§5.4.5)"
-  # test summary for the report
   printf '| suite | result |\n|---|---|\n| autodetect | ❌ FAILED (see %s) |\n' "$TEST_LOG" > "$HK_DIR/tests-summary.md"
   _write_report "❌ nothing shipped (tests red)" "**Sweep aborted: the final build/test check failed.** Nothing was pushed. See $TEST_LOG." "" ""
   _emit_artifacts ""
   notify "Nightly sweep — $DATE" "❌ aborted: final tests RED — nothing pushed" critical
-  # do NOT advance the marker on an abort — the next night re-scans this window.
-  _cleanup_wt
+  _cleanup_wt   # clean abort (no PR) — safe to destroy; marker NOT advanced
   exit 20
 fi
 printf '| suite | result | detail |\n|---|---|---|\n| autodetect | ✅ green | see %s |\n' "$TEST_LOG" > "$HK_DIR/tests-summary.md"
 
-# ===== 4. SECRET-SCAN the diff (NON-NEGOTIABLE) ===============================
-SECRET_RE='-----BEGIN [A-Z ]*PRIVATE KEY-----|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35}|nsec1[a-z0-9]{20,}|[Bb]earer[[:space:]]+[A-Za-z0-9._~+/-]{20,}|-----BEGIN OPENSSH PRIVATE KEY-----'
-# scan added lines only (drop the +++ header)
-ADDED="$(git -C "$WT" diff "$MAIN_REF...HEAD" 2>/dev/null | grep -E '^\+' | grep -Ev '^\+\+\+ ')"
-# scan the added-path list for secret files (.env / .secrets / agent identity)
-ADDED_PATHS="$(git -C "$WT" diff --name-only --diff-filter=A "$MAIN_REF...HEAD" 2>/dev/null)"
-SECRET_HIT=""
-# NB: -e is REQUIRED — SECRET_RE begins with "-----BEGIN…" which grep would
-# otherwise parse as options.
-if printf '%s' "$ADDED" | grep -Eq -e "$SECRET_RE"; then SECRET_HIT="key/token material in an added line"; fi
-if printf '%s\n' "$ADDED_PATHS" | grep -Eq -e '(^|/)\.env($|\.)|(^|/)\.secrets(/|$)|\.claude/agent/'; then
-  SECRET_HIT="${SECRET_HIT:+$SECRET_HIT; }secret-bearing file added (.env/.secrets/agent)"
-fi
-if [ -n "$SECRET_HIT" ]; then
-  _sp_log "SECRET-SCAN HIT: $SECRET_HIT — ABORTING push (§6 row 9)"
-  _write_report "❌ nothing shipped (secret detected)" "**Sweep aborted: a secret was detected in the diff and NOTHING was pushed.** ($SECRET_HIT)" "" ""
-  _emit_artifacts ""
-  notify "Nightly sweep — $DATE" "❌ CRITICAL: secret detected in sweep diff — push aborted ($SECRET_HIT)" critical
-  # do NOT advance the marker on an abort — the next night re-scans this window.
-  _cleanup_wt
-  exit 21
-fi
-
-# ===== 5. diff-cap: drop the LARGEST theme until under cap (never truncate) ===
-_diff_total() { git -C "$WT" diff --numstat "$MAIN_REF...HEAD" 2>/dev/null | awk -F'\t' '{a+=$1; d+=$2} END{print a+d+0}'; }
-_theme_size() { # <theme> → added+deleted across that theme's commits
-  local total=0 s
-  for s in $(_theme_commits "$1"); do
-    total=$(( total + $(git -C "$WT" show --numstat --format= "$s" 2>/dev/null | awk -F'\t' '{a+=$1;d+=$2} END{print a+d+0}') ))
-  done
-  echo "$total"
-}
-_drop_theme() { # revert every commit carrying <theme>'s trailer, newest first
-  local s
-  for s in $(_theme_commits "$1"); do
-    git -C "$WT" revert --no-edit "$s" >/dev/null 2>&1 || { _sp_log "revert $s failed"; return 1; }
-  done
-  return 0
-}
-TOTAL="$(_diff_total)"
-while [ "$TOTAL" -gt "$MAX_DIFF" ] && [ "${#BRANCH_THEMES[@]}" -gt 1 ]; do
-  # find largest remaining theme
-  big=""; bigsz=-1
-  for th in "${BRANCH_THEMES[@]}"; do
-    sz="$(_theme_size "$th")"
-    if [ "$sz" -gt "$bigsz" ]; then bigsz="$sz"; big="$th"; fi
-  done
-  [ -n "$big" ] || break
-  _sp_log "diff-cap: total=$TOTAL > $MAX_DIFF — dropping largest theme '$big' ($bigsz lines)"
-  _drop_theme "$big" || break
-  DROPPED+=("$big")
-  # remove from active set
-  new=(); for th in "${BRANCH_THEMES[@]}"; do [ "$th" = "$big" ] || new+=("$th"); done
-  BRANCH_THEMES=("${new[@]}")
-  TOTAL="$(_diff_total)"
-done
-[ "$TOTAL" -gt "$MAX_DIFF" ] && _sp_log "note: single remaining theme still > cap ($TOTAL) — kept, not truncated"
-
-# ===== 6. push sweep/* ONLY ===================================================
-case "$BRANCH" in sweep/*) : ;; *) _sp_log "refuse push: '$BRANCH'"; exit 20 ;; esac
-if [ "${SWEEP_SKIP_PUSH:-0}" != "1" ]; then
-  if ! git -C "$WT" push -u origin "$BRANCH" >/dev/null 2>&1; then
-    _sp_log "git push failed — leaving worktree for surfacing/retry"
-    _write_report "⚠️ partial (push failed)" "**Push of $BRANCH failed** — nothing merged; worktree left for retry." "" ""
-    _emit_artifacts ""
-    notify "Nightly sweep — $DATE" "⚠️ push failed for $BRANCH" critical
-    exit 30
-  fi
-fi
-
-# ===== 7. gh pr create (≤ max_prs; label sweep:auto) ==========================
+# ===== 3. build the PR body (model prose) — needed by the scan below ==========
 PR_BODY="$HK_DIR/pr-body.md"
 {
   printf '## Nightly housekeeping sweep — %s\n\n' "$DATE"
@@ -296,13 +308,70 @@ PR_BODY="$HK_DIR/pr-body.md"
   printf '### Themes\n'
   for th in "${BRANCH_THEMES[@]}"; do printf -- '- **%s**: %s\n' "$th" "${THEME_WHY[$th]:-see commits}"; done
   printf '\n### Skipped tests (needs credentials — not run in the secret-free sweep)\n'
-  if [ -f "$THEMES_JSON" ]; then jq -r '[.[].skipped_tests // []] | add // [] | .[] | "- " + .' "$THEMES_JSON" 2>/dev/null; fi
+  [ -f "$THEMES_JSON" ] && jq -r '[.[].skipped_tests // []] | add // [] | .[] | "- " + .' "$THEMES_JSON" 2>/dev/null
   printf '\n### Steelman\n%s\n' "$(cat "$HANDOFF/steelman-verdict.txt" 2>/dev/null || echo 'see hand-off')"
 } > "$PR_BODY"
 
+# ===== 4. SECRET-SCAN — FAIL-CLOSED — the POST-revert diff AND the model prose
+# NON-NEGOTIABLE (§6 row 9). Scans the pushed diff AND everything model-authored
+# that reaches a PR/report/DM (PR body = themes' what_why + skipped_tests +
+# steelman verdict). If the scan itself cannot run (git diff error), we ABORT —
+# "could not scan" is NEVER treated as "clean".
+SECRET_RE='-----BEGIN [A-Z ]*PRIVATE KEY-----|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35}|nsec1[a-z0-9]{20,}|[Bb]earer[[:space:]]+[A-Za-z0-9._~+/-]{20,}'
+DIFF_FILE="$HK_DIR/scan-diff.txt"
+if ! git -C "$WT" diff "$MAIN_REF...HEAD" > "$DIFF_FILE" 2>/dev/null; then
+  _sp_log "SECRET-SCAN could not compute the diff — FAIL-CLOSED abort"
+  _write_report "❌ nothing shipped (scan failed)" "**Sweep aborted: the diff could not be computed for the secret scan.** Nothing pushed." "" ""
+  _emit_artifacts ""
+  notify "Nightly sweep — $DATE" "❌ CRITICAL: secret scan could not run — push aborted (fail-closed)" critical
+  _cleanup_wt
+  exit 21
+fi
+ADDED_PATHS="$(git -C "$WT" diff --name-only --diff-filter=ACMR "$MAIN_REF...HEAD" 2>/dev/null)"
+SECRET_HIT=""
+# Materialize the scan input to a FILE first, then grep the file. Do NOT pipe a
+# producer into `grep -q`: -q exits on first match and SIGPIPEs the upstream,
+# which under `set -o pipefail` makes the pipeline non-zero *even on a match* —
+# a NON-DETERMINISTIC fail-OPEN (the scan silently passes a real secret). Grepping
+# a file has no such race.
+SCAN_INPUT="$HK_DIR/scan-input.txt"
+{ grep -E '^\+' "$DIFF_FILE" 2>/dev/null | grep -Ev '^\+\+\+ ' 2>/dev/null; cat "$PR_BODY" 2>/dev/null; } > "$SCAN_INPUT" 2>/dev/null || true
+if grep -Eq -e "$SECRET_RE" "$SCAN_INPUT"; then
+  SECRET_HIT="key/token material in the diff or PR body"
+fi
+rm -f "$SCAN_INPUT" 2>/dev/null || true
+# secret-bearing PATHS at any depth (added OR renamed-in OR modified). Here-string
+# (not a producer pipe) so `grep -q` early-exit can't SIGPIPE under pipefail.
+if grep -Eq -e '(^|/)\.env($|\.)|(^|/)\.secrets(/|$)|\.claude/agent/|(^|/)id_(rsa|ed25519|ecdsa)($|\.)|\.(pem|p12|pfx|jks|keystore)$' <<< "$ADDED_PATHS"; then
+  SECRET_HIT="${SECRET_HIT:+$SECRET_HIT; }secret-bearing file path"
+fi
+if [ -n "$SECRET_HIT" ]; then
+  _sp_log "SECRET-SCAN HIT: $SECRET_HIT — ABORTING push (§6 row 9)"
+  _write_report "❌ nothing shipped (secret detected)" "**Sweep aborted: a secret was detected and NOTHING was pushed.** ($SECRET_HIT)" "" ""
+  _emit_artifacts ""
+  notify "Nightly sweep — $DATE" "❌ CRITICAL: secret detected — push aborted ($SECRET_HIT)" critical
+  _cleanup_wt
+  exit 21
+fi
+rm -f "$DIFF_FILE" 2>/dev/null || true
+
+# ===== 5. push sweep/* ONLY (bounded; never prompts) ==========================
+case "$BRANCH" in sweep/*) : ;; *) _sp_log "refuse push: '$BRANCH'"; exit 20 ;; esac
+NET_TO="${SWEEP_NET_TIMEOUT:-300}"
+if [ "${SWEEP_SKIP_PUSH:-0}" != "1" ]; then
+  if ! timeout "$NET_TO" git -C "$WT" push -u origin "$BRANCH" >/dev/null 2>&1; then
+    _sp_log "git push failed/timed out — leaving worktree for surfacing/retry"
+    _write_report "⚠️ partial (push failed)" "**Push of $BRANCH failed** — nothing merged; worktree left for retry." "" ""
+    _emit_artifacts ""
+    notify "Nightly sweep — $DATE" "⚠️ push failed for $BRANCH" critical
+    exit 30
+  fi
+fi
+
+# ===== 6. gh pr create (≤ max_prs; label sweep:auto) ==========================
 PR_URL=""; PR_NO=""
 if [ "${SWEEP_SKIP_PUSH:-0}" != "1" ] || [ -n "${SWEEP_GH_BIN:-}" ]; then
-  PR_URL="$("$GH" pr create --base main --head "$BRANCH" \
+  PR_URL="$(timeout "$NET_TO" "$GH" pr create --base main --head "$BRANCH" \
       --title "Nightly sweep $DATE" --body-file "$PR_BODY" --label sweep:auto 2>>"$HK_DIR/gh.log")" || PR_URL=""
   PR_NO="$(printf '%s' "$PR_URL" | grep -oE '[0-9]+$' || true)"
 fi
