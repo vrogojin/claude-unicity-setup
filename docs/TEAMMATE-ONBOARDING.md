@@ -113,6 +113,25 @@ nohup node lib/sphere-daemon.mjs start --project /absolute/path/to/your-project 
 #   (a plain `start` without --live falls back to 5s polling; --live is preferred)
 ```
 
+### Upgrading an existing install (safe for AI agents / CI)
+
+`setup.sh` is **idempotent and preserve-by-default**: on an already-configured
+project it keeps the existing identity, nametag, owner, relay/group, and every
+other config value, and only refreshes framework-owned files (hooks, skills,
+settings — with your accumulated permission approvals merged back). To upgrade:
+
+```bash
+cd claude-unicity-setup && git pull
+./setup.sh /absolute/path/to/your-project --yes   # non-interactive: no prompts, never destructive
+```
+
+Non-interactive mode is automatic when stdin is not a TTY. `--dry-run` previews
+faithfully (an existing identity previews as KEPT). Existing values change only
+on explicit input — an interactive entry or a `SETUP_*` env override
+(`SETUP_OWNER_NPUB=… ./setup.sh … --yes`); regenerating the identity requires
+`FORCE_NEW_IDENTITY=1`. The full contract + override list is documented in the
+header of `setup.sh` itself.
+
 ### Path B — Communication channel only (minimal)
 
 If you only want to *talk to the coordinator* (no autonomous protocol on your side yet),
