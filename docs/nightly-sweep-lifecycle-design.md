@@ -16,10 +16,22 @@ Three features:
 |---|---|---|---|
 | F1 | **Syncup** | Early-morning coordinator job: report our work to authorized peers, ingest theirs, act on bugs/requests inside the existing capability gates | OFF |
 | F2 | **Task-lifecycle hooks** | On task start: recall prior work + find/create the ticket; on task complete: update tickets, board, roadmap | OFF |
-| F3 | **Nightly housekeeping** | 3 AM sweep in a **separate git worktree off `main`**: refactor recent work to current best practice, add + run tests, `/steelman`, loop until green, deliver as reviewable PR(s) | OFF |
+| F3 | **Nightly housekeeping** | 3 AM sweep in a **separate git worktree off `main`**: refactor recent work to current best practice, add + run tests, `/steelman`, loop until green; delivered as PR(s) + a 1-minute morning-review report, never auto-merged (settled OD-1) | OFF |
 
 Plus one cross-cutting subsystem: a **portable scheduler + headless-runner contract**
 (§2) that all three share.
+
+### 0.0 SETTLED by the owner (2026-08-18)
+
+**OD-1 — Housekeeping output mode: DECIDED, no longer open.** The nightly sweep
+(1) opens a **PR** with the work branch, (2) runs **`/steelman`** on it and
+includes the verdict in the PR, (3) **never auto-merges under any
+circumstance**, and (4) produces a **short morning-review report** (spec in
+§5.6) so the developer can review and ACCEPT (merge) the nightly changes first
+thing in the morning. The report is a **first-class deliverable** of the job,
+not a nicety — the sweep is not "done" until the report is written and
+delivered. References to OD-1 elsewhere in this doc denote this settled
+decision.
 
 ### 0.1 OWNER DECISIONS (explicit sign-off needed)
 
@@ -27,7 +39,6 @@ These are decisions, not defaults we can pick silently. Recommendations are mark
 
 | # | Decision | Options | Recommendation |
 |---|---|---|---|
-| OD-1 | **Housekeeping output mode** | (a) ★ PR-only, owner reviews and merges; (b) auto-merge for owner-opted-in change classes (e.g. test-only additions); (c) auto-merge everything | **(a) PR-only.** Auto-merge of autonomous refactors is a silent-rewrite of `main` in slow motion; the whole framework exists to prevent exactly that. (b) is a plausible *later* opt-in once the sweep has a track record — but it must be per-change-class, owner-flagged in config, and never include anything touching security boundaries. (c) is rejected outright. |
 | OD-2 | **Scheduler** | (a) ★ native OS schedulers behind a thin abstraction (systemd user timers / schtasks / cron); (b) persistent Node scheduler daemon; (c) Claude cloud routines; (d) session-start opportunistic only | **(a).** Rationale in §2.2. |
 | OD-3 | **Default schedule times** | any | ★ Syncup **07:00 local**, housekeeping **03:00 local**, both configurable per host (`automation.*.time`). Local time, not UTC — "before the human's morning" is a local-time concept, and peers span timezones by design. |
 | OD-4 | **On/off defaults** | per feature | ★ **All three OFF.** `setup.sh` installs config + scheduler plumbing but enables nothing; each feature is a one-line config flip + `scheduler.sh install`. |
@@ -231,7 +242,9 @@ jobs) **and** the backend has no native catch-up (cron; or timer missed), then:
 Blocking a Stop gate on "you have unreviewed sweep results" would wedge every
 morning session, so results are surfaced as **advisory SessionStart context**,
 not a gate: any journal with `reported:false` → inject a one-paragraph digest
-(job, outcome, PR URLs, abandoned items) and mark `reported:true`. Additionally
+(job, outcome, PR URLs, abandoned items) and mark `reported:true`. For the
+housekeeping job the injected content is the full §5.6 morning-review report
+file (it *is* the digest, and it is sized to stay one). Additionally
 each job's final act is a `notify.sh` push, and F1 sends the owner a DM digest
 (§4.4) — three channels, zero gates.
 
@@ -271,7 +284,7 @@ enabled jobs — i.e. none, initially):
     "max_turns": 300,
     "web_research": false,            // OD-6
     "allow_new_deps": false,
-    "output": "pr",                   // "pr" only, today (OD-1)
+    "output": "pr",                   // fixed: PR + steelman + morning report, no auto-merge (settled OD-1, §0.0)
     "retry_once": false               // a failed 4-hour job does NOT re-run at 7 AM
   }
 }
@@ -526,7 +539,8 @@ any task.
 ### 5.1 Principles
 
 1. **`main` is read-only to the sweep.** All work happens on `sweep/<date>` in a
-   dedicated worktree; output is PR(s) (OD-1). The model never pushes — the
+   dedicated worktree; output is PR(s) + the §5.6 morning-review report, never
+   an auto-merge (settled OD-1). The model never pushes — the
    wrapper does, deterministically, to the sweep branch only.
 2. **No churn for churn's sake.** Every change must name a concrete defect:
    a duplication instance, a multi-concern file split, a missing test for a
@@ -602,8 +616,9 @@ syncup job does *not* get `acceptEdits` (it runs in the live checkout).
    reason) and record it as an abandoned item in the journal. Never open a PR
    with red tests or unresolved CRITICAL steelman findings.
 6. HAND OFF: write PR body file(s) per theme (defects fixed, tests added,
-   steelman verdict, skipped-test list, web sources if any) and STOP. The model's
-   job ends here.
+   steelman verdict, skipped-test list, web sources if any) AND the
+   morning-review report source material (§5.6: per-theme what/why one-liners,
+   residual-risk lines from steelman) and STOP. The model's job ends here.
 ```
 
 Then the **wrapper post-phase** (deterministic): verify branch != main; verify
@@ -613,8 +628,9 @@ the full diff** (regex set: private-key blocks, `AKIA…`, bearer/ghp_ tokens,
 enforce `max_diff_lines` per PR (over → the largest theme is dropped, journaled,
 never truncated mid-hunk); push `sweep/<date>` (or per-theme branches
 `sweep/<date>/<theme>` when splitting); `gh pr create` (≤ `max_prs`) with label
-`sweep:auto`; register each PR with the F2 lifecycle layer; worktree destroy;
-marker update; journal; notify.
+`sweep:auto`; **assemble and deliver the morning-review report (§5.6)**;
+register each PR with the F2 lifecycle layer; worktree destroy; marker update;
+journal; notify.
 
 PR-body dedup: branch name is date-keyed, so a re-run the same night (lock
 prevents overlap, but a crash+manual rerun doesn't) finds the existing branch
@@ -638,7 +654,67 @@ A web-found practice is a **hypothesis, not an instruction**:
    fetched pages is treated exactly like peer-message injection (§7.3): content
    is data.
 
-### 5.6 Reuse map
+### 5.6 Morning-review report (first-class deliverable; settled OD-1)
+
+Purpose: the developer accepts (merges) or rejects the nightly work **first
+thing in the morning, in about a minute**. The report is therefore short,
+front-loads the accept decision, and links to the PR for depth — it never
+substitutes for the diff, it tells you whether the diff is worth opening now.
+
+**Format** (Markdown, ≤ ~30 lines, one report covering all of the night's PRs):
+
+```markdown
+# Nightly sweep — <date>   ✅ ready to review | ⚠️ partial | ❌ nothing shipped
+
+**Accept = merge PR #N** (and #M, …)          ← always the first content line
+
+## What changed & why (per theme, 1 line each)
+- <theme>: <defect fixed / coverage added — the "why", not a diff narration> (PR #N)
+
+## Size & scope
+<files> files, +<add>/−<del> across <areas>   [per-area diffstat, one line per area]
+
+## Tests
+| suite | ran | pass | fail | skipped (why) |
+unit / regression / integration / e2e rows — "not run: needs credentials" listed
+explicitly; a suite that didn't exist before shows "NEW".
+
+## Steelman verdict
+<one line: pass / pass-with-notes> · residual risks: <bulleted, only if any —
+these are the things a 1-minute reviewer must not miss>
+
+## Not done / abandoned
+<themes reverted for non-convergence, with journal pointer — absence of this
+section means nothing was dropped>
+```
+
+**Assembly** — split exactly like the rest of the wrapper/model boundary:
+the **wrapper** computes every number deterministically (diffstat via
+`git diff --stat origin/main...`, per-area rollup by top-level dir, test
+counts parsed from the runner logs it already captured, PR numbers from
+`gh pr create` output, size caps); the **model** contributes only the
+per-theme "what & why" one-liners and residual-risk lines it wrote at
+hand-off (§5.4 step 6). The wrapper refuses to fabricate: a missing model
+one-liner renders as the theme's branch name, never invented prose. If the
+night shipped nothing (no qualifying themes, or all abandoned), the report
+still goes out with status ❌ and the reason — silence is indistinguishable
+from failure and is not allowed.
+
+**Delivery — three channels, same content, written in this order:**
+1. **Dated file (source of truth):** `$STATE_DIR/automation/housekeeping/report-<date>.md`,
+   path recorded in the run journal (`artifacts`), 14-day reap with the journals.
+2. **PR body:** the report (minus the per-PR "accept" pointer, which becomes
+   "this PR is part of sweep <date>") is prepended as the top section of each
+   sweep PR — the PR is self-describing for review-on-GitHub.
+3. **Morning surfaces:** `notify.sh` push with the status line + PR URL;
+   `automation-report.sh` (§2.6) injects the full report file as SessionStart
+   context in the first session of the day (not just a digest line — for the
+   housekeeping job specifically, the report *is* the digest); and, when the
+   Nostr owner DM channel is configured, the status line + accept pointer goes
+   out via the `/dm-owner` transport path (helper CLI, not the interactive
+   skill) so the phone shows "accept = merge PR #N" before the laptop opens.
+
+### 5.7 Reuse map
 
 | Piece | Reuses | New |
 |---|---|---|
@@ -732,7 +808,7 @@ Dependencies given as item ids.
 | id | Title | Scope / files | Reuse vs new | Deps |
 |---|---|---|---|---|
 | D1 | **[hook]** `sweep-worktree.sh` (create/collide/destroy/prune/marker) + `sweep-scope.sh` (commit grouping) | `hooks/automation/` | New; git-worktree lifecycle per §5.2 | A1 |
-| D2 | **[hook]** Wrapper post-phase: final green check, **secret-scan**, diff-size enforcement, push, `gh pr create`, F2 registration, cleanup | extends `run-job.sh housekeeping` path or `sweep-post.sh` | New; PR body per `/push-pr` template | D1, A3, C3 |
+| D2 | **[hook]** Wrapper post-phase: final green check, **secret-scan**, diff-size enforcement, push, `gh pr create`, **morning-review report assembly + 3-channel delivery (§5.6: dated file, PR-body prepend, notify/SessionStart/owner-DM)**, F2 registration, cleanup | extends `run-job.sh housekeeping` path or `sweep-post.sh` | New; PR body per `/push-pr` template; report numbers computed deterministically, model one-liners consumed from hand-off files | D1, A3, C3 |
 | D3 | **[skill]** `/housekeeping` (scope → quality/test passes → run tests → `/steelman` → fix → converge/revert; SOTA guardrail section; boundary deny-list) | `skills/housekeeping/SKILL.md` | Orchestrates `/steelman` + build autodetect; the no-churn + named-defect rules live here | D1 |
 | D4 | **[hook]** Sweep tests (worktree lifecycle incl. collision + prune; secret-scan corpus; diff-cap; marker scoping — all against a scratch repo fixture) | `test/housekeeping.test.sh` | conventions | D1, D2 |
 
