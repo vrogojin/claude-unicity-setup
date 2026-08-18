@@ -136,12 +136,7 @@ export PATH="${PATH:-}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/
 
 # --- 6. job → skill prompt + per-job flags ------------------------------------
 # All real logic lives in the skill; scheduled == interactive code path. The
-# housekeeping worktree/post-phase (Group D) extends this path; here it launches
-# generically in the project dir. Why housekeeping alone MAY carry acceptEdits:
-# Group D runs it in a disposable, secret-free worktree on a branch only the
-# wrapper can publish — that isolation does not exist yet, so until D lands the
-# acceptEdits flag is opt-in via AUTOMATION_HK_ACCEPT_EDITS=1 (default off) so an
-# early enable can't autonomously edit the live checkout.
+# housekeeping worktree/post-phase (Group D) extends this path.
 EXTRA=()
 case "$JOB" in
   syncup)       PROMPT="/syncup" ;;
@@ -154,8 +149,45 @@ esac
 WALL="${AUTOMATION_WALL_OVERRIDE:-${MAX_WALL}m}"
 SESSION_LOG="$JOB_DIR/last-session.log"
 
+# --- 6b. housekeeping: run the session in a disposable worktree off origin/main
+# (Group D §5.2/§5.3). The sweep NEVER edits the live checkout. When
+# sweep-worktree.sh is present AND origin/main resolves, create the worktree, run
+# with cwd = worktree + acceptEdits (safe: secret-free, sweep/* branch only the
+# wrapper can publish, PreToolUse gates still live), then hand off to the
+# deterministic post-phase. Absent the machinery or origin/main → fall back to
+# the generic in-place launch (keeps Group A's contract + tests intact; an early
+# enable still can't edit the live checkout without AUTOMATION_HK_ACCEPT_EDITS=1).
+RUN_CWD=""; SWEEP_WT=""; SUMMARY_EXTRA=""
+SWEEP_WT_SH="$RJ_HOOK_DIR/sweep-worktree.sh"
+SWEEP_POST_SH="$RJ_HOOK_DIR/sweep-post.sh"
+if [ "$JOB" = housekeeping ] && [ -x "$SWEEP_WT_SH" ] \
+   && git -C "$PROJ" rev-parse --verify -q origin/main >/dev/null 2>&1; then
+  SWEEP_WT="$(AUTOMATION_STATE_DIR="$STATE_DIR" bash "$SWEEP_WT_SH" create "$PROJ" 2>>"$SESSION_LOG")"
+  RC_WT=$?
+  if [ "$RC_WT" -eq 3 ]; then
+    _write_journal skipped_worktree_exists null "a prior sweep worktree still exists — skipped tonight (surface, don't stack)"
+    _rj_log "housekeeping: sweep worktree collision — skipping this fire"
+    exit 0
+  elif [ "$RC_WT" -ne 0 ] || [ -z "$SWEEP_WT" ] || [ ! -d "$SWEEP_WT" ]; then
+    _write_journal failed "$RC_WT" "could not create sweep worktree (rc=$RC_WT)"
+    notify "Automation: housekeeping failed" "sweep worktree creation failed (rc=$RC_WT) — journal: $JOURNAL" critical
+    exit 0
+  fi
+  RUN_CWD="$SWEEP_WT"
+  EXTRA=(--permission-mode acceptEdits)          # safe ONLY here (§5.3)
+  export SWEEP_HANDOFF_DIR="$JOB_DIR/handoff"
+  rm -rf "$SWEEP_HANDOFF_DIR" 2>/dev/null; mkdir -p "$SWEEP_HANDOFF_DIR" 2>/dev/null || true
+  _rj_log "housekeeping: sweep worktree $SWEEP_WT (cwd), acceptEdits ON"
+fi
+
 _run_once() {
-  if [ "${#EXTRA[@]}" -gt 0 ]; then
+  if [ -n "$RUN_CWD" ]; then
+    if [ "${#EXTRA[@]}" -gt 0 ]; then
+      ( cd "$RUN_CWD" && timeout "$WALL" "$CLAUDE_RESOLVED" -p "$PROMPT" --max-turns "$MAX_TURNS" "${EXTRA[@]}" ) >"$SESSION_LOG" 2>&1
+    else
+      ( cd "$RUN_CWD" && timeout "$WALL" "$CLAUDE_RESOLVED" -p "$PROMPT" --max-turns "$MAX_TURNS" ) >"$SESSION_LOG" 2>&1
+    fi
+  elif [ "${#EXTRA[@]}" -gt 0 ]; then
     timeout "$WALL" "$CLAUDE_RESOLVED" -p "$PROMPT" --max-turns "$MAX_TURNS" "${EXTRA[@]}" >"$SESSION_LOG" 2>&1
   else
     timeout "$WALL" "$CLAUDE_RESOLVED" -p "$PROMPT" --max-turns "$MAX_TURNS" >"$SESSION_LOG" 2>&1
@@ -178,8 +210,32 @@ while [ "$ATTEMPT" -le 2 ]; do
   break
 done
 
+# --- 6c. housekeeping post-phase: deterministic green-check/secret-scan/diff-cap/
+# push/PR/morning-report/cleanup (Group D §5.4 post-phase + §5.6). The MODEL never
+# pushes — this wrapper does, and only after every gate passes. Runs ONLY on a
+# completed session; a timed-out/crashed session deliberately LEAVES the worktree
+# so tomorrow's run collision-skips and SURFACES it (§5.2 collide, §6 row 3).
+if [ -n "$SWEEP_WT" ] && [ -x "$SWEEP_POST_SH" ]; then
+  if [ "$STATUS" = completed ]; then
+    AUTOMATION_STATE_DIR="$STATE_DIR" SWEEP_HANDOFF_DIR="${SWEEP_HANDOFF_DIR:-$JOB_DIR/handoff}" \
+      bash "$SWEEP_POST_SH" "$SWEEP_WT" "$PROJ" >>"$SESSION_LOG" 2>&1
+    PRC=$?
+    case "$PRC" in
+      0)  SUMMARY_EXTRA="PR opened" ;;
+      10) SUMMARY_EXTRA="nothing shipped" ;;
+      20) STATUS=failed; SUMMARY_EXTRA="aborted: red tests" ;;
+      21) STATUS=failed; SUMMARY_EXTRA="aborted: secret detected" ;;
+      30) STATUS=failed; SUMMARY_EXTRA="push/PR failed" ;;
+      *)  STATUS=failed; SUMMARY_EXTRA="post-phase rc=$PRC" ;;
+    esac
+    _rj_log "housekeeping post-phase rc=$PRC ($SUMMARY_EXTRA)"
+  else
+    _rj_log "housekeeping session $STATUS — leaving worktree $SWEEP_WT for surfacing (no post-phase)"
+  fi
+fi
+
 # --- 7. outcome: journal + notify on failure ----------------------------------
-SUMMARY="$PROMPT finished: $STATUS (rc=$RC, attempts=$ATTEMPT)"
+SUMMARY="$PROMPT finished: $STATUS (rc=$RC, attempts=$ATTEMPT)${SUMMARY_EXTRA:+ — $SUMMARY_EXTRA}"
 # Forward-compat: a job's model hand-off may drop an artifacts.json (PR urls /
 # report path — Group D). Consume it into the journal if present + valid.
 ARTS="[]"
