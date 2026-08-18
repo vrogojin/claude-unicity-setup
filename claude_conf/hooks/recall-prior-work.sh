@@ -31,6 +31,11 @@ set -uo pipefail
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo .)"
 . "$HOOK_DIR/state-dir.sh" 2>/dev/null || STATE_DIR="/tmp/claude"
+# Shared task classifier (intent gate + keyword extraction + task-id hash),
+# factored out so the F2 task-lifecycle hook keys on the SAME logic (C1). If the
+# lib is somehow absent, fall back is impossible without duplicating it, so the
+# hook simply stays silent (advisory hook — never a hard failure).
+. "$HOOK_DIR/lib/task-classifier.sh" 2>/dev/null || exit 0
 
 INPUT=$(cat)
 PROMPT=$(echo "$INPUT" | jq -r '.prompt // ""' 2>/dev/null)
@@ -39,21 +44,18 @@ PROMPT=$(echo "$INPUT" | jq -r '.prompt // ""' 2>/dev/null)
 # --- Intent gate: only prompts that read as "make something" -------------------------
 # Word-boundary match on implement/build/add/create/fix/wire/integrate/support/feature/
 # bug/rework/refactor. Skip slash-commands (skills handle themselves) and tiny prompts.
-case "$PROMPT" in /*) exit 0;; esac
-[ "${#PROMPT}" -ge 20 ] || exit 0
-echo "$PROMPT" | grep -qiE '\b(implement|build|add|create|fix|wire|integrate|support|introduce|rework|refactor|feature|bug)\b' || exit 0
+# (Now delegated to the shared classifier lib — same gates, one source of truth.)
+tc_intent_ok "$PROMPT" || exit 0
 
 # --- Keyword extraction: distinctive terms only --------------------------------------
 # Lowercase, strip punctuation, drop stopwords + the intent verbs themselves, keep
 # tokens of length >= 4, dedupe, take the first 6. Fewer than 2 → too vague, bail.
-STOP='the|this|that|with|from|into|when|then|than|them|they|there|should|would|could|please|need|needs|want|wants|make|makes|have|does|will|about|also|just|like|some|more|only|very|it|its|our|your|their|and|for|not|but|can|now|new|use|using|been|were|what|which|where|how|why|all|each|via|per|still|implement|build|add|create|fix|wire|integrate|support|introduce|rework|refactor|feature|bug'
-KEYWORDS=$(echo "$PROMPT" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_-' '\n' \
-  | grep -E '^.{4,}$' | grep -vwE "$STOP" | awk '!seen[$0]++' | head -6)
+KEYWORDS=$(tc_keywords "$PROMPT")
 KW_COUNT=$(echo "$KEYWORDS" | sed '/^$/d' | wc -l)
 [ "$KW_COUNT" -ge 2 ] || exit 0
 
 # --- Debounce: same keyword set within 10 min → stay quiet ---------------------------
-KW_HASH=$(printf '%s' "$KEYWORDS" | sha1sum 2>/dev/null | cut -c1-16)
+KW_HASH=$(tc_task_id "$KEYWORDS")
 MARKER="$STATE_DIR/recall-prior-work.last"
 if [ -f "$MARKER" ]; then
   LAST_HASH=$(cut -d' ' -f1 "$MARKER" 2>/dev/null)
