@@ -79,11 +79,16 @@ _backend() {
 }
 
 # --- 2.4 install-time preflight (loud, exact remediation; NOT at 3 AM) --------
-# Sets PF_OK=0 (all good) or 1 (issues printed above).
+# Sets PF_OK=0 (all good) or 1 (issues printed above). $1 = the job's schedule
+# time (optional) — validated so a malformed value ("0700", "7am") is rejected
+# loudly here rather than accepted-but-inert by systemd/schtasks until 3 AM.
 _preflight() {
-  local rc=0
+  local rc=0 sched_time="${1:-}"
   command -v jq >/dev/null 2>&1 || { _red "  MISSING: jq"; rc=1; }
   [ -f "$CONFIG" ] || { _red "  MISSING: $CONFIG — run setup.sh in this project first"; rc=1; }
+  if [ -n "$sched_time" ] && ! printf '%s' "$sched_time" | grep -Eq '^([01][0-9]|2[0-3]):[0-5][0-9]$'; then
+    _red "  INVALID time '$sched_time' — must be 24h HH:MM (e.g. 03:00). Fix .automation.<job>.time"; rc=1
+  fi
   if [ "${AUTOMATION_SKIP_CLAUDE_CHECK:-0}" != "1" ]; then
     if command -v claude >/dev/null 2>&1; then
       if ! claude -p 'ok' --max-turns 1 >/dev/null 2>&1; then
@@ -120,14 +125,16 @@ _install_systemd() {
   local job="$1" hh="$2" mm="$3" dir unit
   dir="$(_systemd_dir)"; mkdir -p "$dir" 2>/dev/null || true
   unit="$(_unit "$job")"
+  # Quote the project path in Environment= and the exec path in ExecStart= so a
+  # repo path with a space survives (systemd honors double-quotes in both).
   cat > "$dir/$unit.service" <<EOF
 [Unit]
 Description=Claude automation job '$job' for $PROJ
 
 [Service]
 Type=oneshot
-Environment=CLAUDE_PROJECT_DIR=$PROJ
-ExecStart=$RUN_JOB $job
+Environment="CLAUDE_PROJECT_DIR=$PROJ"
+ExecStart="$RUN_JOB" $job
 EOF
   cat > "$dir/$unit.timer" <<EOF
 [Unit]
@@ -143,8 +150,14 @@ WantedBy=timers.target
 EOF
   if _apply; then
     systemctl --user daemon-reload 2>/dev/null || true
-    systemctl --user enable --now "$unit.timer" >/dev/null 2>&1 \
-      || _sc_log "warn: could not enable $unit.timer (is the --user manager running? linger?)"
+    # Capture the enable rc: a green "installed" line while enable silently
+    # failed (no --user manager, linger off) is a lie the operator only discovers
+    # at 3 AM. On failure, downgrade the message and return non-zero.
+    if ! systemctl --user enable --now "$unit.timer" >/dev/null 2>&1; then
+      _red "systemd timer $unit.timer written but enable FAILED (--user manager down? linger off?)"
+      _red "  the unit files are in place; fix the user manager, then: systemctl --user enable --now $unit.timer"
+      return 1
+    fi
   fi
   _grn "installed systemd timer $unit.timer → daily $hh:$mm (Persistent catch-up on)"
 }
@@ -197,6 +210,18 @@ _uninstall_cron() {
 }
 
 # --- commands -----------------------------------------------------------------
+# Persist which backend currently owns a job's registration, so a backend switch
+# between installs (host moved, probe changed) removes the OLD entry instead of
+# leaving two schedulers firing the same job.
+_backend_state() { printf '%s/automation/%s.backend' "$STATE_DIR" "$1"; }
+_uninstall_backend() { # $1=job $2=backend  (targeted, quiet)
+  case "$2" in
+    systemd)  _uninstall_systemd  "$1" >/dev/null 2>&1 || true ;;
+    schtasks) _uninstall_schtasks "$1" >/dev/null 2>&1 || true ;;
+    cron)     _uninstall_cron     "$1" >/dev/null 2>&1 || true ;;
+  esac
+}
+
 _install() {
   local job="${1:-}" force="${2:-}"
   _sc_is_job "$job" || { _red "not a schedulable job: '$job' (use syncup|housekeeping)"; return 2; }
@@ -205,18 +230,34 @@ _install() {
     _sc_log "  to enable: set that flag true in $CONFIG, then re-run: scheduler.sh install $job"
     return 0
   fi
-  PF_OK=0; _preflight
+  local t hh mm; t="$(_job_time "$job")"; hh="${t%%:*}"; mm="${t##*:}"
+  PF_OK=0; _preflight "$t"
   if [ "${PF_OK:-0}" != "0" ] && [ "$force" != "--force" ]; then
     _red "Preflight FAILED (see above). Fix the items, or re-run with --force to install anyway."
     return 1
   fi
-  local t hh mm; t="$(_job_time "$job")"; hh="${t%%:*}"; mm="${t##*:}"
-  case "$(_backend)" in
-    systemd)  _install_systemd  "$job" "$hh" "$mm" ;;
-    schtasks) _install_schtasks "$job" "$hh" "$mm" ;;
-    cron)     _install_cron     "$job" "$hh" "$mm" ;;
+  local chosen prev sf; chosen="$(_backend)"
+  sf="$(_backend_state "$job")"
+  prev="$(cat "$sf" 2>/dev/null || echo "")"
+  # Reconcile: if a DIFFERENT backend previously owned this job, remove its entry
+  # first so we don't end up double-fired by two schedulers.
+  if [ -n "$prev" ] && [ "$prev" != "$chosen" ]; then
+    _sc_log "backend switched ($prev → $chosen) — removing the stale $prev registration for $job"
+    _uninstall_backend "$job" "$prev"
+  fi
+  local rc=0
+  case "$chosen" in
+    systemd)  _install_systemd  "$job" "$hh" "$mm" || rc=$? ;;
+    schtasks) _install_schtasks "$job" "$hh" "$mm" || rc=$? ;;
+    cron)     _install_cron     "$job" "$hh" "$mm" || rc=$? ;;
     *) _red "No scheduler backend available."; return 1 ;;
   esac
+  # Record the active backend only on a successful install.
+  if [ "$rc" -eq 0 ]; then
+    mkdir -p "$(dirname "$sf")" 2>/dev/null || true
+    printf '%s\n' "$chosen" > "$sf" 2>/dev/null || true
+  fi
+  return "$rc"
 }
 
 _uninstall() {
@@ -228,6 +269,7 @@ _uninstall() {
     cron)     _uninstall_cron     "$job" ;;
     *) _sc_log "no backend — nothing to uninstall" ;;
   esac
+  rm -f "$(_backend_state "$job")" 2>/dev/null || true
 }
 
 _status_job() {

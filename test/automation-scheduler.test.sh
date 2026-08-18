@@ -82,8 +82,9 @@ chk "systemd wrote a .service"                "[ -n \"$SERVICE\" ] && [ -f \"$SE
 chk "OnCalendar reflects 07:00"               "grep -q 'OnCalendar=\\*-\\*-\\* 07:00:00' \"$TIMER\""
 chk "Persistent=true (catch-up after downtime)" "grep -q 'Persistent=true' \"$TIMER\""
 chk "RandomizedDelaySec set (no thundering herd)" "grep -q 'RandomizedDelaySec=' \"$TIMER\""
-chk "ExecStart runs run-job.sh syncup"        "grep -q 'run-job.sh syncup' \"$SERVICE\""
-chk "unit bakes CLAUDE_PROJECT_DIR (no env at 3 AM)" "grep -q \"Environment=CLAUDE_PROJECT_DIR=$PROJ\" \"$SERVICE\""
+chk "ExecStart runs run-job.sh syncup"        "grep -Eq 'ExecStart=\"[^\"]*run-job.sh\" syncup' \"$SERVICE\""
+chk "ExecStart path is double-quoted (space-safe)" "grep -q 'ExecStart=\"' \"$SERVICE\""
+chk "unit bakes CLAUDE_PROJECT_DIR quoted (no env at 3 AM, space-safe)" "grep -q 'Environment=\"CLAUDE_PROJECT_DIR='\"$PROJ\"'\"' \"$SERVICE\""
 N1="$(ls "$SDIR" | wc -l)"
 "${SD_ENV[@]}" bash "$SCHED" install syncup --force >/dev/null 2>&1
 chk "systemd reinstall idempotent (still 2 files, rewrite not append)" "[ \"\$(ls '$SDIR' | wc -l)\" -eq \"$N1\" ]"
@@ -132,6 +133,44 @@ chmod +x "$TMP/bin/claude"
 env AUTOMATION_SCHED_BACKEND=cron bash "$SCHED" run syncup >/dev/null 2>&1
 chk "scheduler run → run-job journals a completed run" \
   "[ \"\$(jq -r .status \"$STATE_DIR/automation/syncup/last-run.json\" 2>/dev/null)\" = completed ]"
+
+echo "== backend switch reconciles the old registration (no double-fire) =="
+# Install under cron, then switch to systemd: the cron entry must be removed so
+# two schedulers don't both fire syncup.
+rm -f "$STATE_DIR/automation/syncup.backend"
+: > "$CRONSTORE"; rm -rf "$SDIR"
+env AUTOMATION_SCHED_BACKEND=cron bash "$SCHED" install syncup --force >/dev/null 2>&1
+chk "switch: cron entry present after cron install" "grep -q claude-automation '$CRONSTORE'"
+env AUTOMATION_SCHED_BACKEND=systemd AUTOMATION_SCHED_APPLY=0 AUTOMATION_SYSTEMD_DIR="$SDIR" \
+  CRONTAB_CMD="$TMP/bin/mockcron" bash "$SCHED" install syncup --force >/dev/null 2>&1
+chk "switch: stale CRON entry removed after switching to systemd" "! grep -q claude-automation '$CRONSTORE'"
+chk "switch: systemd unit now present"              "[ -n \"\$(ls '$SDIR'/*.timer 2>/dev/null)\" ]"
+chk "switch: active backend persisted = systemd"    "[ \"\$(cat '$STATE_DIR/automation/syncup.backend')\" = systemd ]"
+
+echo "== systemd enable failure → non-zero + no false success =="
+rm -f "$STATE_DIR/automation/syncup.backend"; rm -rf "$SDIR"
+cat > "$TMP/bin/systemctl" <<'EOF'
+#!/bin/bash
+for a in "$@"; do [ "$a" = "enable" ] && exit 1; done
+exit 0
+EOF
+chmod +x "$TMP/bin/systemctl"
+env AUTOMATION_SCHED_BACKEND=systemd AUTOMATION_SCHED_APPLY=1 AUTOMATION_SYSTEMD_DIR="$SDIR" \
+  bash "$SCHED" install syncup --force >/dev/null 2>&1
+chk "enable failure → install returns non-zero" "[ $? -ne 0 ]"
+chk "enable failure → active backend NOT persisted" "[ ! -e \"$STATE_DIR/automation/syncup.backend\" ]"
+rm -f "$TMP/bin/systemctl"
+
+echo "== invalid schedule time rejected at preflight =="
+# malformed time in config → install must FAIL (accepted-but-inert avoided)
+jq '.automation.syncup.time="0700"' "$PROJ/.claude/agent/config.json" > "$PROJ/c.tmp" && mv "$PROJ/c.tmp" "$PROJ/.claude/agent/config.json"
+: > "$CRONSTORE"
+IOUT="$(env AUTOMATION_SCHED_BACKEND=cron bash "$SCHED" install syncup 2>&1)"; IRC=$?
+chk "invalid time → install returns non-zero"        "[ $IRC -ne 0 ]"
+chk "invalid time → error names it INVALID"          "echo \"\$IOUT\" | grep -q 'INVALID time'"
+chk "invalid time → nothing registered"              "! grep -q claude-automation '$CRONSTORE'"
+# restore a valid time
+jq '.automation.syncup.time="07:00"' "$PROJ/.claude/agent/config.json" > "$PROJ/c.tmp" && mv "$PROJ/c.tmp" "$PROJ/.claude/agent/config.json"
 
 echo
 if [ "$FAIL" = 0 ]; then echo "ALL CHECKS PASSED"; else echo "SOME CHECKS FAILED"; fi

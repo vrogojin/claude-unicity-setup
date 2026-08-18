@@ -134,6 +134,46 @@ printf '{"job":"syncup","status":"completed","started_at":"%s"}' "$(date -u +%FT
 OUT3="$(echo '{}' | AUTOMATION_CATCHUP_APPLY=0 bash "$CATCHUP")"
 chk "fresh last-run → no catch-up fired"   "[ -z \"\$OUT3\" ]"
 
+echo "== T10: SIGTERM-ignoring child is SIGKILLed after the grace (timeout -k) =="
+# Mock claude ignores SIGTERM and sleeps 30s. With a 1s wall + 1s kill-grace it
+# must be SIGKILLed ~2s in, run-job must RETURN (not wedge), the journal must end
+# non-'running', and the flock must be free for the next fire.
+cat > "$TMP/bin/claude" <<'EOF'
+#!/bin/bash
+trap '' TERM
+sleep 30
+EOF
+chmod +x "$TMP/bin/claude"
+cfg '{"automation":{"syncup":{"enabled":true,"retry_once":false}}}'
+T_START="$(date +%s)"
+AUTOMATION_WALL_OVERRIDE=1s AUTOMATION_KILL_AFTER=1s bash "$RJ" syncup >/dev/null 2>&1
+T_ELAPSED=$(( $(date +%s) - T_START ))
+chk "run-job returned promptly (SIGKILL fired, no 30s wedge)" "[ \"$T_ELAPSED\" -lt 15 ]"
+chk "journal ended non-'running'"        "[ \"\$(jq -r .status \"$(LR syncup)\")\" != running ]"
+chk "SIGTERM-ignoring child → status timeout" "[ \"\$(jq -r .status \"$(LR syncup)\")\" = timeout ]"
+# flock is free → the next fire is NOT skipped_overlap
+mk_claude ok
+bash "$RJ" syncup >/dev/null 2>&1
+chk "flock released after SIGKILL (next fire runs, not skipped)" "[ \"\$(jq -r .status \"$(LR syncup)\")\" = completed ]"
+
+echo "== T11: retry is for CRASHES only — a timeout never retries =="
+cat > "$TMP/bin/claude" <<'EOF'
+#!/bin/bash
+echo "$*" >> "$CLAUDE_CALLS"
+sleep 30
+EOF
+chmod +x "$TMP/bin/claude"
+export CLAUDE_CALLS="$TMP/claude-calls.log"; : > "$CLAUDE_CALLS"
+cfg '{"automation":{"syncup":{"enabled":true,"retry_once":true}}}'
+AUTOMATION_WALL_OVERRIDE=1s AUTOMATION_KILL_AFTER=1s bash "$RJ" syncup >/dev/null 2>&1
+chk "timeout + retry_once=true → claude ran ONCE (no 2nd 45-min session)" "[ \"\$(wc -l < \"$CLAUDE_CALLS\")\" -eq 1 ]"
+chk "timeout status recorded"                "[ \"\$(jq -r .status \"$(LR syncup)\")\" = timeout ]"
+# and the crash path still retries once (RC nonzero, not 124/137)
+mk_claude fail
+: > "$TMP/claude-calls.log"
+bash "$RJ" syncup >/dev/null 2>&1
+chk "crash + retry_once=true → claude ran TWICE (crash retry intact)" "[ \"\$(wc -l < \"$TMP/claude-calls.log\")\" -eq 2 ]"
+
 echo
 if [ "$FAIL" = 0 ]; then echo "ALL CHECKS PASSED"; else echo "SOME CHECKS FAILED"; fi
 exit "$FAIL"

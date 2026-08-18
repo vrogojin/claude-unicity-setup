@@ -152,27 +152,39 @@ esac
 # Wall cap: minutes → `timeout` duration; AUTOMATION_WALL_OVERRIDE lets tests
 # force a tiny cap (e.g. "2s") against a mock claude that sleeps.
 WALL="${AUTOMATION_WALL_OVERRIDE:-${MAX_WALL}m}"
+# SIGKILL grace after the wall SIGTERM (see _run_once); tunable for tests.
+KILL_AFTER="${AUTOMATION_KILL_AFTER:-30s}"
 SESSION_LOG="$JOB_DIR/last-session.log"
 
+# `-k 30s`: if the child ignores the SIGTERM `timeout` sends at the wall cap,
+# SIGKILL it 30 s later. Without this a SIGTERM-ignoring session would wedge past
+# the cap forever — holding the flock (so every later fire skips) and leaving the
+# journal stuck at 'running'; the hard kill is what makes the runaway cap and
+# "flock released by death" actually hold.
 _run_once() {
   if [ "${#EXTRA[@]}" -gt 0 ]; then
-    timeout "$WALL" "$CLAUDE_RESOLVED" -p "$PROMPT" --max-turns "$MAX_TURNS" "${EXTRA[@]}" >"$SESSION_LOG" 2>&1
+    timeout -k "$KILL_AFTER" "$WALL" "$CLAUDE_RESOLVED" -p "$PROMPT" --max-turns "$MAX_TURNS" "${EXTRA[@]}" >"$SESSION_LOG" 2>&1
   else
-    timeout "$WALL" "$CLAUDE_RESOLVED" -p "$PROMPT" --max-turns "$MAX_TURNS" >"$SESSION_LOG" 2>&1
+    timeout -k "$KILL_AFTER" "$WALL" "$CLAUDE_RESOLVED" -p "$PROMPT" --max-turns "$MAX_TURNS" >"$SESSION_LOG" 2>&1
   fi
 }
 
 _write_journal running null "launched $PROMPT (wall=$WALL, max_turns=$MAX_TURNS)"
 _rj_log "starting $JOB: $CLAUDE_BIN -p '$PROMPT' --max-turns $MAX_TURNS (wall=$WALL)"
 
-# --- execute with at most one wrapper-level retry (crash recovery only) --------
+# --- execute with at most one wrapper-level retry (CRASH recovery only) --------
+# Per §2.3.7 a retry is for crashes, NEVER for a timeout: the watchdog already
+# absorbs API outages INSIDE the run, so a run that hit the wall cap has already
+# spent its whole window — retrying would launch a SECOND full-length session
+# past the job's window (e.g. syncup's 45 min again past 08:00). So we retry only
+# when STATUS=failed (nonzero AND not 124/137); a timeout is terminal.
 ATTEMPT=1 STATUS="" RC=0
 while [ "$ATTEMPT" -le 2 ]; do
   _run_once; RC=$?
   if [ "$RC" -eq 0 ]; then STATUS=completed; break; fi
   if [ "$RC" -eq 124 ] || [ "$RC" -eq 137 ]; then STATUS=timeout; else STATUS=failed; fi
-  if [ "$RETRY_ONCE" = "true" ] && [ "$ATTEMPT" -lt 2 ]; then
-    _rj_log "$JOB $STATUS (rc=$RC) — one retry permitted (retry_once=true)"
+  if [ "$STATUS" = "failed" ] && [ "$RETRY_ONCE" = "true" ] && [ "$ATTEMPT" -lt 2 ]; then
+    _rj_log "$JOB crashed (rc=$RC) — one retry permitted (retry_once=true)"
     ATTEMPT=$((ATTEMPT + 1)); continue
   fi
   break
