@@ -481,6 +481,7 @@ EX_OWNER_NAMETAG=""
 EX_OWNER_NPUB=""
 EX_NETWORK=""
 EX_RELAY=""
+EX_RELAYS_JSON="[]"
 EX_NOTIFY=""
 EX_GROUP_ID=""
 EX_GROUP_NAME=""
@@ -491,12 +492,15 @@ EX_DEPS_JSON="[]"
 EXISTING_CONFIG_FILE="$CLAUDE_DIR/agent/config.json"
 EXISTING_IDENTITY_FILE="$CLAUDE_DIR/agent/identity.json"
 
-if [ -f "$EXISTING_CONFIG_FILE" ] && jq -e . "$EXISTING_CONFIG_FILE" >/dev/null 2>&1; then
+if [ -f "$EXISTING_CONFIG_FILE" ] && jq -e 'type == "object"' "$EXISTING_CONFIG_FILE" >/dev/null 2>&1; then
   EX_AGENT_NAMETAG=$(jq -r '.agent_nametag // ""' "$EXISTING_CONFIG_FILE")
   EX_OWNER_NAMETAG=$(jq -r '.owner_nametag // ""' "$EXISTING_CONFIG_FILE")
   EX_OWNER_NPUB=$(jq -r '.owner_npub // ""' "$EXISTING_CONFIG_FILE")
   EX_NETWORK=$(jq -r '.network // ""' "$EXISTING_CONFIG_FILE")
-  EX_RELAY=$(jq -r '.group.relays[0] // ""' "$EXISTING_CONFIG_FILE")
+  # Full relay ARRAY (preserved verbatim when the relay is unchanged) + its
+  # first entry (the prompt default / comparison value).
+  EX_RELAYS_JSON=$(jq -c '.group.relays // [] | if type == "array" then . else [] end' "$EXISTING_CONFIG_FILE")
+  EX_RELAY=$(jq -r '.group.relays // [] | if type == "array" then (.[0] // "") else "" end' "$EXISTING_CONFIG_FILE")
   EX_NOTIFY=$(jq -r '.notification_url // ""' "$EXISTING_CONFIG_FILE")
   EX_GROUP_ID=$(jq -r '.group.id // ""' "$EXISTING_CONFIG_FILE")
   EX_GROUP_NAME=$(jq -r '.group.name // ""' "$EXISTING_CONFIG_FILE")
@@ -545,10 +549,10 @@ fi
 # (template wins on conflicts; user-added entries are preserved).
 OLD_SETTINGS_JSON=""
 OLD_SETTINGS_LOCAL=""
-if [ -f "$CLAUDE_DIR/settings.json" ] && jq -e . "$CLAUDE_DIR/settings.json" >/dev/null 2>&1; then
+if [ -f "$CLAUDE_DIR/settings.json" ] && jq -e 'type == "object"' "$CLAUDE_DIR/settings.json" >/dev/null 2>&1; then
   OLD_SETTINGS_JSON=$(cat "$CLAUDE_DIR/settings.json")
 fi
-if [ -f "$CLAUDE_DIR/settings.local.json" ] && jq -e . "$CLAUDE_DIR/settings.local.json" >/dev/null 2>&1; then
+if [ -f "$CLAUDE_DIR/settings.local.json" ] && jq -e 'type == "object"' "$CLAUDE_DIR/settings.local.json" >/dev/null 2>&1; then
   OLD_SETTINGS_LOCAL=$(cat "$CLAUDE_DIR/settings.local.json")
 fi
 
@@ -559,32 +563,54 @@ if [ "$DRY_RUN" = "true" ]; then
   [ -n "$OLD_SETTINGS_JSON" ]  && info "[dry-run] Merge user env keys back into settings.json after copy"
   [ -n "$OLD_SETTINGS_LOCAL" ] && info "[dry-run] Merge existing settings.local.json (permission approvals) back after copy"
 else
+  # NOTE on failure handling: `jq ... > tmp && mv` would NOT abort under set -e
+  # (the left side of && is errexit-exempt), silently leaving the template in
+  # place — the user's settings clobbered with a green "preserved" message. So
+  # both merges check jq's exit EXPLICITLY and, on failure, RESTORE the
+  # pre-copy snapshot (losing at worst this run's template refresh of that one
+  # file, never the user's data). Inputs are also type-coerced so a hand-edited
+  # scalar (e.g. "deny": "Bash(rm:*)") cannot make the merge throw.
   if [ -n "$OLD_SETTINGS_JSON" ] && [ -f "$CLAUDE_DIR/settings.json" ]; then
     # Keep user-added env keys; the template's own env keys win on conflict.
-    jq --argjson old "$OLD_SETTINGS_JSON" \
-      '.env = (($old.env // {}) * (.env // {}))' \
-      "$CLAUDE_DIR/settings.json" > "$CLAUDE_DIR/settings.json.tmp" \
-      && mv "$CLAUDE_DIR/settings.json.tmp" "$CLAUDE_DIR/settings.json"
-    ok "Preserved user env keys in settings.json"
+    if jq --argjson old "$OLD_SETTINGS_JSON" '
+         def obj(f): f | if type == "object" then . else {} end;
+         .env = (obj($old.env) * obj(.env))
+       ' "$CLAUDE_DIR/settings.json" > "$CLAUDE_DIR/settings.json.tmp" 2>/dev/null; then
+      mv "$CLAUDE_DIR/settings.json.tmp" "$CLAUDE_DIR/settings.json"
+      ok "Preserved user env keys in settings.json"
+    else
+      rm -f "$CLAUDE_DIR/settings.json.tmp"
+      printf '%s\n' "$OLD_SETTINGS_JSON" > "$CLAUDE_DIR/settings.json"
+      warn "settings.json env merge FAILED — restored your previous settings.json unchanged"
+      warn "  (this run's template refresh was NOT applied to settings.json; inspect it and re-run)"
+    fi
   fi
   if [ -n "$OLD_SETTINGS_LOCAL" ] && [ -f "$CLAUDE_DIR/settings.local.json" ]; then
     # Deep-merge (existing values win for scalars) + UNION the permission and
     # MCP-server arrays, so approvals the user accumulated are never lost.
-    jq --argjson old "$OLD_SETTINGS_LOCAL" '
-      . as $tpl
-      | ($tpl * $old)
-      | .permissions = ((($tpl.permissions // {}) * ($old.permissions // {}))
-          | reduce ("allow", "deny", "ask") as $k (.;
-              if ((($tpl.permissions[$k] // []) + ($old.permissions[$k] // [])) | length) > 0
-              then .[$k] = ((($tpl.permissions[$k] // []) + ($old.permissions[$k] // [])) | unique)
-              else . end))
-      | (if .permissions == {} then del(.permissions) else . end)
-      | (if ((($tpl.enabledMcpjsonServers // []) + ($old.enabledMcpjsonServers // [])) | length) > 0
-         then .enabledMcpjsonServers = ((($tpl.enabledMcpjsonServers // []) + ($old.enabledMcpjsonServers // [])) | unique)
-         else . end)
-    ' "$CLAUDE_DIR/settings.local.json" > "$CLAUDE_DIR/settings.local.json.tmp" \
-      && mv "$CLAUDE_DIR/settings.local.json.tmp" "$CLAUDE_DIR/settings.local.json"
-    ok "Merged settings.local.json (existing permission approvals preserved)"
+    if jq --argjson old "$OLD_SETTINGS_LOCAL" '
+         def arr(f): f | if type == "array" then . else [] end;
+         def obj(f): f | if type == "object" then . else {} end;
+         . as $tpl
+         | ($tpl * $old)
+         | .permissions = ((obj($tpl.permissions) * obj($old.permissions))
+             | reduce ("allow", "deny", "ask") as $k (.;
+                 if ((arr(obj($tpl.permissions)[$k]) + arr(obj($old.permissions)[$k])) | length) > 0
+                 then .[$k] = ((arr(obj($tpl.permissions)[$k]) + arr(obj($old.permissions)[$k])) | unique)
+                 else . end))
+         | (if .permissions == {} then del(.permissions) else . end)
+         | (if ((arr($tpl.enabledMcpjsonServers) + arr($old.enabledMcpjsonServers)) | length) > 0
+            then .enabledMcpjsonServers = ((arr($tpl.enabledMcpjsonServers) + arr($old.enabledMcpjsonServers)) | unique)
+            else . end)
+       ' "$CLAUDE_DIR/settings.local.json" > "$CLAUDE_DIR/settings.local.json.tmp" 2>/dev/null; then
+      mv "$CLAUDE_DIR/settings.local.json.tmp" "$CLAUDE_DIR/settings.local.json"
+      ok "Merged settings.local.json (existing permission approvals preserved)"
+    else
+      rm -f "$CLAUDE_DIR/settings.local.json.tmp"
+      printf '%s\n' "$OLD_SETTINGS_LOCAL" > "$CLAUDE_DIR/settings.local.json"
+      warn "settings.local.json merge FAILED — restored your previous settings.local.json unchanged"
+      warn "  (this run's template refresh was NOT applied to it; inspect the file and re-run)"
+    fi
   fi
 fi
 
@@ -755,9 +781,13 @@ if [ -f "$IDENTITY_FILE" ]; then
     if [ "$DRY_RUN" = "true" ]; then
       info "[dry-run] Stamp nametag '$AGENT_NAMETAG' into identity.json"
     else
-      jq --arg nametag "$AGENT_NAMETAG" '.nametag = $nametag' "$IDENTITY_FILE" > "$IDENTITY_FILE.tmp" \
-        && mv "$IDENTITY_FILE.tmp" "$IDENTITY_FILE"
-      chmod 600 "$IDENTITY_FILE"
+      if jq --arg nametag "$AGENT_NAMETAG" '.nametag = $nametag' "$IDENTITY_FILE" > "$IDENTITY_FILE.tmp" 2>/dev/null; then
+        mv "$IDENTITY_FILE.tmp" "$IDENTITY_FILE"
+        chmod 600 "$IDENTITY_FILE"
+      else
+        rm -f "$IDENTITY_FILE.tmp"
+        warn "Could not stamp nametag into identity.json — file left untouched"
+      fi
     fi
   fi
 fi
@@ -856,36 +886,46 @@ else
   NETWORK=$(prompt_input "Network environment" "${EX_NETWORK:-testnet}")
 fi
 
-# Preserve a custom/hand-edited relay verbatim when the network is UNCHANGED
-# and no explicit override was given; otherwise map network → default relay.
-if [ -z "${SETUP_NETWORK+x}" ] && [ -n "$EX_NETWORK" ] && [ "$NETWORK" = "$EX_NETWORK" ] && [ -n "$EX_RELAY" ]; then
-  RELAY_URL="$EX_RELAY"
-else
-  case "$NETWORK" in
-    1|testnet)
-      NETWORK="testnet"
-      RELAY_URL="wss://nostr-relay.testnet.unicity.network"
-      ;;
-    2|mainnet)
-      NETWORK="mainnet"
-      RELAY_URL="wss://relay.unicity.network"
-      ;;
-    3|devnet)
-      NETWORK="devnet"
-      RELAY_URL="ws://localhost:7777"
-      ;;
-    *)
+# Canonicalize the network name and derive its DEFAULT relay. An unrecognized
+# value that matches the EXISTING network is preserved verbatim (a hand-edited
+# custom network must survive a re-run) instead of being reset to testnet.
+case "$NETWORK" in
+  1|testnet)
+    NETWORK="testnet"
+    MAPPED_RELAY="wss://nostr-relay.testnet.unicity.network"
+    ;;
+  2|mainnet)
+    NETWORK="mainnet"
+    MAPPED_RELAY="wss://relay.unicity.network"
+    ;;
+  3|devnet)
+    NETWORK="devnet"
+    MAPPED_RELAY="ws://localhost:7777"
+    ;;
+  *)
+    if [ -n "$EX_NETWORK" ] && [ "$NETWORK" = "$EX_NETWORK" ]; then
+      MAPPED_RELAY="${EX_RELAY:-wss://nostr-relay.testnet.unicity.network}"
+    else
       warn "Unknown network '$NETWORK', defaulting to testnet"
       NETWORK="testnet"
-      RELAY_URL="wss://nostr-relay.testnet.unicity.network"
-      ;;
-  esac
-fi
+      MAPPED_RELAY="wss://nostr-relay.testnet.unicity.network"
+    fi
+    ;;
+esac
 
-# Explicit relay override always wins.
+# Relay choice: explicit override > existing relay(s) preserved verbatim when
+# the network is unchanged (also when the existing config has relays but no
+# recorded network at all) > the network's default relay. RELAYS_PRESERVED
+# carries the FULL existing relay array into config.json (never truncated).
+RELAYS_PRESERVED=false
 if [ -n "${SETUP_RELAY_URL+x}" ] && [ -n "$SETUP_RELAY_URL" ]; then
   RELAY_URL="$SETUP_RELAY_URL"
   info "Relay (from SETUP_RELAY_URL): $RELAY_URL"
+elif [ -n "$EX_RELAY" ] && [ "$NETWORK" = "${EX_NETWORK:-$NETWORK}" ]; then
+  RELAY_URL="$EX_RELAY"
+  RELAYS_PRESERVED=true
+else
+  RELAY_URL="$MAPPED_RELAY"
 fi
 
 ok "Network: $NETWORK ($RELAY_URL)"
@@ -1062,6 +1102,14 @@ fi
 # writes back exactly what was there. transport.helper_path is framework-owned
 # and deliberately re-pointed at this clone on every run.
 CONFIG_FILE="$CLAUDE_DIR/agent/config.json"
+# Relays written to config: the FULL existing array when preserved (a
+# multi-relay config must never be truncated to one entry by a re-run),
+# else the single resolved relay.
+if [ "$RELAYS_PRESERVED" = "true" ] && [ "$EX_RELAYS_JSON" != "[]" ]; then
+  CONFIG_RELAYS_JSON="$EX_RELAYS_JSON"
+else
+  CONFIG_RELAYS_JSON=$(jq -cn --arg r "$RELAY_URL" '[$r]')
+fi
 NEW_CONFIG=$(jq -n \
   --arg agent_nametag "$AGENT_NAMETAG" \
   --arg owner_npub "$OWNER_NPUB" \
@@ -1069,7 +1117,7 @@ NEW_CONFIG=$(jq -n \
   --arg notification_url "$NOTIFY_URL" \
   --arg group_name "$GROUP_NAME" \
   --arg group_id "$GROUP_ID" \
-  --arg relay "$RELAY_URL" \
+  --argjson relays "$CONFIG_RELAYS_JSON" \
   --arg network "$NETWORK" \
   --arg helper_path "$SCRIPT_DIR/lib/sphere-helper.mjs" \
   --argjson dep_enabled "$DEP_TRACKING_ENABLED" \
@@ -1083,7 +1131,7 @@ NEW_CONFIG=$(jq -n \
     group: {
       name: $group_name,
       id: $group_id,
-      relays: [$relay]
+      relays: $relays
     },
     transport: {
       helper_path: $helper_path
@@ -1100,11 +1148,17 @@ if [ "$DRY_RUN" = "true" ]; then
     info "[dry-run] Write $CONFIG_FILE"
   fi
 else
-  if [ -f "$CONFIG_FILE" ] && jq -e . "$CONFIG_FILE" >/dev/null 2>&1; then
-    jq --argjson new "$NEW_CONFIG" '. * $new' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" \
-      && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+  if [ -f "$CONFIG_FILE" ] && jq -e 'type == "object"' "$CONFIG_FILE" >/dev/null 2>&1; then
+    # Explicit exit check: a failed merge must be LOUD, never a silent skip
+    # that leaves the ok-line lying (jq on the left of && is set -e exempt).
+    if jq --argjson new "$NEW_CONFIG" '. * $new' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" 2>/dev/null; then
+      mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+    else
+      rm -f "$CONFIG_FILE.tmp"
+      die "config.json merge failed — existing file left untouched at $CONFIG_FILE"
+    fi
   else
-    [ -f "$CONFIG_FILE" ] && warn "Existing config.json was not valid JSON — rewriting it"
+    [ -f "$CONFIG_FILE" ] && warn "Existing config.json was not a JSON object — rewriting it"
     printf '%s\n' "$NEW_CONFIG" > "$CONFIG_FILE"
   fi
 fi
@@ -1142,18 +1196,24 @@ if [ "$DRY_RUN" = "true" ]; then
     info "[dry-run] Write $DAEMON_FILE"
   fi
 else
-  if [ -f "$DAEMON_FILE" ] && jq -e . "$DAEMON_FILE" >/dev/null 2>&1; then
-    jq --argjson new "$NEW_DAEMON" '
-      .relays = (((.relays // []) + $new.relays) | unique)
-      | .subscriptions = ((.subscriptions // {})
-          | .groups = (((.groups // []) + $new.subscriptions.groups) | unique_by(.id))
-          | .dm_contacts = (((.dm_contacts // []) + $new.subscriptions.dm_contacts)
-                            | map(select(. != "")) | unique))
-      | .hooks = (((.hooks // {})) * $new.hooks)
-    ' "$DAEMON_FILE" > "$DAEMON_FILE.tmp" \
-      && mv "$DAEMON_FILE.tmp" "$DAEMON_FILE"
+  if [ -f "$DAEMON_FILE" ] && jq -e 'type == "object"' "$DAEMON_FILE" >/dev/null 2>&1; then
+    if jq --argjson new "$NEW_DAEMON" '
+         def arr(f): f | if type == "array" then . else [] end;
+         def obj(f): f | if type == "object" then . else {} end;
+         .relays = ((arr(.relays) + $new.relays) | unique)
+         | .subscriptions = (obj(.subscriptions)
+             | .groups = ((arr(.groups) + $new.subscriptions.groups) | unique_by(.id))
+             | .dm_contacts = ((arr(.dm_contacts) + $new.subscriptions.dm_contacts)
+                               | map(select(. != "")) | unique))
+         | .hooks = (obj(.hooks) * $new.hooks)
+       ' "$DAEMON_FILE" > "$DAEMON_FILE.tmp" 2>/dev/null; then
+      mv "$DAEMON_FILE.tmp" "$DAEMON_FILE"
+    else
+      rm -f "$DAEMON_FILE.tmp"
+      die "daemon.json merge failed — existing file left untouched at $DAEMON_FILE"
+    fi
   else
-    [ -f "$DAEMON_FILE" ] && warn "Existing daemon.json was not valid JSON — rewriting it"
+    [ -f "$DAEMON_FILE" ] && warn "Existing daemon.json was not a JSON object — rewriting it"
     printf '%s\n' "$NEW_DAEMON" > "$DAEMON_FILE"
   fi
 fi
@@ -1162,11 +1222,15 @@ ok "Wrote agent/daemon.json"
 # --- Update settings.json: CLAUDE_NOTIFY_URL + TEAM_SPHERE_HELPER ---
 SETTINGS_FILE="$CLAUDE_DIR/settings.json"
 if [ -f "$SETTINGS_FILE" ] && [ "$DRY_RUN" != "true" ]; then
-  jq --arg url "$NOTIFY_URL" --arg helper "$SCRIPT_DIR/lib/sphere-helper.mjs" \
-     '.env.CLAUDE_NOTIFY_URL = $url | .env.TEAM_SPHERE_HELPER = $helper' \
-     "$SETTINGS_FILE" > "$SETTINGS_FILE.tmp" \
-    && mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
-  ok "Updated CLAUDE_NOTIFY_URL + TEAM_SPHERE_HELPER in settings.json"
+  if jq --arg url "$NOTIFY_URL" --arg helper "$SCRIPT_DIR/lib/sphere-helper.mjs" \
+       '.env.CLAUDE_NOTIFY_URL = $url | .env.TEAM_SPHERE_HELPER = $helper' \
+       "$SETTINGS_FILE" > "$SETTINGS_FILE.tmp" 2>/dev/null; then
+    mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
+    ok "Updated CLAUDE_NOTIFY_URL + TEAM_SPHERE_HELPER in settings.json"
+  else
+    rm -f "$SETTINGS_FILE.tmp"
+    warn "Could not update env keys in settings.json — file left untouched"
+  fi
 elif [ "$DRY_RUN" = "true" ]; then
   info "[dry-run] Update CLAUDE_NOTIFY_URL + TEAM_SPHERE_HELPER in settings.json"
 fi

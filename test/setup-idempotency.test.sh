@@ -120,6 +120,50 @@ check "[ \"\$(jq -r .userScalar '$SL3B')\" = true ]" "unknown settings.local.jso
 check "[ \"\$(jq -r '.env.MY_CUSTOM_ENV' '$SJ3B')\" = keepme ]" "user env key in settings.json survives"
 check "jq -e '.hooks' '$SJ3B' >/dev/null" "template settings.json content deployed"
 
+echo "== T3c: malformed settings values cannot clobber user data =="
+P3C="$SBX/proj3c"; seed_configured "$P3C"
+mkdir -p "$P3C/.claude"
+# "deny" is a SCALAR (user typo) — the merge must not throw, and the custom
+# allow entry + deny list + unknown key must survive the framework refresh.
+echo '{"permissions":{"allow":["Bash(my-tool:*)"],"deny":"Bash(rm:*)","ask":["Bash(sudo:*)"]},"userScalar":42}' > "$P3C/.claude/settings.local.json"
+echo '{"env":"not-an-object"}' > "$P3C/.claude/settings.json"
+OUT3C="$(bash "$SETUP" "$P3C" --yes </dev/null 2>&1)"; RC3C=$?
+SL3C="$P3C/.claude/settings.local.json"
+check "[ $RC3C -eq 0 ]" "run with malformed settings exits 0"
+check "jq -e 'type == \"object\"' '$SL3C' >/dev/null" "settings.local.json still valid JSON"
+check "jq -e '.permissions.allow | index(\"Bash(my-tool:*)\")' '$SL3C' >/dev/null" "custom allow entry survives despite malformed sibling"
+check "jq -e '.permissions.ask | index(\"Bash(sudo:*)\")' '$SL3C' >/dev/null" "ask list survives (union)"
+check "[ \"\$(jq -r .userScalar '$SL3C')\" = 42 ]" "unknown key survives despite malformed values"
+check "jq -e '.env | type == \"object\"' '$P3C/.claude/settings.json' >/dev/null" "scalar env coerced, settings.json valid"
+check "! ls '$P3C/.claude/'*.tmp 2>/dev/null | grep -q tmp" "no leftover .tmp files"
+
+echo "== T3d: deny/ask permission union + multi-relay + relay-without-network =="
+P3D="$SBX/proj3d"; seed_configured "$P3D"
+mkdir -p "$P3D/.claude"
+echo '{"permissions":{"deny":["Bash(dd:*)"]}}' > "$P3D/.claude/settings.local.json"
+# multi-relay config + NO network field: both must survive a --yes re-run.
+jq 'del(.network) | .group.relays = ["wss://custom.relay.example","wss://second.relay.example"]' \
+  "$P3D/.claude/agent/config.json" > "$P3D/.claude/agent/config.json.new" \
+  && mv "$P3D/.claude/agent/config.json.new" "$P3D/.claude/agent/config.json"
+bash "$SETUP" "$P3D" --yes </dev/null >/dev/null 2>&1
+C3D="$P3D/.claude/agent/config.json"
+check "jq -e '.permissions.deny | index(\"Bash(dd:*)\")' '$P3D/.claude/settings.local.json' >/dev/null" "user deny entry survives refresh"
+check "[ \"\$(jq -c '.group.relays' '$C3D')\" = '[\"wss://custom.relay.example\",\"wss://second.relay.example\"]' ]" "multi-relay array preserved untruncated"
+check "[ \"\$(jq -r '.group.relays[0]' '$C3D')\" = wss://custom.relay.example ]" "custom relay preserved even with no network field"
+
+echo "== T3e: identity nametag fill converges =="
+P3E="$SBX/proj3e"; seed_configured "$P3E"
+# identity has NO nametag; config does — first run fills it (additive), second
+# run must then be byte-for-byte untouched.
+jq 'del(.nametag)' "$P3E/.claude/agent/identity.json" > "$P3E/.claude/agent/identity.json.new" \
+  && mv "$P3E/.claude/agent/identity.json.new" "$P3E/.claude/agent/identity.json"
+bash "$SETUP" "$P3E" --yes </dev/null >/dev/null 2>&1
+check "[ \"\$(jq -r .nametag '$P3E/.claude/agent/identity.json')\" = seeded-agent ]" "missing identity nametag filled from config"
+check "[ \"\$(jq -r .npub '$P3E/.claude/agent/identity.json')\" = npub1seededagent ]" "keypair untouched by the fill"
+cp "$P3E/.claude/agent/identity.json" "$SBX/id3e.after1"
+bash "$SETUP" "$P3E" --yes </dev/null >/dev/null 2>&1
+check "cmp -s '$P3E/.claude/agent/identity.json' '$SBX/id3e.after1'" "identity byte-for-byte on the following run"
+
 echo "== T4: second run converges (idempotent) =="
 cp "$C3" "$SBX/cfg.after1"
 bash "$SETUP" "$P3" --yes </dev/null >/dev/null 2>&1
