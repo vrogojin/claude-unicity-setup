@@ -172,6 +172,34 @@ T3="$(bash "$TC" task-add --team demo --subject "Also export" --scope src/export
 chk "overlapping-scope task held out of ready-serialized" '[ "$(bash "$TC" ready-serialized demo | jq -r --arg t "'"$T3"'" "map(.taskId)|index(\$t)")" = null ]'
 chk "same task appears in unserialized ready" '[ "$(bash "$TC" ready demo | jq -r --arg t "'"$T3"'" "map(.taskId)|index(\$t)")" != null ]'
 
+echo; echo "── Work-item dedup: same DM via two delivery paths (different ts) → ONE item ──"
+# Deliver a message with an EXPLICIT timestamp (deliver() stamps 'now', which two calls in
+# the same second would share — we need DIFFERENT ts to prove the dedup ignores it).
+deliver_ts() { # <from_pubkey> <body> <ts>
+  local from="$1" body="$2" ts="$3"
+  [ -f "$MSGFILE" ] || printf '{"unread":false,"unread_count":0,"priority_count":0,"messages":[]}' > "$MSGFILE"
+  local tmp="$MSGFILE.t"
+  jq --arg from "$from" --arg body "$body" --arg ts "$ts" \
+     '.messages += [{type:"dm",from:$from,from_name:"",body:$body,timestamp:$ts,priority:false,read:false,authz:null}]' \
+     "$MSGFILE" > "$tmp" && mv "$tmp" "$MSGFILE"
+  ( cd "$HOOKS" && bash "$HOOKS/classify-inbound.sh" >/dev/null 2>&1 )
+}
+WI_DIR="$STATE_DIR/agent-workitems"
+DEDUP_BODY="please summarize the current roadmap status"
+WI_BEFORE=$(ls "$WI_DIR"/*.json 2>/dev/null | wc -l | tr -d ' ')
+# Live evidence: byte-identical DM delivered by BOTH the daemon path and the poll fallback,
+# with DIFFERENT receivedAt timestamps → two work items. The dedup key must ignore ts.
+deliver_ts "$WORKER_PK" "$DEDUP_BODY" "2026-08-18T10:00:00Z"   # daemon path
+deliver_ts "$WORKER_PK" "$DEDUP_BODY" "2026-08-18T10:00:03Z"   # poll path — SAME body, +3s ts
+WI_AFTER=$(ls "$WI_DIR"/*.json 2>/dev/null | wc -l | tr -d ' ')
+chk "duplicate DM (differing ts) produced exactly ONE work item" '[ "$(( WI_AFTER - WI_BEFORE ))" = 1 ]'
+EXP_ID="$(printf '%s|%s' "$WORKER_PK" "$DEDUP_BODY" | sha1sum | cut -c1-16)"
+chk "work item keyed by sha1(from|body), not the timestamp" '[ -f "'"$WI_DIR/$EXP_ID.json"'" ]'
+# A genuinely different body from the same sender IS still its own distinct work item.
+deliver_ts "$WORKER_PK" "a different request entirely" "2026-08-18T10:00:05Z"
+WI_FINAL=$(ls "$WI_DIR"/*.json 2>/dev/null | wc -l | tr -d ' ')
+chk "distinct body still enqueues its own work item" '[ "$(( WI_FINAL - WI_AFTER ))" = 1 ]'
+
 echo; echo "── Rendered ledgers ──"
 bash "$TC" render demo >/dev/null
 chk "ledger.md rendered" '[ -f "$TEAM_ROOT/demo/ledger.md" ]'

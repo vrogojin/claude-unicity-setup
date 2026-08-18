@@ -152,6 +152,27 @@ if [ -f "$AUTHZ_PENDING" ]; then
   fi
 fi
 
+# --- Denied agents that tried to re-authorize via an automatic path (deny is sticky) ---
+# An owner's /deny-agent is final against ANY automatic re-auth (e.g. a denied peer
+# re-redeeming its already-used invite ticket). Such attempts are refused and recorded
+# here; surface them so the owner consciously re-authorizes (the ONLY un-deny) or ignores.
+DENIED_REAUTH="$STATE_DIR/agent-denied-reauth.json"
+if [ -f "$DENIED_REAUTH" ]; then
+  DRCOUNT=$(jq -r '.count // 0' "$DENIED_REAUTH" 2>/dev/null)
+  if [ "$DRCOUNT" -gt 0 ] 2>/dev/null && [ "$DRCOUNT" != "0" ]; then
+    DR_DETAILS=$(jq -r '
+      .items[]? |
+      "  • " + (if (.unicityName // "") != "" then .unicityName + " (" + (.pubkey[0:12]) + "…)"
+                else (.pubkey[0:16] + "…") end)
+      + " — " + ((.attempts // 1)|tostring) + " blocked attempt(s)"
+      + (if (.lastContext // "") != "" then "; last: " + ((.lastContext) | gsub("[\n\r]";" ") | .[0:120]) else "" end)
+    ' "$DENIED_REAUTH" 2>/dev/null)
+    DR_MSG="${DRCOUNT} DENIED agent(s) attempted to re-authorize via an automatic path (e.g. re-redeeming an already-used invite ticket). The deny still holds — nothing was authorized:\n${DR_DETAILS}\n\nTo re-admit one, consciously re-authorize:  /authorize-agent <name-or-npub> <cap,cap,...>\nTo keep the deny and dismiss this notice:  rm ${DENIED_REAUTH}\nA denied agent can NEVER un-deny itself — only you can."
+    jq -n --arg reason "$DR_MSG" '{"decision":"block","reason":$reason}'
+    exit 0
+  fi
+fi
+
 # --- Authorized agent requests queued for capability-scoped dispatch -----------
 WI_DIR="$STATE_DIR/agent-workitems"
 if [ -d "$WI_DIR" ]; then

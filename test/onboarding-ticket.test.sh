@@ -278,6 +278,39 @@ read -r ZN ZH < <(new_peer legacyp)
 redeem_msg "$ZH" "$TIDV1" "$SECV1" "$ZN" | bash "$TICKET" ingest-redeem - >/dev/null 2>&1
 [ "$(authst "$ZH")" = "authorized" ] && ok "v1 ticket ingest still authorizes" || bad "v1 ingest broken"
 
+echo "== 19. DENY is STICKY: a denied peer re-redeeming its ticket stays denied + is surfaced =="
+# Live evidence: a denied agent RE-AUTHORIZED itself by re-redeeming an already-redeemed ticket.
+# The ticket re-redeem path must NOT un-deny; only an OWNER-explicit authorize may.
+REG="$HOOKS/agent-registry.sh"
+# The surface lands in the per-repo STATE_DIR (derived by state-dir.sh from the hooks path,
+# exactly where the Stop gate reads it) — capture it the same way section 14 does.
+SD19="$(. "$HOOKS/state-dir.sh" 2>/dev/null && printf '%s' "$STATE_DIR")"
+SURF="$SD19/agent-denied-reauth.json"
+rm -f "$SURF"
+TS19=$(issue --caps consult,claim-area --name sticky); TID19=$(tid_of "$TS19"); SEC19=$(secret_of "$TS19")
+read -r SN SH < <(new_peer sticky)
+# a) first redeem → authorized + ticket consumed (baseline)
+redeem_msg "$SH" "$TID19" "$SEC19" "$SN" | bash "$TICKET" ingest-redeem - >/dev/null 2>&1
+[ "$(authst "$SH")" = "authorized" ] && ok "peer authorized on first redeem" || bad "first redeem did not authorize"
+# b) owner DENIES the peer
+bash "$REG" deny "$SH" >/dev/null 2>&1
+[ "$(authst "$SH")" = "denied" ] && ok "owner deny recorded" || bad "deny not recorded"
+# c) DENIED peer re-redeems the SAME (already-redeemed) ticket → MUST stay denied, NO re-grant
+OUT=$(redeem_msg "$SH" "$TID19" "$SEC19" "$SN" | bash "$TICKET" ingest-redeem - 2>&1)
+[ "$(authst "$SH")" = "denied" ] && ok "re-redeem did NOT un-deny (deny sticky)" || bad "denied peer re-authorized itself via re-redeem!"
+echo "$OUT" | grep -q "DRY-RUN send.*ticket.grant" && bad "grant emitted to a denied peer!" || ok "no grant emitted to a denied peer"
+# d) attempt is surfaced to the owner (Stop-gate state file)
+[ "$(jq -r '.count // 0' "$SURF" 2>/dev/null)" -gt 0 ] 2>/dev/null && ok "denied re-auth surfaced to owner" || bad "denied re-auth NOT surfaced"
+[ "$(jq -r --arg h "$SH" 'any(.items[]?; .pubkey==$h)' "$SURF" 2>/dev/null)" = "true" ] && ok "surface names the denied pubkey" || bad "surface missing the pubkey"
+# e) a bare (non-owner) direct authorize is ALSO refused — the chokepoint is in the registry
+bash "$REG" authorize "$SH" consult >/dev/null 2>&1 && bad "non-owner authorize un-denied!" || ok "non-owner authorize refused (exit non-zero)"
+[ "$(authst "$SH")" = "denied" ] && ok "still denied after non-owner authorize" || bad "un-denied by non-owner authorize"
+# f) OWNER-explicit authorize (--owner) is the ONLY un-deny → succeeds + clears the surface
+bash "$REG" authorize "$SH" consult --owner >/dev/null 2>&1 && ok "owner --owner authorize succeeds" || bad "owner authorize failed"
+[ "$(authst "$SH")" = "authorized" ] && ok "owner re-authorized the peer (un-deny)" || bad "owner authorize did not un-deny"
+[ "$(jq -r '.count // 0' "$SURF" 2>/dev/null)" = "0" ] && ok "surface cleared after owner un-deny" || bad "surface not cleared"
+rm -f "$SURF"  # clean our shared-STATE_DIR footprint (repo-default dir, like section 14)
+
 echo ""
 echo "════════════════════════════════════════"
 echo "  onboarding-ticket: $PASS passed, $FAIL failed"
