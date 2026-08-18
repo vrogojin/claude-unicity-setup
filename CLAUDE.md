@@ -136,6 +136,38 @@ Three new non-destructive capabilities gate participation: `team-coordinate`, `t
 Opt-in and inert-safe (no local team ⇒ only invitations surface); requires the Sphere
 daemon for live delivery. Full model: [`docs/team-coordination.md`](docs/team-coordination.md).
 
+## Scheduled Automation
+
+Three optional autonomous features layer on the existing coordination/recall/roadmap
+machinery. **All three are OFF by default** — `setup.sh` (Phase 11) seeds the config and
+installs the scheduler plumbing but enables nothing. Full design:
+[`docs/nightly-sweep-lifecycle-design.md`](docs/nightly-sweep-lifecycle-design.md).
+
+| Feature | Purpose | Trigger |
+|---|---|---|
+| **Syncup** (`syncup`) | Early-morning coordinator peer-sync: drain inbound peer traffic, process consults + capability-scoped requests, emit our own deterministic `sync.report`, DM the owner a digest. Widens no permission. | Scheduled, **07:00 local** (coordinator role only) |
+| **Task-lifecycle** (`lifecycle`) | On task start: recall prior work + find/create the ticket; on task complete: update ticket/board/roadmap. | **Event-driven** — `UserPromptSubmit` + `PostToolUse` + Stop gate #15 (not scheduled) |
+| **Nightly housekeeping** (`housekeeping`) | 3 AM sweep in a disposable git worktree off `main`: refactor recent work to named defects, add + run tests, `/steelman`, loop until green. | Scheduled, **03:00 local** |
+
+**Config surface** — all in `.claude/agent/config.json`, never `settings.json` env (deep-merged, so setup re-runs preserve your tuning):
+
+- Top-level `"role": "coordinator" | "peer"` — gates outbound syncup traffic (a `peer` never emits). Set by the `setup.sh` prompt / `SETUP_ROLE`.
+- `"automation": { "syncup": {…}, "lifecycle": {…}, "housekeeping": {…} }` — each block carries `enabled:false` plus its knobs (`time`, `max_wall_minutes`, `max_turns`, `retry_once` for syncup; `ticket_mode`, `max_new_tickets_per_day` for lifecycle; `scope_days`, `max_items`, `max_prs`, `max_diff_lines`, `max_iterations`, `web_research`, `allow_new_deps`, `output:"pr"` for housekeeping).
+
+**Enable one feature (safely):**
+
+- **Scheduled jobs** (`syncup`, `housekeeping`): set `.automation.<job>.enabled=true`, then register the timer with `bash .claude/hooks/automation/scheduler.sh install <job>`. The scheduler picks a backend by platform probe (systemd user timers → `schtasks` → cron) and runs an **install-time preflight** (claude auth, `gh auth`, `jq`, Linux `enable-linger`) with exact remediation — it does not fail silently at 3 AM. Observe with `scheduler.sh status [<job>]`.
+- **Task-lifecycle** is event-driven — no scheduler entry. Just set `.automation.lifecycle.enabled=true`; the `task-lifecycle-check.sh` hook (already wired into `settings.json`) activates.
+
+**Output model (housekeeping):** every sweep produces a **PR** on `sweep/<date>` + a `/steelman` verdict in the PR body + a short **morning-review report** (dated file, PR-body prepend, and a SessionStart digest). It **never auto-merges** — you accept by merging the PR. The wrapper (not the model) pushes, and only to `sweep/*`; the diff is secret-scanned pre-push.
+
+**Kill switches:**
+
+- `AUTOMATION_DISABLE=1` (env) — `run-job.sh` disables **every** scheduled job at the runner without touching timers.
+- Per-job `.automation.<job>.enabled=false` — turns off that one job (the runner and the lifecycle hook both gate on it).
+- `TASK_LIFECYCLE_DISABLE=1` (env) — turns off the task-lifecycle hook entirely.
+- A stuck run: `rm -f /tmp/claude/*/automation/<job>.lock` (flock, so process death already releases it).
+
 ## Editing Configuration
 
 When modifying `claude_conf/`:

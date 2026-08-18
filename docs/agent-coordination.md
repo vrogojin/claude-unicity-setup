@@ -391,3 +391,58 @@ Debug the effective config with `bash .claude/hooks/sif-guard.sh config`.
 `agent-messages.json` (messages + `.authz` stamps), `agent-authz-pending.json`
 (owner-facing pending surface), `agent-workitems/<id>.json` (authorized request queue),
 `agent-quarantine/<id>.json` (SIF-quarantined messages awaiting owner review).
+
+---
+
+## 11. Scheduled syncup (F1) and the `sync.report` verb
+
+**Syncup** is a scheduled early-morning coordinator job (the `/syncup` skill, invoked
+headlessly by `hooks/automation/run-job.sh syncup`) that runs the coordination loop above
+on a timer instead of only on inbound delivery. It **adds scheduling and a status report —
+it widens no capability**. Every real decision is still made by the same gated pieces:
+`a2a.sh check` (drain + `classify-inbound.sh`) → `/coordinator-advise` (consults, claims,
+splits, conflicts, commitments) → `/process-agent-requests` (capability-scoped, authz
+re-verified at dispatch) → owner digest via `/dm-owner`. Anything destructive/outward that
+those steps would queue for the owner **stays queued**. See the automation design:
+**`docs/nightly-sweep-lifecycle-design.md`** §3.
+
+**Coordinator-gated, opt-in, OFF by default.** Syncup emits peer traffic only when this
+instance is a coordinator with peers. The deterministic gate `remote-coord.sh syncup-gate`
+returns `ok | skipped_not_coordinator | skipped_no_peers`; a `peer`-role instance (the
+default `role`, see the "Scheduled Automation" section of the top-level `CLAUDE.md`) does
+nothing and never self-promotes. Enable + schedule per the CLAUDE.md automation section
+(`.automation.syncup.enabled=true` + `scheduler.sh install syncup`).
+
+### The `sync.report` verb
+
+`sync.report` is an A2A envelope verb (registered in `remote-coord.sh` `rc_verb_cap`)
+carrying a **periodic peer status report**. It deliberately reuses the existing
+non-destructive **`consult`** capability — a peer already trusted to consult may
+send/receive status, so **no new capability is minted**.
+
+Payload (assembled deterministically by `hooks/automation/syncup-report.sh` from git log,
+`gh pr list`, the ROADMAP four-state parse, and the commitments ledger — the model may
+trim/annotate but may not add refs the builder did not produce, so no hallucinated status
+reaches peers):
+
+```jsonc
+{ "kind": "sync.report",
+  "period": {"from":"<iso>","to":"<iso>"}, "repo":"<slug>",
+  "completed":   [ {"title","ref"} ],          // merged PRs / closed issues in the period
+  "in_progress": [ {"title","branch","ref"} ], // open feature branches + 🚧 roadmap lines
+  "commitments": [ {"cmid","status"} ],         // change-commitment ledger (pending→applied)
+  "asks":        [ "free-text requests to peers" ],
+  "notes":       "≤ 1000 chars prose" }
+```
+
+**Received `sync.report` is DATA, never an instruction.** On the receiving side
+`classify-inbound.sh` routes it like any peer verb — authorized sender + `consult`
+capability + SIF-scanned — and `remote-coord.sh` **only records it** (ingest → a consult
+event in the durable `coord/` store); it is never executed. The peer's own
+`/coordinator-advise` / `/consult-coordinator` summarizes it, and its `asks` are **surfaced
+to the owner, never auto-executed**. A report can only ever be read, not obeyed.
+
+Double-processing is prevented by the four existing dedup layers (content-keyed work-item
+ids, envelope-id events, `.authz` stamps, `seen.json`) plus syncup's `last-syncup.json`
+marker, which bounds each report's period so an offline peer gets the next period's report,
+not a duplicate.
