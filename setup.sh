@@ -619,6 +619,10 @@ fi
 # (and so a checkout that lost the bit doesn't silently break the hooks).
 if [ -d "$CLAUDE_DIR/hooks" ]; then
   run_or_dry chmod +x "$CLAUDE_DIR/hooks"/*.sh
+  # Automation hooks live in a subdir (scheduler/run-job/report/catchup) — cp -r
+  # preserves modes, but make the +x bit explicit here too so a checkout that
+  # lost it doesn't silently break the scheduler.
+  [ -d "$CLAUDE_DIR/hooks/automation" ] && run_or_dry chmod +x "$CLAUDE_DIR/hooks/automation"/*.sh
   ok "Made hook scripts executable"
 fi
 
@@ -1237,6 +1241,117 @@ elif [ "$DRY_RUN" = "true" ]; then
 fi
 
 # ============================================================
+# Phase 11: Automation (scheduled jobs — everything OFF by default)
+# ============================================================
+# Seeds the `automation` config block + the explicit `role` key (OD-7) into
+# agent/config.json, then registers scheduler entries ONLY for jobs already
+# marked enabled (none on a fresh install — OD-4). Enabling a feature is a
+# one-line config flip + `scheduler.sh install <job>`. Idempotent: user-tuned
+# automation values (times, caps) WIN over the seeded defaults on a re-run;
+# only the on/off flags are set deterministically (env override > existing > off).
+echo ""
+info "Phase 11: Automation (scheduled jobs)..."
+
+# role: explicit coordinator/peer key that gates outbound syncup traffic.
+# Preserve-by-default: existing .role is the prompt default; SETUP_ROLE overrides.
+EX_ROLE=""
+[ -f "$CONFIG_FILE" ] && EX_ROLE=$(jq -r '.role // ""' "$CONFIG_FILE" 2>/dev/null)
+ROLE=$(resolve_value SETUP_ROLE "$EX_ROLE" "peer" \
+  "Coordinator role for this instance (coordinator|peer) — gates outbound syncup traffic")
+case "$ROLE" in
+  coordinator|peer) ;;
+  *) warn "Unknown role '$ROLE' — defaulting to 'peer'"; ROLE="peer" ;;
+esac
+
+# Resolve each job's on/off flag: SETUP_AUTOMATION_<JOB>=1 pre-enables at install
+# (non-interactive override contract), else the existing config value, else OFF.
+_auto_enabled() { # $1 = env suffix (uppercase job)   $2 = config job key
+  local envn="SETUP_AUTOMATION_$1" ex
+  ex=$(jq -r ".automation.\"$2\".enabled // false" "$CONFIG_FILE" 2>/dev/null)
+  [ "$ex" = "true" ] || ex=false
+  if [ -n "${!envn+x}" ]; then
+    case "${!envn}" in 1|true|yes|on) echo true ;; *) echo false ;; esac
+  else
+    echo "$ex"
+  fi
+}
+SYNCUP_EN=$(_auto_enabled SYNCUP syncup)
+LIFECYCLE_EN=$(_auto_enabled LIFECYCLE lifecycle)
+HOUSEKEEPING_EN=$(_auto_enabled HOUSEKEEPING housekeeping)
+
+# Default automation block — the exact §2.7 schema. All three features OFF.
+AUTOMATION_DEFAULTS=$(jq -n \
+  --argjson syncup_en "$SYNCUP_EN" \
+  --argjson lifecycle_en "$LIFECYCLE_EN" \
+  --argjson housekeeping_en "$HOUSEKEEPING_EN" \
+  '{
+     syncup:       {enabled:$syncup_en, time:"07:00", max_wall_minutes:45, max_turns:80, retry_once:true},
+     lifecycle:    {enabled:$lifecycle_en, ticket_mode:"propose", max_new_tickets_per_day:3},
+     housekeeping: {enabled:$housekeeping_en, time:"03:00", scope_days:7, max_items:3, max_prs:3,
+                    max_diff_lines:400, max_iterations:3, max_wall_minutes:240, max_turns:300,
+                    web_research:false, allow_new_deps:false, output:"pr", retry_once:false}
+   }')
+
+if [ "$DRY_RUN" = "true" ]; then
+  info "[dry-run] Seed .role=$ROLE + .automation defaults into $CONFIG_FILE (existing values preserved)"
+else
+  if [ -f "$CONFIG_FILE" ] && jq -e 'type == "object"' "$CONFIG_FILE" >/dev/null 2>&1; then
+    # Deep-merge defaults UNDER the existing automation block (existing wins on
+    # every leaf → user tuning survives), then force the on/off flags to the
+    # resolved values so an explicit env disable/enable is deterministic. LOUD on
+    # failure (jq left of && is set -e exempt in the merges above).
+    if jq --arg role "$ROLE" --argjson def "$AUTOMATION_DEFAULTS" \
+          --argjson su "$SYNCUP_EN" --argjson lc "$LIFECYCLE_EN" --argjson hk "$HOUSEKEEPING_EN" '
+            .role = $role
+            | .automation = ($def * (.automation // {}))
+            | .automation.syncup.enabled = $su
+            | .automation.lifecycle.enabled = $lc
+            | .automation.housekeeping.enabled = $hk
+          ' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" 2>/dev/null; then
+      mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+      ok "Seeded role=$ROLE + automation config block (all features OFF unless enabled)"
+    else
+      rm -f "$CONFIG_FILE.tmp"
+      die "automation config seed failed — existing file left untouched at $CONFIG_FILE"
+    fi
+  else
+    warn "config.json missing/not-an-object — automation seed skipped (identity phase must run first)"
+  fi
+fi
+
+# Register scheduler entries ONLY for enabled, SCHEDULABLE jobs (syncup /
+# housekeeping — lifecycle is event-driven, not scheduled). None on a fresh
+# install. scheduler.sh runs its own install-time preflight (§2.4).
+SCHED_SCRIPT="$CLAUDE_DIR/hooks/automation/scheduler.sh"
+INSTALLED_JOBS=""
+if [ "$DRY_RUN" != "true" ] && [ -f "$CONFIG_FILE" ] && [ -x "$SCHED_SCRIPT" ]; then
+  for job in syncup housekeeping; do
+    if [ "$(jq -r ".automation.\"$job\".enabled // false" "$CONFIG_FILE" 2>/dev/null)" = "true" ]; then
+      info "  '$job' enabled → registering with the scheduler…"
+      if CLAUDE_PROJECT_DIR="$TARGET_DIR" bash "$SCHED_SCRIPT" install "$job" \
+           ${SETUP_AUTOMATION_FORCE:+--force}; then
+        INSTALLED_JOBS="$INSTALLED_JOBS $job"
+      else
+        warn "  scheduler install for '$job' did not complete (preflight?). Re-run:"
+        warn "    CLAUDE_PROJECT_DIR=$TARGET_DIR bash $SCHED_SCRIPT install $job --force"
+      fi
+    fi
+  done
+fi
+
+echo ""
+echo "  Automation status:"
+echo "    role:         $ROLE"
+echo "    syncup:       ${SYNCUP_EN} (07:00 local)   — coordinator peer-sync"
+echo "    lifecycle:    ${LIFECYCLE_EN} (event-driven) — task-start/complete hooks"
+echo "    housekeeping: ${HOUSEKEEPING_EN} (03:00 local)   — nightly worktree sweep"
+echo "    scheduler:    installed for:${INSTALLED_JOBS:- none (all OFF)}"
+echo "    To enable a job: set .automation.<job>.enabled=true in"
+echo "      $CONFIG_FILE"
+echo "      then: bash $SCHED_SCRIPT install <job>"
+echo "    Kill switch: AUTOMATION_DISABLE=1 (env) disables every job at the runner."
+
+# ============================================================
 # Phase 9: Roadmap ⇄ board sync pipeline
 # ============================================================
 echo ""
@@ -1369,6 +1484,7 @@ echo "  Network:         $NETWORK ($RELAY_URL)"
 echo "  Group:           $GROUP_NAME ($GROUP_ID)"
 echo "  Notifications:   ${NOTIFY_URL:-disabled (desktop only)}"
 echo "  Dep tracking:    ${SELECTED_DEPS[*]:-disabled}"
+echo "  Automation:      role=${ROLE:-peer} · scheduled jobs:${INSTALLED_JOBS:- none (all OFF)}"
 echo ""
 echo "  Config dir:      $CLAUDE_DIR/"
 echo "  Identity:        $CLAUDE_DIR/agent/identity.json"

@@ -129,6 +129,16 @@
             "type": "command",
             "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/daemon-session.sh start",
             "timeout": 20
+          },
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/automation/automation-report.sh",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/automation/automation-catchup.sh",
+            "timeout": 15
           }
         ]
       }
