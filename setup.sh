@@ -1373,9 +1373,29 @@ else
   fi
 fi
 
-# Make the reverse-direction fenced wrapper node-runnable regardless of umask.
-[ -f "$CLAUDE_DIR/hooks/gptbridge/consult-claude-mcp.mjs" ] && \
-  run_or_dry chmod +x "$CLAUDE_DIR/hooks/gptbridge/consult-claude-mcp.mjs"
+# Make the gptbridge executables node/bash-runnable regardless of umask.
+for _gbx in \
+  "$CLAUDE_DIR/hooks/gptbridge/consult-claude-mcp.mjs" \
+  "$CLAUDE_DIR/hooks/gptbridge/relay.mjs" \
+  "$CLAUDE_DIR/hooks/gptbridge/gptbridge.sh" \
+  "$CLAUDE_DIR/hooks/lib/secret-scan.sh"; do
+  [ -f "$_gbx" ] && run_or_dry chmod +x "$_gbx"
+done
+
+# T2 relay pseudo-peer (OD-6): register `chatgpt-bridge` in the agent registry
+# with the single `consult` capability so inbound consults ride classify-inbound
+# (SIF/quarantine, dedup, Stop-gate, /deny-agent). Only when the relay tier is
+# ENABLED — a fresh OFF install must not pre-authorize an external peer. (start
+# also registers it, so this is just eager wiring for an already-enabled install.)
+GB_RELAY_EN=false
+if [ -f "$CONFIG_FILE" ]; then GB_RELAY_EN=$(jq -r '.gptbridge.relay.enabled // false' "$CONFIG_FILE" 2>/dev/null || echo false); fi
+[ "$GB_RELAY_EN" = "true" ] || GB_RELAY_EN=false
+if [ "$DRY_RUN" != "true" ] && [ "$GB_MASTER" = "true" ] && [ "$GB_RELAY_EN" = "true" ] \
+   && [ -f "$CLAUDE_DIR/hooks/gptbridge/gptbridge.sh" ]; then
+  CLAUDE_PROJECT_DIR="$TARGET_DIR" bash "$CLAUDE_DIR/hooks/gptbridge/gptbridge.sh" register-peer >/dev/null 2>&1 \
+    && ok "Registered gptbridge pseudo-peer 'chatgpt-bridge' (consult cap)" \
+    || warn "gptbridge pseudo-peer registration skipped (registry not ready)"
+fi
 
 # Preflight report (informational — the feature is OFF; absence is not an error).
 GB_HAVE_CODEX=no; command -v codex >/dev/null 2>&1 && GB_HAVE_CODEX=yes
@@ -1448,6 +1468,16 @@ if [ -f "$CLAUDE_DIR/templates/codex-config.toml.snippet" ]; then
   done < "$CLAUDE_DIR/templates/codex-config.toml.snippet"
 fi
 echo "    Kill switch: GPTBRIDGE_DISABLE=1 (env) makes the reverse wrapper refuse; master gate OFF disables everything."
+echo ""
+echo "    To enable T2 (ChatGPT-session consult relay; public HTTPS via cloudflared, capability-URL auth):"
+echo "      1. Install cloudflared (needed for the public tunnel)."
+echo "      2. Set .gptbridge.enabled=true AND .gptbridge.relay.enabled=true in $CONFIG_FILE"
+echo "      3. Start it:  /gptbridge start   (or bash $CLAUDE_DIR/hooks/gptbridge/gptbridge.sh start)"
+echo "         → prints https://<random>.trycloudflare.com/mcp/<token> (token ROTATES each start)."
+echo "      4. In ChatGPT (web): Settings → Apps → Advanced → Developer mode → Add custom connector → paste URL → auth: none."
+echo "      Surface = exactly two tools (consult_claude, check_relay). ChatGPT gets NO file/tool/exec access."
+echo "      Inbound consults are UNTRUSTED, quarantined for your approval; replies are owner-approved. Reverse (Claude→ChatGPT) is pull-only."
+echo "      Kill: /gptbridge stop · GPTBRIDGE_DISABLE=1 · /deny-agent chatgpt-bridge (sticky). Auto-stops after ttl_hours + on SessionEnd."
 
 # ============================================================
 # Phase 9.5: Transport preflight

@@ -328,15 +328,17 @@ To skip the agent messages gate: `rm -f /tmp/claude/*/agent-messages.json`.
 To clear a pending-authorization block without deciding: `/deny-agent <name-or-npub>`
 (or `rm -f /tmp/claude/*/agent-authz-pending.json`).
 
-## ChatGPT / Codex Coupling (gptbridge — T1)
+## ChatGPT / Codex Coupling (gptbridge — T1 Codex + T2 ChatGPT-session relay)
 
-`gptbridge` couples this Claude Code session with OpenAI's **Codex CLI** so the
-two agents can *consult each other* over **local stdio MCP** — no tunnel, no
-tokens, no network surface, no API spend (Codex rides your existing ChatGPT
-subscription). **Installed but OFF by default** (`.gptbridge.enabled=false` in
-`.claude/agent/config.json`); nothing runs until you flip the gate. Full design
-(plus the unbuilt T2 ChatGPT-session relay and T3 model-consult tiers):
+`gptbridge` lets this Claude Code session and OpenAI *consult each other*. Two
+tiers ship, both **OFF by default** (`.gptbridge.enabled=false` in
+`.claude/agent/config.json`); nothing runs until you flip the gate. Full design:
 [`docs/chatgpt-mcp-coupling-design.md`](docs/chatgpt-mcp-coupling-design.md).
+
+- **T1 — Claude ⇄ Codex CLI** (local stdio MCP; no tunnel, tokens, or API spend —
+  Codex rides your ChatGPT subscription).
+- **T2 — Claude ⇄ your actual ChatGPT session** (a consult relay + cloudflared
+  quick tunnel registered as a ChatGPT developer-mode connector). See below.
 
 - **Claude → Codex:** registers Codex's official `codex mcp-server` (tools
   `codex`/`codex-reply`, persistent `threadId`) in the project `.mcp.json` — a
@@ -357,6 +359,41 @@ settings `env`) → reverse (optional) by appending
 `.claude/templates/codex-config.toml.snippet` to `~/.codex/config.toml`.
 **Kill-switches:** master gate off, `.gptbridge.codex.enabled=false`, or
 `GPTBRIDGE_DISABLE=1` (env). Absent `codex` ⇒ inert, not an error.
+
+### T2 — ChatGPT-session consult relay (`/gptbridge`)
+
+Couples your **actual ChatGPT (web/app) session** with this Claude Code session.
+ChatGPT can only reach us as an MCP *client* over public HTTPS, so a tiny
+loopback relay (`.claude/hooks/gptbridge/relay.mjs`) is fronted by a
+**cloudflared quick tunnel** and registered as a ChatGPT **developer-mode
+connector**. It exposes **exactly two tools and nothing else**:
+
+- **`consult_claude(question)`** — ChatGPT asks this session a question. The
+  question is injected **as a2a peer traffic** from the pseudo-peer
+  `chatgpt-bridge` (`consult` cap), so it rides `classify-inbound.sh`: SIF
+  content-guard, dedup, quarantine, the Stop-gate, and `/deny-agent
+  chatgpt-bridge` sticky-deny all apply. It lands as **UNTRUSTED, quarantined
+  DATA** — never instructions. You answer it owner-approved via `/gptbridge
+  reply <consult_id>`; the reply is secret-scanned before it is served.
+- **`check_relay()`** — ChatGPT **pulls** owner-approved replies and any
+  Claude-initiated questions (`/gptbridge ask`). ChatGPT can't be pushed to, so
+  Claude→ChatGPT is **pull-only**: your questions wait until the owner tells
+  ChatGPT to "check the relay". Honest asymmetry, by platform design.
+
+**ChatGPT gets NO file/tool/exec access on this surface** — it is pure
+message-passing. **Auth = capability-URL:** a per-start token in the tunnel path
+(`/mcp/<token>`), **rotated every start**; any other path/token 404s. Relay binds
+`127.0.0.1`; cloudflared is the only ingress; **TTL auto-stop** (`ttl_hours`,
+default 4) + **SessionEnd reap**; `GPTBRIDGE_DISABLE=1` refuses mid-flight.
+
+**Enable:** install `cloudflared` → set `.gptbridge.enabled=true` **and**
+`.gptbridge.relay.enabled=true` → `/gptbridge start` → paste the printed
+`https://<random>.trycloudflare.com/mcp/<token>` into ChatGPT (Settings → Apps →
+Advanced → Developer mode → Add custom connector → auth: none). Re-paste after
+each `start` (token rotation; a permanent URL needs OAuth, phase 2). Verbs:
+`/gptbridge start|stop|status|url|reply <id>|ask "<q>"`. Cross-vendor note:
+consult/reply text authored here reaches OpenAI; ChatGPT's questions enter this
+session — scoped to deliberately-authored text.
 
 ## Documentation Pointers
 
