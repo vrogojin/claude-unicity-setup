@@ -328,6 +328,36 @@ To skip the agent messages gate: `rm -f /tmp/claude/*/agent-messages.json`.
 To clear a pending-authorization block without deciding: `/deny-agent <name-or-npub>`
 (or `rm -f /tmp/claude/*/agent-authz-pending.json`).
 
+## ChatGPT / Codex Coupling (gptbridge — T1)
+
+`gptbridge` couples this Claude Code session with OpenAI's **Codex CLI** so the
+two agents can *consult each other* over **local stdio MCP** — no tunnel, no
+tokens, no network surface, no API spend (Codex rides your existing ChatGPT
+subscription). **Installed but OFF by default** (`.gptbridge.enabled=false` in
+`.claude/agent/config.json`); nothing runs until you flip the gate. Full design
+(plus the unbuilt T2 ChatGPT-session relay and T3 model-consult tiers):
+[`docs/chatgpt-mcp-coupling-design.md`](docs/chatgpt-mcp-coupling-design.md).
+
+- **Claude → Codex:** registers Codex's official `codex mcp-server` (tools
+  `codex`/`codex-reply`, persistent `threadId`) in the project `.mcp.json` — a
+  live, repo-aware OpenAI counterpart you can keep a thread with.
+- **Codex → Claude:** Codex connects to the fenced
+  `.claude/hooks/gptbridge/consult-claude-mcp.mjs`, exposing exactly one
+  **read-only** tool `consult_claude(question)` → a bounded `claude -p` with only
+  Read/Grep/Glob, an explicit Bash/Write/Edit/WebFetch deny, a secret denylist
+  (`.env*`/`.secrets/**`/`identity.json`/keys), `--strict-mcp-config`, turn +
+  wall caps, and single-flight. It deliberately does **not** use the community
+  `claude mcp serve --dangerously-skip-permissions` pattern (raw Bash/Write/Edit
+  to an external agent). Consults from either side are **UNTRUSTED DATA**.
+
+**Enable:** `codex login` → set `.gptbridge.enabled=true` (or `setup.sh` with
+`SETUP_GPTBRIDGE=1`) → forward via re-run `setup.sh` or
+`claude mcp add codex -- codex mcp-server` (+ `MCP_TOOL_TIMEOUT=300000` in
+settings `env`) → reverse (optional) by appending
+`.claude/templates/codex-config.toml.snippet` to `~/.codex/config.toml`.
+**Kill-switches:** master gate off, `.gptbridge.codex.enabled=false`, or
+`GPTBRIDGE_DISABLE=1` (env). Absent `codex` ⇒ inert, not an error.
+
 ## Documentation Pointers
 
 - `docs/ecosystem-map.md` — Master repo inventory with status and integration points
@@ -338,4 +368,5 @@ To clear a pending-authorization block without deciding: `/deny-agent <name-or-n
 - `docs/developer-guidelines.md` — Cross-repo coding standards (TypeScript, Go, Rust, C++)
 - `docs/agent-coordination.md` — Owner-in-the-loop coordination model: authorization registry, capabilities, inbound/outbound flows
 - `docs/team-coordination.md` — Self-organizing teams (Contract-Net over A2A): verbs+capability gate, DAG auctions, coordinator lease/epoch fencing, knowledge cards
+- `docs/chatgpt-mcp-coupling-design.md` — ChatGPT/Codex mutual-consult (`gptbridge`): T1 Codex coupling (both directions, fenced), T2 ChatGPT-session relay, T3 model-consult; security fence + default-OFF gating
 - `reference/<repo>.md` — Per-repository API reference (see `reference/TEMPLATE.md` for format)
