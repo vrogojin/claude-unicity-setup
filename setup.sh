@@ -1313,19 +1313,24 @@ info "Phase 11: gptbridge (ChatGPT/Codex coupling)..."
 
 # Master gate: SETUP_GPTBRIDGE=1 pre-enables at install (non-interactive override
 # contract), else existing config value, else OFF. setup.sh NEVER forces it true.
+# Read existing values with an explicit `if` (NOT `[ -f ] && VAR=$(jq)`): jq as the
+# last command of an &&-list is NOT set -e exempt, so a malformed config would
+# abort the whole setup — the `|| echo` fallback keeps it robust.
 GB_EX=false
-[ -f "$CONFIG_FILE" ] && GB_EX=$(jq -r '.gptbridge.enabled // false' "$CONFIG_FILE" 2>/dev/null)
+if [ -f "$CONFIG_FILE" ]; then GB_EX=$(jq -r '.gptbridge.enabled // false' "$CONFIG_FILE" 2>/dev/null || echo false); fi
 [ "$GB_EX" = "true" ] || GB_EX=false
-if [ -n "${SETUP_GPTBRIDGE+x}" ]; then
+# Treat SET-BUT-EMPTY as "no choice" (falls through to existing) — a stray empty
+# export must not silently flip the gate.
+if [ -n "${SETUP_GPTBRIDGE:-}" ]; then
   case "$SETUP_GPTBRIDGE" in 1|true|yes|on) GB_MASTER=true ;; *) GB_MASTER=false ;; esac
 else
   GB_MASTER=$GB_EX
 fi
 # codex tier flag (default on — effective only when master gate on AND codex on PATH).
 GB_CODEX_EX=true
-[ -f "$CONFIG_FILE" ] && GB_CODEX_EX=$(jq -r '.gptbridge.codex.enabled // true' "$CONFIG_FILE" 2>/dev/null)
+if [ -f "$CONFIG_FILE" ]; then GB_CODEX_EX=$(jq -r '.gptbridge.codex.enabled // true' "$CONFIG_FILE" 2>/dev/null || echo true); fi
 [ "$GB_CODEX_EX" = "false" ] || GB_CODEX_EX=true
-if [ -n "${SETUP_GPTBRIDGE_CODEX+x}" ]; then
+if [ -n "${SETUP_GPTBRIDGE_CODEX:-}" ]; then
   case "$SETUP_GPTBRIDGE_CODEX" in 0|false|no|off) GB_CODEX=false ;; *) GB_CODEX=true ;; esac
 else
   GB_CODEX=$GB_CODEX_EX
@@ -1394,16 +1399,30 @@ if [ "$GB_MASTER" = "true" ] && [ "$GB_CODEX" = "true" ] && [ "$GB_HAVE_CODEX" =
       rm -f "$GB_MCP_DEST.tmp"; GB_FWD_STATUS="MERGE FAILED — add the codex entry manually (see template)"
     fi
   else
-    if jq -n --slurpfile t "$GB_TEMPLATE" '{mcpServers:{codex:$t[0].mcpServers.codex}}' > "$GB_MCP_DEST" 2>/dev/null; then
-      GB_FWD_STATUS="created .mcp.json with 'codex' server"
+    # Create branch: write via .tmp+mv so a jq failure can't leave a truncated
+    # zero-byte .mcp.json that Claude Code then fails to parse.
+    if jq -n --slurpfile t "$GB_TEMPLATE" '{mcpServers:{codex:$t[0].mcpServers.codex}}' > "$GB_MCP_DEST.tmp" 2>/dev/null; then
+      mv "$GB_MCP_DEST.tmp" "$GB_MCP_DEST"; GB_FWD_STATUS="created .mcp.json with 'codex' server"
     else
-      GB_FWD_STATUS="CREATE FAILED — add the codex entry manually (see template)"
+      rm -f "$GB_MCP_DEST.tmp"; GB_FWD_STATUS="CREATE FAILED — add the codex entry manually (see template)"
     fi
   fi
 elif [ "$GB_MASTER" = "true" ] && [ "$GB_CODEX" = "true" ] && [ "$GB_HAVE_CODEX" != "yes" ]; then
   GB_FWD_STATUS="codex tier ON but 'codex' not on PATH — inert until Codex CLI is installed"
-elif [ "$GB_MASTER" = "true" ] && [ "$GB_CODEX" != "true" ]; then
-  GB_FWD_STATUS="codex tier disabled"
+else
+  # Feature (or codex tier) OFF: actively STRIP any previously-merged codex server
+  # so "disabled" is honored for the forward direction too — Claude Code would
+  # otherwise keep launching `codex mcp-server` every session. Idempotent.
+  GB_FWD_STATUS="not merged (gptbridge master gate OFF)"
+  [ "$GB_MASTER" = "true" ] && [ "$GB_CODEX" != "true" ] && GB_FWD_STATUS="codex tier disabled"
+  if [ "$DRY_RUN" != "true" ] && [ -f "$GB_MCP_DEST" ] && \
+     jq -e '.mcpServers.codex' "$GB_MCP_DEST" >/dev/null 2>&1; then
+    if jq 'if .mcpServers then .mcpServers |= del(.codex) else . end' "$GB_MCP_DEST" > "$GB_MCP_DEST.tmp" 2>/dev/null; then
+      mv "$GB_MCP_DEST.tmp" "$GB_MCP_DEST"; GB_FWD_STATUS="$GB_FWD_STATUS; removed stale 'codex' entry from .mcp.json"
+    else
+      rm -f "$GB_MCP_DEST.tmp"
+    fi
+  fi
 fi
 
 echo ""
@@ -1422,7 +1441,11 @@ echo "           claude mcp add codex -- codex mcp-server"
 echo "         Add MCP_TOOL_TIMEOUT=300000 to .claude/settings.json 'env' — agentic turns exceed the 60s default."
 echo "      4. Reverse (Codex consults Claude, read-only + fenced) — append to ~/.codex/config.toml:"
 if [ -f "$CLAUDE_DIR/templates/codex-config.toml.snippet" ]; then
-  sed "s|__PROJECT_DIR__|$TARGET_DIR|g" "$CLAUDE_DIR/templates/codex-config.toml.snippet" | sed 's/^/           /'
+  # LITERAL substitution via bash parameter expansion (no sed) so a `|`/`&`/regex
+  # char in $TARGET_DIR can't break the delimiter or expand into the output.
+  while IFS= read -r _gb_ln || [ -n "$_gb_ln" ]; do
+    printf '           %s\n' "${_gb_ln//__PROJECT_DIR__/$TARGET_DIR}"
+  done < "$CLAUDE_DIR/templates/codex-config.toml.snippet"
 fi
 echo "    Kill switch: GPTBRIDGE_DISABLE=1 (env) makes the reverse wrapper refuse; master gate OFF disables everything."
 

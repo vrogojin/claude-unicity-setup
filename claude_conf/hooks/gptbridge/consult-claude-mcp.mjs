@@ -44,7 +44,6 @@ import { readFileSync, openSync, closeSync, unlinkSync } from 'node:fs';
 import * as fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve, join } from 'node:path';
-import { createInterface } from 'node:readline';
 import { tmpdir } from 'node:os';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -67,15 +66,48 @@ const HARD_DENY = [
   'Bash', 'BashOutput', 'KillBash', 'KillShell', 'Edit', 'MultiEdit', 'Write',
   'NotebookEdit', 'WebFetch', 'WebSearch', 'Task', 'Agent', 'ExitPlanMode',
 ];
-// Secret paths the consulted Claude must not Read even though Read is allowed.
-const SECRET_DENY = [
-  'Read(**/.env)', 'Read(**/.env.*)', 'Read(**/.env*)',
-  'Read(**/.secrets/**)', 'Read(**/secrets/**)',
-  'Read(**/identity.json)', 'Read(**/*identity.json)',
-  'Read(**/id_rsa*)', 'Read(**/id_ed25519*)',
-  'Read(**/*.pem)', 'Read(**/*.key)', 'Read(**/*.p12)', 'Read(**/*.pfx)',
-  'Read(**/.git/config)', 'Read(**/.npmrc)', 'Read(**/.netrc)',
+// Secret path globs the consult must never reach. NOTE: the deny is emitted for
+// EVERY content-or-listing tool (Read AND Grep AND Glob AND LS) — a Read-only
+// deny would leave Grep(content-mode) free to exfiltrate the SAME files (nsec /
+// mnemonic in identity.json, .env secrets). Broadened beyond an enumerated few
+// toward common secret shapes; the egress redactor (redactSecrets) backstops any
+// glob this list misses.
+const SECRET_GLOBS = [
+  '**/.env', '**/.env.*', '**/.env*',
+  '**/.secrets/**', '**/secrets/**',
+  '**/identity.json', '**/*identity.json',
+  '**/id_rsa*', '**/id_ed25519*', '**/id_ecdsa*', '**/id_dsa*',
+  '**/*.pem', '**/*.key', '**/*.p12', '**/*.pfx', '**/*.p8',
+  '**/*.crt', '**/*.cert', '**/*.jks', '**/*.keystore',
+  '**/.git/config', '**/.npmrc', '**/.netrc', '**/.pgpass',
+  '**/.aws/**', '**/.ssh/**',
+  '**/credentials.json', '**/*credentials*.json', '**/*credentials*',
+  '**/*service-account*.json', '**/*serviceaccount*.json',
+  '**/token.json', '**/*.token', '**/*secret*.json', '**/*.secrets.*',
 ];
+const SECRET_DENY_TOOLS = ['Read', 'Grep', 'Glob', 'LS'];
+function secretDenyRules() {
+  const rules = [];
+  for (const g of SECRET_GLOBS) for (const t of SECRET_DENY_TOOLS) rules.push(`${t}(${g})`);
+  return rules;
+}
+
+// Egress redactor (defence in depth on the RETURN path): strip the highest-value
+// secrets from whatever the consulted Claude sends back to Codex, so a secret
+// that slipped past the deny globs (or was echoed into an answer) is not relayed
+// verbatim. Not a substitute for the deny fence — a backstop.
+function redactSecrets(s) {
+  if (!s) return s;
+  return String(s)
+    .replace(/-----BEGIN[^-]*PRIVATE KEY-----[\s\S]*?-----END[^-]*PRIVATE KEY-----/g, '[REDACTED private key]')
+    .replace(/nsec1[02-9ac-hj-np-z]{20,}/gi, '[REDACTED nsec]')
+    .replace(/xprv[0-9a-zA-Z]{20,}/g, '[REDACTED xprv]')
+    .replace(/\bAKIA[0-9A-Z]{16}\b/g, '[REDACTED aws-key]')
+    .replace(/\bAIza[0-9A-Za-z_-]{35}\b/g, '[REDACTED google-key]')
+    .replace(/\bghp_[A-Za-z0-9]{30,}\b/g, '[REDACTED github-token]')
+    .replace(/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g, '[REDACTED slack-token]')
+    .replace(/\bsk-[A-Za-z0-9]{20,}\b/g, '[REDACTED api-key]');
+}
 
 const log = (...a) => { try { process.stderr.write('[consult-claude] ' + a.join(' ') + '\n'); } catch {} };
 
@@ -133,8 +165,12 @@ function resolveClaudeBin() {
 }
 
 function lockPath() {
-  const base = process.env.GPTBRIDGE_STATE_DIR || join(tmpdir(), 'claude-gptbridge');
-  try { fs.mkdirSync(base, { recursive: true }); } catch {}
+  // Per-user, 0700 dir (not a world-writable shared /tmp path) so another user
+  // on the host can't pre-create the lockfile to DoS the consult feature.
+  const uid = (typeof process.getuid === 'function' ? process.getuid() : 'u');
+  const base = process.env.GPTBRIDGE_STATE_DIR
+    || join(process.env.XDG_RUNTIME_DIR || tmpdir(), `claude-gptbridge-${uid}`);
+  try { fs.mkdirSync(base, { recursive: true, mode: 0o700 }); } catch {}
   return join(base, 'consult-claude.lock');
 }
 
@@ -176,7 +212,7 @@ function acquire() {
 // placed after `-p` would otherwise be parsed by claude as a FLAG, defeating the
 // fence. On stdin it is inert data. Exposed for the argv-assert tests.
 function buildArgv(s) {
-  const settingsJson = JSON.stringify({ permissions: { deny: SECRET_DENY } });
+  const settingsJson = JSON.stringify({ permissions: { deny: secretDenyRules() } });
   return [
     '--output-format', 'json',
     '--permission-mode', 'default',
@@ -206,7 +242,9 @@ function runClaude(question, s) {
     };
     let child;
     try {
-      child = spawn(bin, argv, { cwd: PROJECT_DIR, env, stdio: ['pipe', 'pipe', 'pipe'] });
+      // detached: put claude in its own process group so a timeout can SIGKILL
+      // the WHOLE group (grandchildren included), not just the direct child.
+      child = spawn(bin, argv, { cwd: PROJECT_DIR, env, detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
     } catch (e) {
       resolvePromise({ ok: false, text: `consult failed to launch claude: ${e && e.message}` });
       return;
@@ -217,19 +255,26 @@ function runClaude(question, s) {
       child.stdin.on('error', () => {});
       child.stdin.end(question);
     } catch { /* ignore */ }
-    let out = '', err = '', done = false;
+    let out = '', err = '', done = false, timedOut = false, launchErr = null;
     const finish = (r) => { if (!done) { done = true; resolvePromise(r); } };
+    // Kill the whole process group (negative pid). Fall back to the direct child.
+    const killGroup = (sig) => {
+      try { process.kill(-child.pid, sig); } catch { try { child.kill(sig); } catch {} }
+    };
     const timer = setTimeout(() => {
-      try { child.kill('SIGTERM'); } catch {}
-      setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 3000).unref?.();
-      finish({ ok: false, text: `consult timed out after ${Math.round(s.timeoutMs / 1000)}s` });
+      timedOut = true;
+      killGroup('SIGTERM');
+      setTimeout(() => killGroup('SIGKILL'), 3000).unref?.();
+      // NOTE: do NOT resolve here — resolve on 'close' so the single-flight lock
+      // (released in handleConsult's finally) is held until the child is DEAD.
     }, s.timeoutMs);
     child.stdout.on('data', (d) => { out += d; if (out.length > 4 * 1024 * 1024) out = out.slice(-4 * 1024 * 1024); });
-    child.stderr.on('data', (d) => { err += d; });
-    child.on('error', (e) => { clearTimeout(timer); finish({ ok: false, text: `consult error: ${e && e.message}` }); });
+    child.stderr.on('data', (d) => { err += d; if (err.length > 64 * 1024) err = err.slice(-64 * 1024); });
+    child.on('error', (e) => { launchErr = e; }); // e.g. ENOENT — 'close' still fires
     child.on('close', (code) => {
       clearTimeout(timer);
-      if (done) return;
+      if (timedOut) { finish({ ok: false, text: `consult timed out after ${Math.round(s.timeoutMs / 1000)}s` }); return; }
+      if (launchErr) { finish({ ok: false, text: `consult error: ${launchErr.message}` }); return; }
       // --output-format json → a JSON envelope with a `.result` string.
       let text = out.trim();
       try {
@@ -237,7 +282,8 @@ function runClaude(question, s) {
         if (j && typeof j.result === 'string') text = j.result; // else keep raw stdout
       } catch { /* not JSON — return raw stdout */ }
       if (code !== 0 && !text) text = `claude exited ${code}${err ? `: ${err.slice(-400)}` : ''}`;
-      finish({ ok: code === 0, text: text || '(empty response)' });
+      // Redact secrets on the RETURN path before it leaves for Codex (backstop).
+      finish({ ok: code === 0, text: redactSecrets(text || '(empty response)') });
     });
   });
 }
@@ -316,20 +362,44 @@ async function dispatch(msg) {
   }
 }
 
-function main() {
-  const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
-  rl.on('line', (line) => {
-    const t = line.trim();
-    if (!t) return;
-    let msg;
-    try { msg = JSON.parse(t); } catch { return; } // ignore non-JSON lines
-    if (!msg || msg.jsonrpc !== '2.0') return;
-    Promise.resolve(dispatch(msg)).catch((e) => {
-      log('dispatch error:', e && e.message);
-      if (msg.id !== undefined && msg.id !== null) replyErr(msg.id, -32603, 'internal error');
-    });
+const MAX_LINE_BYTES = 512 * 1024; // a JSON-RPC line is tiny; cap the raw transport.
+
+function handleLine(line) {
+  const t = line.trim();
+  if (!t) return;
+  let msg;
+  try { msg = JSON.parse(t); } catch { return; } // ignore non-JSON lines
+  if (!msg || msg.jsonrpc !== '2.0') return;
+  Promise.resolve(dispatch(msg)).catch((e) => {
+    log('dispatch error:', e && e.message);
+    if (msg.id !== undefined && msg.id !== null) replyErr(msg.id, -32603, 'internal error');
   });
-  rl.on('close', () => process.exit(0));
+}
+
+function main() {
+  // Manual newline-delimited framing (not readline) so buffering is BOUNDED: a
+  // hostile client streaming a multi-GB line with no newline would pin memory in
+  // readline's internal buffer; here we drop the pending line once it blows past
+  // the cap. Single stdin listener → no chance of a first-chunk race with a
+  // second consumer.
+  let buf = '';
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (chunk) => {
+    buf += chunk;
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl);
+      buf = buf.slice(nl + 1);
+      handleLine(line);
+    }
+    if (buf.length > MAX_LINE_BYTES) { // an unterminated line grew past the cap
+      log('input line exceeded cap — dropping pending buffer');
+      buf = '';
+    }
+  });
+  const done = () => process.exit(0);
+  process.stdin.on('end', done);
+  process.stdin.on('close', done);
   log(`ready (project=${PROJECT_DIR})`);
 }
 
@@ -338,4 +408,4 @@ function main() {
 const RUN_AS_MAIN = process.argv[1] && resolve(process.argv[1]) === SELF;
 if (RUN_AS_MAIN && process.env.CONSULT_CLAUDE_NOSERVE !== '1') main();
 
-export { buildArgv, resolveSettings, READONLY_WHITELIST, HARD_DENY, SECRET_DENY };
+export { buildArgv, resolveSettings, redactSecrets, secretDenyRules, READONLY_WHITELIST, HARD_DENY };
