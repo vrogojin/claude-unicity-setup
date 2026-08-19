@@ -43,7 +43,10 @@ secret_scan_text() {
   # text may be large but replies are size-capped upstream, so this is cheap.
   while IFS=$'\t' read -r label ere; do
     [ -n "$label" ] || continue
-    if printf '%s' "$text" | grep -Eq "$ere" 2>/dev/null; then
+    # `-e --` is REQUIRED: several patterns start with `-` (e.g. the PEM
+    # `-----BEGIN…PRIVATE KEY-----`); without `-e` grep parses them as options,
+    # errors to exit 2, and the scan silently FAILS OPEN on the highest-value key.
+    if printf '%s' "$text" | grep -Eq -e "$ere" 2>/dev/null; then
       printf '%s\n' "$label"
       hit=1
     fi

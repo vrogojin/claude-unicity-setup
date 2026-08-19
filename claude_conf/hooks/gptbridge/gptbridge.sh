@@ -130,21 +130,27 @@ gb_consult_id() { # <question>
 }
 
 gb_rate_ok() { # returns 0 if under the per-hour cap, else 1 (and records the hit)
-  local now cutoff cnt
-  now="$(date -u +%s)"; cutoff=$((now - 3600))
-  # prune + count within the sliding hour
-  if [ -f "$GB_RATE" ]; then
-    cnt="$(awk -v c="$cutoff" '$1+0 >= c {n++} END{print n+0}' "$GB_RATE" 2>/dev/null || echo 0)"
-  else
-    cnt=0
-  fi
-  [ "$cnt" -ge "$GB_MAX_PER_HR" ] 2>/dev/null && return 1
-  # NB: the group MUST exit 0 (a bare `[ -f ] && awk` short-circuits to exit 1 when
-  # the file is absent, which would skip the mv and never persist the counter).
-  { printf '%s\n' "$now"; if [ -f "$GB_RATE" ]; then awk -v c="$cutoff" '$1+0 >= c' "$GB_RATE" 2>/dev/null; fi; true; } \
-    > "$GB_RATE.tmp" 2>/dev/null
-  mv "$GB_RATE.tmp" "$GB_RATE" 2>/dev/null || true
-  return 0
+  # Read-count-and-write under a lock so concurrent ingests can't clobber the
+  # counter (lost update → cap silently exceeded). fd 9 → $GB_RATE.lock.
+  local rc
+  ( flock 9 2>/dev/null || true
+    local now cutoff cnt
+    now="$(date -u +%s)"; cutoff=$((now - 3600))
+    if [ -f "$GB_RATE" ]; then
+      cnt="$(awk -v c="$cutoff" '$1+0 >= c {n++} END{print n+0}' "$GB_RATE" 2>/dev/null || echo 0)"
+    else
+      cnt=0
+    fi
+    [ "$cnt" -ge "$GB_MAX_PER_HR" ] 2>/dev/null && exit 1
+    # NB: the group MUST exit 0 (a bare `[ -f ] && awk` short-circuits to exit 1 when
+    # the file is absent, which would skip the mv and never persist the counter).
+    { printf '%s\n' "$now"; if [ -f "$GB_RATE" ]; then awk -v c="$cutoff" '$1+0 >= c' "$GB_RATE" 2>/dev/null; fi; true; } \
+      > "$GB_RATE.tmp" 2>/dev/null
+    mv "$GB_RATE.tmp" "$GB_RATE" 2>/dev/null || true
+    exit 0
+  ) 9>"$GB_RATE.lock"
+  rc=$?
+  return $rc
 }
 
 gb_ingest() {
@@ -268,7 +274,10 @@ gb_reply_get() { # <consult_id>  → print reply text + mark delivered; exit 1 i
     flock 9 2>/dev/null || true
     found="$(jq -c --arg cid "$cid" 'select(.type=="reply" and .consult_id==$cid and (.delivered|not))' "$GB_OUTBOX" 2>/dev/null | head -1)"
     [ -n "$found" ] || exit 1
-    # mark that exact line delivered (match by consult_id, first undelivered)
+    # mark that exact line delivered. SAFE-by-jq-escaping: reply text is stored via
+    # jq --arg, so any literal `"delivered":false` / `"type":"reply"` inside the text
+    # is serialized with escaped quotes (\") and can't match these bare-token index()
+    # checks — so a hostile reply body can't flip the wrong line's flag.
     awk -v cid="$cid" '
       BEGIN{done=0}
       { if(!done && index($0,"\"type\":\"reply\"") && index($0,"\"consult_id\":\""cid"\"") && index($0,"\"delivered\":false")){ sub(/"delivered":false/,"\"delivered\":true"); done=1 } print }

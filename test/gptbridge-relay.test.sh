@@ -204,7 +204,38 @@ CK="$(hc POST "/mcp/$TOKEN" '{"jsonrpc":"2.0","id":4,"method":"tools/call","para
 CKTXT="$(printf '%s' "${CK#*$'\t'}" | jq -r '.result.content[0].text' 2>/dev/null)"
 printf '%s' "$CKTXT" | grep -q "the http answer" && ok "check_relay(HTTP) serves the owner-approved reply" || bad "check_relay did not serve the reply"
 
+# malformed percent-encoding on the unauth path must NOT crash the relay (host-only DoS)
+R="$(hc POST "/mcp/%" "$INIT")"; [ "${R%%$'\t'*}" = "404" ] && ok "malformed %-escape path → 404 (no crash)" || bad "malformed escape not 404 (${R%%$'\t'*})"
+R="$(hc POST "/mcp/$TOKEN" "$INIT")"; [ "${R%%$'\t'*}" = "200" ] && ok "relay survives the malformed-escape request" || bad "relay died on a malformed escape"
+# oversized batch rejected
+BATCH="[$(for _ in $(seq 1 40); do printf '{"jsonrpc":"2.0","id":1,"method":"ping"},'; done | sed 's/,$//')]"
+R="$(hc POST "/mcp/$TOKEN" "$BATCH")"; [ "${R%%$'\t'*}" = "413" ] && ok "oversized JSON-RPC batch → 413" || bad "oversized batch not rejected (${R%%$'\t'*})"
+
 kill "$RPID" 2>/dev/null
+
+# ============================================================================
+echo "== steelman regressions: traversal / attribution / PEM secret-scan =="
+# ============================================================================
+# CRITICAL 2: a DIFFERENT consult-capable peer forging a gptbridge.consult with a
+# path-traversal consult_id must NOT escape the inbox NOR be attributed to the bridge.
+EVIL_HEX="$(printf 'evilpeer' | sha256sum | cut -c1-64)"
+bash "$REG" upsert-pending --pubkey "$EVIL_HEX" --name evil --type dm >/dev/null 2>&1
+bash "$REG" authorize "$EVIL_HEX" consult --owner >/dev/null 2>&1
+EVIL_ENV='{"a2a":"1","kind":"gptbridge.consult","id":"x","from":"evil","fromNpub":"","consult_id":"../../pwned-escape","message":{"text":"pwn"},"context":""}'
+EVIL_MSG="$(jq -nc --arg from "$EVIL_HEX" --arg body "$EVIL_ENV" --arg ts "$(date -u +%FT%TZ)" '{type:"dm",from:$from,from_name:"evil",body:$body,timestamp:$ts,priority:false,read:false}')"
+jq --argjson m "$EVIL_MSG" '.messages += [$m]' "$STATE_DIR/agent-messages.json" > "$STATE_DIR/am.tmp" && mv "$STATE_DIR/am.tmp" "$STATE_DIR/agent-messages.json"
+CLAUDE_PROJECT_DIR="$WS" bash "$WS/.claude/hooks/classify-inbound.sh" >/dev/null 2>&1
+[ ! -e "$STATE_DIR/pwned-escape.json" ] && [ ! -e "$STATE_DIR/gptbridge/pwned-escape.json" ] && ok "forged traversal consult_id did NOT escape the inbox dir" || bad "path traversal wrote a file outside the inbox"
+# and it was NOT stored as a bridge consult (identity gate: FROM != pseudo-peer hex)
+if bash "$GB" pending | jq -e '.[] | select(.question=="pwn")' >/dev/null 2>&1; then bad "forged consult was attributed to the ChatGPT bridge"; else ok "forged consult from a non-bridge peer is NOT a bridge consult (identity gate)"; fi
+
+# CRITICAL 3: secret-scan must catch a PEM private key block (pattern starts with '-')
+PEM="$(printf -- '-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaAAAA\n-----END OPENSSH PRIVATE KEY-----')"
+HITS="$(printf '%s' "$PEM" | bash "$WS/.claude/hooks/lib/secret-scan.sh" scan)"
+printf '%s' "$HITS" | grep -q private-key && ok "secret-scan catches a PEM PRIVATE KEY block" || bad "secret-scan FAILED OPEN on a PEM key"
+# and gb_reply blocks a reply carrying one
+OUTP2="$(bash "$GB" ingest --question "pem test question")"; PCID="$(printf '%s' "$OUTP2" | jq -r '.consult_id')"
+bash "$GB" reply "$PCID" --text "$PEM" >/dev/null 2>&1 && bad "reply with a PEM key was served" || ok "gb_reply blocks a reply carrying a PEM key"
 
 echo ""
 echo "gptbridge-relay: $PASS passed, $FAIL failed"

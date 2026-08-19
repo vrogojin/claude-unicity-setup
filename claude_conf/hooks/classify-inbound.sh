@@ -372,13 +372,16 @@ while [ "$i" -lt "$TOTAL" ]; do
             AUTHZJSON="$(jq -nc --arg name "$NAME" --arg kind "$ENV_KIND" --arg cap "$REQ_CAP" \
               '{role:"agent", status:"authorized", unicityName:$name, peerVerb:$kind, capMissing:$cap, deferred:true, classified:true}')"
           fi
-        elif [ "$ENV_KIND" = "gptbridge.consult" ]; then
+        elif [ "$ENV_KIND" = "gptbridge.consult" ] \
+             && [ "$FROM" = "$(printf 'gptbridge:pseudo-peer:chatgpt-bridge:v1' | sha256sum 2>/dev/null | cut -c1-64)" ]; then
           # --- ChatGPT-session consult relay (gptbridge T2) --------------------------------
           # An inbound consult from the `chatgpt-bridge` pseudo-peer (OD-6). Routed to the
           # gptbridge inbox so /gptbridge reply answers it (owner-approved) and check_relay
-          # serves the reply. Same guards as every peer verb: the sender must hold `consult`
-          # (default-deny; a denied bridge never reaches here) and the body must be SIF-clean
-          # — else quarantine / stash for a later grant. The question is UNTRUSTED DATA.
+          # serves the reply. Guards: (a) the sender MUST be the pseudo-peer's synthetic hex
+          # (must match gptbridge.sh:gb_bridge_hex — else any consult-capable peer could forge
+          # a gptbridge.consult and spoof the "external ChatGPT bridge" attribution / traverse
+          # a crafted consult_id); (b) it must hold `consult`; (c) SIF-clean. The question is
+          # UNTRUSTED DATA. A non-matching sender falls through to the generic 1:1 path.
           if echo "$CAPS" | jq -e 'index("consult")' >/dev/null 2>&1; then
             SIF_Q=0
             if [ -f "$SIF_GUARD" ]; then
@@ -391,6 +394,13 @@ while [ "$i" -lt "$TOTAL" ]; do
             else
               GB_CID="$(echo "$BODY" | jq -r '.consult_id // ""' 2>/dev/null)"
               GB_CTX="$(echo "$BODY" | jq -r '.context // ""' 2>/dev/null)"
+              # STRICT id format (gb_ + 16 hex) BEFORE it is used as a filename — a crafted
+              # consult_id (e.g. "../../x") must never escape the inbox dir (cf. stash_deferred's
+              # hex-validation of .id). gptbridge.sh mints exactly this shape.
+              case "$GB_CID" in
+                gb_[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) : ;;
+                *) GB_CID="" ;;
+              esac
               GB_INBOX_DIR="$STATE_DIR/gptbridge/inbox"; mkdir -p "$GB_INBOX_DIR" 2>/dev/null || true
               # Content-keyed (consult_id) → a ChatGPT retry can't double-queue.
               if [ -n "$GB_CID" ] && [ ! -e "$GB_INBOX_DIR/$GB_CID.json" ]; then
@@ -399,9 +409,9 @@ while [ "$i" -lt "$TOTAL" ]; do
                   '{consult_id:$cid, from_pubkey:$from,
                     unicityName:(if $name=="" then "chatgpt-bridge" else $name end),
                     question:$q, context:$ctx, status:"pending", source:"chatgpt-bridge", receivedAt:$ts}' \
-                  > "$GB_INBOX_DIR/$GB_CID.json.tmp" 2>/dev/null \
-                  && mv "$GB_INBOX_DIR/$GB_CID.json.tmp" "$GB_INBOX_DIR/$GB_CID.json" \
-                  || rm -f "$GB_INBOX_DIR/$GB_CID.json.tmp"
+                  > "$GB_INBOX_DIR/$GB_CID.json.tmp.$$" 2>/dev/null \
+                  && mv "$GB_INBOX_DIR/$GB_CID.json.tmp.$$" "$GB_INBOX_DIR/$GB_CID.json" \
+                  || rm -f "$GB_INBOX_DIR/$GB_CID.json.tmp.$$"
               fi
             fi
             AUTHZJSON="$(jq -nc --arg name "$NAME" --argjson q "$SIF_Q" \

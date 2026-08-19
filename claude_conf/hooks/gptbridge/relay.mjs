@@ -62,6 +62,18 @@ const MAX_CONSULT_BYTES = 1024 * cfgNum(CFG, ['gptbridge', 'relay', 'max_consult
 
 const log = (...a) => { try { process.stderr.write('[relay] ' + a.join(' ') + '\n'); } catch {} };
 
+// Last-resort nets: this is an internet-exposed process; a single malformed
+// request must never take it down (no supervisor auto-restarts it).
+process.on('uncaughtException', (e) => log('uncaughtException:', e && e.message));
+process.on('unhandledRejection', (e) => log('unhandledRejection:', e && (e.message || e)));
+
+// Concurrency guard (leaked-token threat model): each consult_claude spawns bash
+// children and sync-waits up to sync_wait_s. Cap concurrent consults + batch size
+// so a flood of cheap HTTP requests can't amplify into PID/memory exhaustion.
+const MAX_INFLIGHT_CONSULTS = 4;
+const MAX_BATCH = 16;
+let inflight = 0;
+
 // constant-time string compare (avoids a token timing oracle on the path/bearer)
 function safeEqual(a, b) {
   const ba = Buffer.from(String(a));
@@ -193,7 +205,13 @@ async function dispatch(msg) {
       const name = params && params.name;
       const args = (params && params.arguments) || {};
       let r;
-      if (name === 'consult_claude') r = await handleConsult(args);
+      if (name === 'consult_claude') {
+        if (inflight >= MAX_INFLIGHT_CONSULTS) {
+          return { id, result: { content: [{ type: 'text', text: 'The relay is busy (too many consults in flight) — retry shortly.' }], isError: true } };
+        }
+        inflight++;
+        try { r = await handleConsult(args); } finally { inflight--; }
+      }
       else if (name === 'check_relay') r = await handleCheckRelay();
       else return { id, error: { code: -32602, message: `unknown tool: ${name}` } };
       return { id, result: { content: [{ type: 'text', text: r.text }], isError: !!r.isError } };
@@ -208,7 +226,12 @@ function authorized(req) {
   // capability-URL: POST /mcp/<token>
   const url = req.url || '';
   const m = url.match(/^\/mcp\/([^/?#]+)/);
-  if (m && TOKEN && safeEqual(decodeURIComponent(m[1]), TOKEN)) return true;
+  // decodeURIComponent throws URIError on malformed percent-escapes (e.g. `/mcp/%`).
+  // This runs BEFORE the token check on the unauthenticated path, so an unguarded
+  // throw would be an anyone-with-the-HOST (no token) crash. Fail closed instead.
+  let seg = '';
+  if (m) { try { seg = decodeURIComponent(m[1]); } catch { seg = ''; } }
+  if (seg && TOKEN && safeEqual(seg, TOKEN)) return true;
   // optional Authorization: Bearer <token> (Agents-SDK callers)
   const auth = req.headers['authorization'] || '';
   const bm = auth.match(/^Bearer\s+(.+)$/i);
@@ -238,6 +261,7 @@ const server = createServer((req, res) => {
     const sid = req.headers['mcp-session-id'] || randomUUID();
     try {
       if (Array.isArray(msg)) {
+        if (msg.length > MAX_BATCH) return send(413, { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'batch too large' } });
         const out = [];
         for (const m of msg) { const r = await dispatch(m); if (r) out.push({ jsonrpc: '2.0', ...r }); }
         return send(200, out.length ? out : { jsonrpc: '2.0', id: null, result: {} }, { 'Mcp-Session-Id': sid });
@@ -252,6 +276,9 @@ const server = createServer((req, res) => {
   });
 });
 
+// Explicit timeouts so a slow/held request can't pin a connection indefinitely.
+server.requestTimeout = 60000;
+server.headersTimeout = 20000;
 server.on('error', (e) => { log('server error:', e && e.message); process.exit(1); });
 server.listen(PORT, '127.0.0.1', () => log(`listening on 127.0.0.1:${PORT} (token ${TOKEN ? 'set' : 'MISSING'})`));
 
