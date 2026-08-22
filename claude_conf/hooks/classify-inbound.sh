@@ -38,6 +38,18 @@ REGISTRY="$HOOK_DIR/agent-registry.sh"
 # agents coordinating with our coordinator.
 . "$HOOK_DIR/remote-coord.sh" 2>/dev/null || true
 
+# Resolve the transport helper (for verifying npub-rotation attestations). Same resolution the
+# rest of the A2A stack uses (_tc_sphere_helper), with a relative fallback; run it with NODE_PATH
+# pointed at the clone's node_modules so the SDK loads even when invoked from a hook.
+HELPER=""
+type _tc_sphere_helper >/dev/null 2>&1 && HELPER="$(_tc_sphere_helper 2>/dev/null)"
+[ -n "$HELPER" ] || HELPER="$HOOK_DIR/../../lib/sphere-helper.mjs"
+run_helper() {
+  [ -f "$HELPER" ] || return 3
+  local np; np="$(cd "$(dirname "$HELPER")/.." 2>/dev/null && pwd)/node_modules:${NODE_PATH:-}"
+  NODE_PATH="$np" node "$HELPER" "$@"
+}
+
 STATE_FILE="$STATE_DIR/agent-messages.json"
 PENDING_FILE="$STATE_DIR/agent-authz-pending.json"
 WORKITEMS_DIR="$STATE_DIR/agent-workitems"
@@ -298,6 +310,52 @@ while [ "$i" -lt "$TOTAL" ]; do
       bash "$HOOK_DIR/ticket.sh" "ingest-${ENV_KIND#ticket.}" "$MSG" >/dev/null 2>&1 || true
     fi
     AUTHZJSON="$(jq -nc --arg kind "$ENV_KIND" --argjson q "$SIF_Q" '{role:"agent", ticketVerb:$kind, sifQuarantined:($q==1), classified:true}')"
+  elif [ "$ENV_KIND" = "identity.rotate" ]; then
+    # --- npub-rotation attestation: an authorized peer is retiring its key for a successor. -----
+    # Verified chain-of-trust — the OLD key must have SIGNED the attestation binding the new npub
+    # (rotate-verify), and the rotation may only retire the SENDER's OWN key (att.old_hex==FROM),
+    # so a harvested public npub can't drive a rotation. On success we RETIRE the old registry
+    # entry and seed the successor as PENDING (default-deny — the owner re-authorizes the new
+    # npub). Only an already-authorized sender's rotation is acted on; anything else is inert.
+    ROT_ST="$(bash "$REGISTRY" status "$FROM" 2>/dev/null || echo unknown)"
+    ROT_OK=false; ROT_REASON="unhandled"; ROT_NEW=""
+    if [ "$ROT_ST" = "authorized" ]; then
+      SIF_Q=0
+      if [ -f "$SIF_GUARD" ]; then
+        SIF_OUT="$(printf '%s' "$BODY" | bash "$SIF_GUARD" check --direction inbound --principal "$FROM" --source agent-comms 2>/dev/null)"
+        [ -n "$SIF_OUT" ] || SIF_OUT='{}'
+        [ "$(echo "$SIF_OUT" | jq -r '.decision // "pass"' 2>/dev/null)" = "quarantine" ] && SIF_Q=1
+      fi
+      if [ "$SIF_Q" = "1" ]; then
+        quarantine_message "$FROM" "$TS" "$BODY" "$TYPE" "$GROUP" "$CLAIMED_NAME" "$ENV_NPUB" "${SIF_OUT:-{}}"
+        ROT_REASON="sif-quarantined"
+      else
+        ATT="$(echo "$BODY" | jq -c '.attestation // .att // empty' 2>/dev/null)"
+        if [ -n "$ATT" ] && [ "$ATT" != "null" ]; then
+          VER="$(printf '%s' "$ATT" | run_helper rotate-verify 2>/dev/null || echo '{"valid":false,"reason":"verify-unavailable"}')"
+          if [ "$(echo "$VER" | jq -r '.valid // false' 2>/dev/null)" = "true" ]; then
+            ROLD="$(echo "$VER" | jq -r '.old_hex // ""')"; ROT_NEW="$(echo "$VER" | jq -r '.new_npub // ""')"
+            if [ "$ROLD" = "$FROM" ] && [ -n "$ROT_NEW" ]; then
+              if bash "$REGISTRY" rotate "$FROM" --to "$ROT_NEW" --note "attested rotation of ${FROM:0:12}…" >/dev/null 2>&1; then
+                ROT_OK=true; ROT_REASON="rotated-successor-pending"
+              else
+                ROT_REASON="registry-rotate-failed"
+              fi
+            else
+              ROT_REASON="sender-is-not-the-rotating-key"
+            fi
+          else
+            ROT_REASON="attestation-invalid:$(echo "$VER" | jq -r '.reason // "?"' 2>/dev/null)"
+          fi
+        else
+          ROT_REASON="no-attestation"
+        fi
+      fi
+    else
+      ROT_REASON="sender-not-authorized:$ROT_ST"
+    fi
+    AUTHZJSON="$(jq -nc --arg kind "$ENV_KIND" --argjson ok "$ROT_OK" --arg reason "$ROT_REASON" --arg new "$ROT_NEW" \
+      '{role:"agent", rotationVerb:$kind, rotated:$ok, reason:$reason, successorNpub:$new, classified:true}')"
   else
     [ -n "$FROM" ] || FROM="unknown"
     ST="$(bash "$REGISTRY" status "$FROM" 2>/dev/null || echo unknown)"
@@ -397,6 +455,11 @@ while [ "$i" -lt "$TOTAL" ]; do
         ;;
       denied)
         AUTHZJSON='{"role":"agent","status":"denied","classified":true}'
+        ;;
+      retired)
+        # A rotated-away (retired) key: the successor carries any authorization now, so the old
+        # key grants nothing and its traffic is dropped inert — a harvested old npub is a dead end.
+        AUTHZJSON='{"role":"agent","status":"retired","classified":true}'
         ;;
       *)  # pending | unknown | peer → queue for owner authorization, act on nothing
         # Impersonation guard: a message CLAIMING a name already tied to a DIFFERENT
