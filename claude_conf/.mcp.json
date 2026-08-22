@@ -4,6 +4,8 @@
       "command": "docker",
       "args": [
         "run", "--rm", "-i",
+        "--memory=4g", "--memory-swap=4g", "--pids-limit=256",
+        "--label=unicity-serena", "--init",
         "-e", "SERENA_DOCKER=1",
         "-e", "SERENA_HOME=/serena-data",
         "-v", "__WORKSPACE_ROOT__:__WORKSPACE_ROOT__:ro",
