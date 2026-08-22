@@ -109,6 +109,51 @@ if [ -f "$ROADMAP_STATE" ]; then
   fi
 fi
 
+# --- Task-lifecycle completion gate (#15, F2) -----------------------------------
+# A task the human actually STARTED (it passed the shared classifier at prompt
+# time — trivial turns never created a record, so they can never trip this) that
+# has SHIPPED (bound feature branch + a PR exists or the branch merged) but whose
+# ticket/board/roadmap trail was never closed out. Advisory + escapable, ordered
+# AFTER the roadmap gate on purpose: /task-complete delegates to /roadmap-sync, so
+# clearing this gate also clears gate #6 in one run (no deadlock). Only tasks fresh
+# within RC_STOP_TTL_HOURS block — a stale record is left for review, never a wedge.
+TL_STATE="$STATE_DIR/task-lifecycle.json"
+# OD-4: only enforce when F2 is explicitly enabled (fail-closed). This also means a
+# stale task-lifecycle.json left over from a previously-enabled period can never
+# wedge Stop once the user turns F2 off — the config flag is the master switch, the
+# TTL + rm hatch below are the second layer.
+TL_CONFIG="$CLAUDE_PROJECT_DIR/.claude/agent/config.json"
+TL_ON=false
+if command -v jq >/dev/null 2>&1 && [ -f "$TL_CONFIG" ] \
+   && [ "$(jq -r '.automation.lifecycle.enabled // false' "$TL_CONFIG" 2>/dev/null)" = "true" ]; then
+  TL_ON=true
+fi
+if [ "$TL_ON" = "true" ] && [ -f "$TL_STATE" ]; then
+  TL_TTL="${RC_STOP_TTL_HOURS:-72}"; case "$TL_TTL" in ''|*[!0-9]*) TL_TTL=72;; esac
+  # GNU date first, BSD/macOS `-v` second, epoch last. Without a BSD fallback the
+  # cutoff would collapse to 1970 on macOS and OVER-block every shipped task
+  # forever (open records are never reaped) — defeating the anti-wedge TTL.
+  TL_CUTOFF="$(date -u -d "-${TL_TTL} hours" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+    || date -u -v-"${TL_TTL}"H +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+    || echo "1970-01-01T00:00:00Z")"
+  # A record blocks only if: still live, actually shipped (PR present and NOT a
+  # rejected/closed PR), and FRESH (a missing started_at is treated as stale, not
+  # fresh — it must never bypass the TTL and wedge Stop indefinitely).
+  TL_SEL='(.status=="open" or .status=="ticketed") and (.pr != null) and ((.pr_state // "") != "CLOSED") and ((.started_at // "") != "" and (.started_at) > $c)'
+  TL_PENDING="$(jq -r --arg c "$TL_CUTOFF" "[ .tasks[]? | select($TL_SEL) ] | length" "$TL_STATE" 2>/dev/null)"
+  if [ "${TL_PENDING:-0}" -gt 0 ] 2>/dev/null; then
+    TL_DETAILS="$(jq -r --arg c "$TL_CUTOFF" "
+      .tasks[]? | select($TL_SEL)"'
+      | "  • " + (.title_guess // .task_id) + " — branch " + (.branch // "?")
+        + " · PR #" + ((.pr)|tostring)
+        + (if (.ticket != null) then " · ticket #" + ((.ticket)|tostring) else " · no ticket yet" end)' \
+      "$TL_STATE" 2>/dev/null)"
+    TL_MSG="${TL_PENDING} started task(s) have shipped a PR but were never closed out:\n${TL_DETAILS}\n\nRun /task-complete to update the ticket, move the board card, and reconcile docs/ROADMAP.md (it delegates to /roadmap-sync, so this also clears the roadmap gate). If these are done or don't need tracking, clear it: rm -f \"$TL_STATE\"."
+    jq -n --arg reason "$TL_MSG" '{"decision":"block","reason":$reason}'
+    exit 0
+  fi
+fi
+
 # --- Urgent agent messages check ---
 MSG_STATE="$STATE_DIR/agent-messages.json"
 if [ -f "$MSG_STATE" ]; then

@@ -104,3 +104,22 @@ EOF
 ### 5. Output
 
 Print the PR URL so the user can see it.
+
+### 6. Task-lifecycle close-out (F2)
+
+Creating the PR **is** the task-completion declaration in this workflow. If this
+branch is tracked as a task, close it out so its ticket/board/roadmap trail matches:
+
+```bash
+STATE_DIR="$( . "$CLAUDE_PROJECT_DIR/.claude/hooks/state-dir.sh" 2>/dev/null && printf '%s' "$STATE_DIR" )"
+TL="$STATE_DIR/task-lifecycle.json"
+BRANCH="$(git branch --show-current)"
+# Is this branch a tracked, not-yet-completed task?
+[ -f "$TL" ] && jq -e --arg b "$BRANCH" \
+  '[.tasks[] | select(.branch==$b and (.status=="open" or .status=="ticketed"))] | length > 0' \
+  "$TL" >/dev/null 2>&1 && echo "tracked-task"
+```
+
+If that prints `tracked-task`, run **`/task-complete`** now (it updates the ticket,
+moves the board card, and delegates to `/roadmap-sync`). If the branch is not a
+tracked task, skip this step — nothing to do.

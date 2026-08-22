@@ -623,6 +623,9 @@ if [ -d "$CLAUDE_DIR/hooks" ]; then
   # preserves modes, but make the +x bit explicit here too so a checkout that
   # lost it doesn't silently break the scheduler.
   [ -d "$CLAUDE_DIR/hooks/automation" ] && run_or_dry chmod +x "$CLAUDE_DIR/hooks/automation"/*.sh
+  # lib/ holds sourceable helpers (task-classifier.sh); sourcing doesn't need +x,
+  # but keep the bit consistent so nothing surprises a future exec caller.
+  [ -d "$CLAUDE_DIR/hooks/lib" ] && run_or_dry chmod +x "$CLAUDE_DIR/hooks/lib"/*.sh
   ok "Made hook scripts executable"
 fi
 
