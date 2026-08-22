@@ -9,9 +9,13 @@
 // sha1(resolve(path)) split in two on Windows (c:\ vs C:\ drive-letter case), splitting
 // the seen-set.
 //
-// Fix under test: rolling `now - LOOKBACK` gift-wrap floor (giftwrapSince) + persistent
-// outer-wrap-id dedup pruned by the same window (loadSeen/pruneSeen/persistSeen) +
-// drive-letter normalization (driveLetterNormalize) that is a strict no-op on POSIX.
+// Fix under test:
+//   - rolling `now - LOOKBACK` gift-wrap floor (giftwrapSince), honoring explicit --since;
+//   - persistent outer-wrap-id dedup keyed on the OUTER created_at and pruned by
+//     query-eligibility (seenPruneFloor/pruneSeen) — no count cap, honors NIP-59 future skew;
+//   - a durable poll cursor (loadCursor/saveCursor/nextCursor) advanced ONLY on a successful
+//     poll, so downtime can't skip maximally-backdated messages;
+//   - drive-letter normalization (driveLetterNormalize) that is a strict no-op on POSIX.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -22,10 +26,41 @@ import { resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 
 import { giftwrapSince, GIFTWRAP_LOOKBACK_SECONDS } from '../lib/sphere-helper.mjs';
-import { driveLetterNormalize, stateDirFor, loadSeen, pruneSeen, persistSeen } from '../lib/sphere-daemon.mjs';
+import {
+  driveLetterNormalize, stateDirFor, loadSeen, pruneSeen, persistSeen,
+  seenPruneFloor, loadCursor, saveCursor, nextCursor,
+} from '../lib/sphere-daemon.mjs';
 
 const HOUR = 3600;
 const DAY = 24 * HOUR;
+const MAX_BACKDATE = 2 * DAY;   // NIP-59 max backward skew (mirrors the daemon)
+const MAX_FUTURE = 2 * DAY;     // NIP-59 max forward skew (mirrors the daemon)
+
+// Faithful mirror of the daemon's dispatch()+seen bookkeeping over the pure functions:
+// stamps each id with the OUTER wrap created_at (clamped to now+MAX_FUTURE), dedups on the
+// outer id, and prunes by query-eligibility on every message. Used to prove no re-delivery.
+function makeTracker() {
+  const entries = [];
+  const set = new Set();
+  return {
+    entries, set,
+    dispatch(msg, nowSec) {
+      if (msg.id && set.has(msg.id)) return false;
+      const createdAt = Number.isFinite(Number(msg.wrap_created_at)) ? Number(msg.wrap_created_at) : nowSec;
+      const t = Math.min(createdAt, nowSec + MAX_FUTURE);
+      set.add(msg.id);
+      entries.push({ id: msg.id, t });
+      const pruned = pruneSeen(entries, seenPruneFloor(nowSec));
+      if (pruned.length !== entries.length) {
+        const keep = new Set(pruned.map((e) => e.id));
+        for (const e of entries) if (!keep.has(e.id)) set.delete(e.id);
+        entries.length = 0;
+        for (const e of pruned) entries.push(e);
+      }
+      return true;
+    },
+  };
+}
 
 // ---------------------------------------------------------------------------------
 // 1. Rolling lookback: a backdated gift-wrap is INCLUDED even after the cursor advanced.
@@ -130,27 +165,85 @@ test('seen store: reads a legacy string[] seen-events.json without dropping ids'
 // 3. Time-based pruning: ids older than the window are dropped; in-window ids kept;
 //    a hard count cap bounds growth.
 // ---------------------------------------------------------------------------------
-test('pruneSeen: drops ids older than the re-query window, keeps in-window ids', () => {
+test('pruneSeen: keeps ids the relay can still return, drops only unreturnable ones', () => {
   const now = 2_000_000_000;
+  const floor = seenPruneFloor(now); // steady-state prune floor (created_at-based)
   const entries = [
-    { id: 'fresh', t: now - 1 * HOUR },
-    { id: 'edge-in', t: now - (GIFTWRAP_LOOKBACK_SECONDS - HOUR) },
-    { id: 'stale', t: now - (GIFTWRAP_LOOKBACK_SECONDS + DAY) },
+    { id: 'fresh', t: now - HOUR },
+    { id: 'at-floor', t: floor },        // exactly at the floor — still relay-eligible
+    { id: 'below', t: floor - HOUR },    // below the floor — can never be returned again
   ];
-  const kept = pruneSeen(entries, now).map((e) => e.id);
+  const kept = pruneSeen(entries, floor).map((e) => e.id);
   assert.ok(kept.includes('fresh'));
-  assert.ok(kept.includes('edge-in'));
-  assert.ok(!kept.includes('stale'), 'stale id (outside window) is pruned');
+  assert.ok(kept.includes('at-floor'));
+  assert.ok(!kept.includes('below'), 'only the unreturnable id is pruned');
 });
 
-test('pruneSeen: hard-caps to the newest 5000 entries', () => {
+test('pruneSeen: never evicts an in-window id — no count cap (>5000 all retained)', () => {
   const now = 2_000_000_000;
+  const floor = seenPruneFloor(now);
   const entries = [];
-  for (let i = 0; i < 6000; i++) entries.push({ id: `id-${i}`, t: now - 10 });
-  const kept = pruneSeen(entries, now);
-  assert.equal(kept.length, 5000, 'capped at SEEN_MAX');
-  assert.equal(kept[kept.length - 1].id, 'id-5999', 'keeps the newest entries');
-  assert.equal(kept[0].id, 'id-1000', 'drops the oldest overflow');
+  for (let i = 0; i < 6000; i++) entries.push({ id: `id-${i}`, t: now - 10 }); // all in-window
+  const kept = pruneSeen(entries, floor);
+  assert.equal(kept.length, 6000, 'all 6000 in-window ids retained (the old 5000 cap is gone)');
+});
+
+test('future-stamped wrap (created_at = now + 2d): delivered once, never re-delivered across the window', () => {
+  const tr = makeTracker();
+  const t0 = 2_000_000_000;
+  // NIP-59 can stamp the outer wrap up to +2 days. A receipt-time TTL would forget it early
+  // (its "age" looks negative), then re-deliver it while the relay still returns it.
+  const wrap = { id: 'future-outer-id', type: 'dm', from: 'peer', body: 'hi', wrap_created_at: t0 + 2 * DAY };
+  assert.equal(tr.dispatch(wrap, t0), true, 'delivered once on first poll');
+  for (const dt of [HOUR, DAY, 2 * DAY, 3 * DAY]) {
+    assert.equal(tr.dispatch(wrap, t0 + dt), false, `not re-delivered at +${dt}s (still in seen-set)`);
+  }
+  assert.ok(tr.set.has('future-outer-id'), 'future-stamped id survives the whole window');
+});
+
+test('>5000-in-window burst: all retained, none re-delivered on the next poll', () => {
+  const tr = makeTracker();
+  const t0 = 2_000_000_000;
+  for (let i = 0; i < 6000; i++) {
+    assert.equal(tr.dispatch({ id: `b-${i}`, type: 'dm', from: 'p', body: 'x', wrap_created_at: t0 - 10 }, t0), true);
+  }
+  assert.equal(tr.entries.length, 6000, 'all 6000 kept (no cap evicts in-window ids)');
+  let redelivered = 0;
+  for (let i = 0; i < 6000; i++) {
+    if (tr.dispatch({ id: `b-${i}`, wrap_created_at: t0 - 10 }, t0 + 5)) redelivered++;
+  }
+  assert.equal(redelivered, 0, 'no in-window id re-delivered after a >5000 burst');
+});
+
+test('cursor: persisted + loaded on restart, advanced ONLY on a successful poll', () => {
+  const proj = join(tmpdir(), `poller-cursor-${process.pid}-${Date.now()}`);
+  const sd = stateDirFor(proj);
+  try {
+    mkdirSync(sd, { recursive: true });
+    assert.equal(loadCursor(proj), null, 'no cursor initially → daemon falls back to now-interval');
+    saveCursor(proj, 1000);
+    assert.equal(loadCursor(proj), 1000, 'cursor round-trips through disk (survives restart)');
+    assert.equal(nextCursor(1000, 2000, true), 2000, 'successful poll advances the cursor to now');
+    assert.equal(nextCursor(1000, 2000, false), 1000, 'FAILED poll leaves the cursor unchanged');
+  } finally {
+    try { rmSync(sd, { recursive: true, force: true }); } catch {}
+  }
+});
+
+test('downtime: a durable cursor + backdate reach recovers a maximally-backdated message', () => {
+  const now = 2_000_000_000;
+  const lastSuccess = now - 5 * DAY;              // daemon was down ~5 days
+  const realSend = lastSuccess + HOUR;            // a message sent just after the last success
+  const wrapCreatedAt = realSend - MAX_BACKDATE;  // backdated the full 2 days
+
+  // Daemon queries from (durable cursor − max backdate); giftwrapSince clamps the top.
+  const querySince = Math.max(0, lastSuccess - MAX_BACKDATE);
+  const floor = giftwrapSince(querySince, now);
+  assert.ok(wrapCreatedAt >= floor, 'backdated-during-downtime wrap IS inside the recovered window');
+
+  // Contrast: a non-durable cursor reset to ~now on restart clamps to now-LOOKBACK and MISSES it.
+  const naiveFloor = giftwrapSince(now, now); // = now - LOOKBACK
+  assert.ok(wrapCreatedAt < naiveFloor, 'a reset-to-now cursor would have permanently dropped it');
 });
 
 // ---------------------------------------------------------------------------------
