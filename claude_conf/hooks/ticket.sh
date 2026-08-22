@@ -188,7 +188,7 @@ tk_issue() {
     # world-readable through /proc/<pid>/cmdline for the process's lifetime, environ is not.
     signIn="$(TKSEC="$secret" jq -nc --argjson p "$payload" '{secret:env.TKSEC, payload:$p}')"
     event="$(_tk_run_helper_stdin "$signIn" ticket2-sign --identity "$(_tk_identity)")" || { _tk_err "ticket2-sign failed"; return 1; }
-    pub="$(_tk_run_helper_stdin "$event" relay-publish --relay "$relayUrl")" \
+    pub="$(_tk_run_helper_stdin "$event" relay-publish --relay "$relayUrl" --identity "$(_tk_identity)")" \
       || { _tk_err "relay publish FAILED ($relayUrl) — ticket NOT issued (nothing recorded)"; return 1; }
     eventId="$(printf '%s' "$pub" | jq -r '.id // ""')"
   fi
@@ -262,7 +262,7 @@ tk_redeem() {
       local dhash relayUrl evs nEv vin vf2
       dhash="$(_tk_sha256 "$secret")"
       relayUrl="${relayOpt:-${RELAY_URL:-wss://nostr-relay.testnet.unicity.network}}"
-      evs="$(_tk_run_helper relay-fetch --relay "$relayUrl" --dtag "$dhash")" \
+      evs="$(_tk_run_helper relay-fetch --relay "$relayUrl" --dtag "$dhash" --identity "$(_tk_identity)")" \
         || { _tk_err "relay fetch FAILED ($relayUrl) — cannot resolve the ticket event (connectivity? non-default relay ⇒ pass --relay)"; return 1; }
       nEv="$(printf '%s' "$evs" | jq '.events | length' 2>/dev/null || echo 0)"
       [ "${nEv:-0}" -gt 0 ] \

@@ -330,6 +330,128 @@ a2a_deny()      { bash "$A2A_REGISTRY" deny "$@"; }
 a2a_caps()      { bash "$A2A_REGISTRY" caps; }
 a2a_onboard()   { bash "$A2A_ONBOARD" "$@"; }
 
+# ══════════════════════════════════════════════════════════════════════════════════════
+# rotate — retire this agent's npub for a fresh one (A2A threat-model prereq). A leaked/
+# harvested npub is a durable target (it is where our coordination traffic is addressed and
+# what a relay allow-list keys on), so rotation replaces it. The chain of trust: the OLD key
+# SIGNS an npub-rotation attestation binding old_npub→new_npub — only the holder of the old key
+# (not someone who merely harvested the public npub) can authorize the successor — then we
+# announce it (relay-publish + DM to owner + each authorized peer, all sent by the OLD key so
+# recipients can verify it) and swap identity.json locally, archiving the old key 0600. Peers'
+# classify-inbound verifies the attestation and RETIRES the old key, seeding the successor as
+# PENDING for the owner to re-authorize (default-deny preserved). DESTRUCTIVE → requires --yes.
+# ══════════════════════════════════════════════════════════════════════════════════════
+a2a_rotate() {
+  local yes=0 reason="" nametag="" no_announce=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --yes|-y)     yes=1; shift;;
+    --reason)     reason="${2:-}"; shift 2;;
+    --nametag)    nametag="${2:-}"; shift 2;;
+    --no-announce) no_announce=1; shift;;
+    *) shift;;
+  esac; done
+
+  local id cfg relay helper
+  id="$(_a2a_identity)"; cfg="$(_a2a_config)"; relay="$(_a2a_relay)"; helper="$(_a2a_helper)"
+  [ -f "$id" ] || { _a2a_err "identity not found ($id) — run setup.sh"; return 1; }
+  [ -n "$helper" ] && [ -f "$helper" ] || { _a2a_err "sphere-helper unresolved — run setup.sh"; return 1; }
+
+  local oldNpub; oldNpub="$(jq -r '.npub // ""' "$id" 2>/dev/null)"
+  [ -n "$oldNpub" ] || { _a2a_err "current identity has no npub — cannot rotate"; return 1; }
+
+  if [ "$yes" != "1" ]; then
+    echo "About to ROTATE this agent's identity npub:"
+    echo "  current: $oldNpub"
+    echo "  reason:  ${reason:-<none>}"
+    echo
+    echo "This generates a NEW keypair, signs an old-key attestation, announces it to the owner"
+    echo "+ authorized peers, and replaces identity.json (old key archived 0600). The daemon must"
+    echo "be restarted afterwards, and the owner must re-authorize the new npub on peers + relay."
+    echo "Re-run with --yes to proceed."
+    return 2
+  fi
+
+  # 1. Generate the successor identity into a private temp file (never on argv/stdout).
+  local newId; newId="$(mktemp)"; chmod 600 "$newId"
+  if ! _a2a_run_helper create-identity > "$newId" 2>/dev/null || ! jq -e .npub "$newId" >/dev/null 2>&1; then
+    rm -f "$newId"; _a2a_err "could not generate a new identity (helper/SDK broken) — run: a2a verify"; return 1
+  fi
+  local newNpub; newNpub="$(jq -r '.npub' "$newId")"
+
+  # 2. OLD key signs the rotation attestation binding old→new (the trust anchor).
+  local att; att="$(_a2a_run_helper rotate-sign --identity "$id" --new-npub "$newNpub" ${reason:+--reason "$reason"} 2>/dev/null)"
+  if ! printf '%s' "$att" | _a2a_run_helper rotate-verify >/dev/null 2>&1; then
+    rm -f "$newId"; _a2a_err "rotation attestation failed to sign/verify — aborting (identity UNCHANGED)"; return 1
+  fi
+
+  # 3. Announce (best-effort) — publish to the relay + DM the owner and every authorized peer,
+  #    all signed/sent by the OLD key so recipients can verify the attestation before the swap.
+  local announced=0 announceFail=0
+  if [ "$no_announce" != "1" ]; then
+    local envelope; envelope="$(jq -nc --argjson att "$att" --arg from "$oldNpub" \
+      '{kind:"identity.rotate", attestation:$att, fromNpub:$from, message:"npub rotation — please re-authorize the successor"}')"
+    # relay-publish the attestation (parameterized-replaceable, discoverable by peers).
+    printf '%s' "$att" | _a2a_run_helper relay-publish --relay "$relay" --identity "$id" >/dev/null 2>&1 \
+      && announced=$((announced+1)) || announceFail=$((announceFail+1))
+    # DM the owner.
+    local ownerNpub; ownerNpub="$(jq -r '.owner_npub // ""' "$cfg" 2>/dev/null)"
+    if [ -n "$ownerNpub" ] && [ "$ownerNpub" != "null" ]; then
+      printf '%s' "$envelope" | _a2a_run_helper send-dm "$ownerNpub" --identity "$id" --relay "$relay" >/dev/null 2>&1 \
+        && announced=$((announced+1)) || announceFail=$((announceFail+1))
+    fi
+    # DM every authorized peer.
+    local peersJson; peersJson="$(bash "$A2A_REGISTRY" list authorized 2>/dev/null || echo '[]')"
+    local n i pnpub
+    n="$(printf '%s' "$peersJson" | jq 'length' 2>/dev/null || echo 0)"
+    i=0
+    while [ "$i" -lt "${n:-0}" ]; do
+      pnpub="$(printf '%s' "$peersJson" | jq -r ".[$i].npub // \"\"" 2>/dev/null)"
+      i=$((i+1))
+      [ -n "$pnpub" ] && [ "$pnpub" != "null" ] || continue
+      printf '%s' "$envelope" | _a2a_run_helper send-dm "$pnpub" --identity "$id" --relay "$relay" >/dev/null 2>&1 \
+        && announced=$((announced+1)) || announceFail=$((announceFail+1))
+    done
+  fi
+
+  # 4. Swap locally — archive the OLD key 0600, install the successor at the same path, and
+  #    record the rotation in config (append old npub to previous_npubs; the retired key must
+  #    stay a KNOWN dead-end, never silently forgotten).
+  local ts; ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  local bak="${id}.rotated-${ts}.bak"
+  # Persist the attestation next to the identity so it can be re-announced without re-signing.
+  local attFile="$(dirname "$id")/rotation-${ts}.attestation.json"
+  printf '%s\n' "$att" > "$attFile"; chmod 600 "$attFile" 2>/dev/null || true
+  cp -p "$id" "$bak" 2>/dev/null && chmod 600 "$bak" 2>/dev/null || { rm -f "$newId"; _a2a_err "could not archive old identity — aborting BEFORE swap (identity UNCHANGED)"; return 1; }
+  # Atomic install: write beside the target then rename, so a mid-write failure can never leave a
+  # truncated identity.json (the .bak archive is the recovery point regardless).
+  if ! { cp "$newId" "$id.rot.tmp" && chmod 600 "$id.rot.tmp" && mv -f "$id.rot.tmp" "$id"; }; then
+    rm -f "$newId" "$id.rot.tmp"; _a2a_err "could not install new identity — old identity archived at $bak; identity.json may be intact (verify)"; return 1
+  fi
+  rm -f "$newId"
+  if [ -f "$cfg" ]; then
+    local tmpc; tmpc="$(mktemp)"
+    jq --arg old "$oldNpub" --arg new "$newNpub" --arg ts "$ts" \
+      '.previous_npubs = ((.previous_npubs // []) + [$old] | unique)
+       | .agent_npub = $new
+       | .rotated_at = $ts' "$cfg" > "$tmpc" 2>/dev/null && cat "$tmpc" > "$cfg"
+    rm -f "$tmpc"
+  fi
+
+  echo "ROTATED identity npub:"
+  echo "  old (retired): $oldNpub   → archived: $bak"
+  echo "  new (active):  $newNpub"
+  echo "  attestation:   $attFile"
+  [ "$no_announce" != "1" ] && echo "  announced:     $announced ok, $announceFail failed (attestation signed by the old key)"
+  echo
+  echo "NEXT STEPS:"
+  echo "  1. Restart the message daemon so it picks up the new key:  a2a daemon restart"
+  echo "  2. Owner: re-authorize the new npub on each peer (they hold it PENDING) and, if the"
+  echo "     relay enforces a NIP-42 allow-list, add $newNpub (and remove the old key)."
+  [ -n "$nametag" ] && echo "  3. Re-register the nametag to the new key:  (register-nametag $nametag with the new identity)"
+  [ "$announceFail" -gt 0 ] && echo "  NOTE: $announceFail announcement(s) failed — re-publish $attFile / re-DM peers when connectivity returns."
+  return 0
+}
+
 a2a_help() {
   cat <<'EOF'
 a2a.sh — one turnkey entry point for every A2A operation. All resolution is baked in.
@@ -359,6 +481,10 @@ a2a.sh — one turnkey entry point for every A2A operation. All resolution is ba
   a2a peers [authorized|pending|denied|peer]     a2a caps
   a2a authorize <peer> <caps>                     a2a deny <peer>
   a2a onboard <npub> --name NAME [--caps csv]
+
+  # identity hardening (A2A threat-model prereq)
+  a2a rotate --yes [--reason '…'] [--no-announce]  rotate this agent's npub (old key attests the
+                                     successor; announces to owner+peers; archives old key 0600)
 EOF
 }
 
@@ -385,6 +511,7 @@ _a2a_cli() {
     authorize)     a2a_authorize "$@";;
     deny)          a2a_deny "$@";;
     onboard)       a2a_onboard "$@";;
+    rotate)        a2a_rotate "$@";;
     caps)          a2a_caps "$@";;
     help|-h|--help) a2a_help;;
     *) _a2a_err "unknown op '$cmd'"; a2a_help; return 1;;

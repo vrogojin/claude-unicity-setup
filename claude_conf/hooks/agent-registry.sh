@@ -478,6 +478,61 @@ _ar_cli() {
         && _ar_read --arg k "$key" '.agents[$k]'
       ;;
 
+    rotate)  # rotate <oldQuery> --to <newNpub> [--owner] [--note <text>]
+      # Migrate an entry from a RETIRED (rotated) pubkey to its successor. The OLD entry becomes
+      # status="retired" (caps stripped, rotatedTo=<newHex>) so a harvested old npub can never be
+      # used against us again; the NEW entry is seeded keyed by the successor's hex. DEFAULT-DENY
+      # is preserved: without --owner the successor lands as PENDING (the owner must re-authorize
+      # it), and a DENIED identity stays denied across rotation (a denied peer cannot rotate into
+      # a fresh pending slot to re-request). Only an owner-explicit rotate carries caps+status.
+      local q="${1:-}"; shift || true
+      local newNpub="" owner=0 note=""
+      while [ $# -gt 0 ]; do
+        case "${1:-}" in
+          --to)    newNpub="${2:-}"; shift 2 || true;;
+          --owner) owner=1; shift || true;;
+          --note)  note="${2:-}"; shift 2 || true;;
+          *) shift || true;;
+        esac
+      done
+      local oldKey; oldKey="$(_ar_resolve_key "$q")"
+      [ "$oldKey" = "__AMBIGUOUS__" ] && { echo "ERR: '$q' is ambiguous — rotate by the exact pubkey or npub" >&2; return 1; }
+      [ -n "$oldKey" ] || { echo "ERR: no registry entry matches '$q'" >&2; return 1; }
+      [ -n "$newNpub" ] || { echo "ERR: --to <newNpub> is required" >&2; return 1; }
+      local newKey; newKey="$(_ar_npub_to_hex "$newNpub" 2>/dev/null || true)"
+      [ -n "$newKey" ] && [[ "$newKey" =~ ^[0-9a-f]{64}$ ]] || { echo "ERR: --to '$newNpub' is not a decodable npub" >&2; return 1; }
+      [ "$newKey" = "$oldKey" ] && { echo "ERR: --to equals the old key (nothing to rotate)" >&2; return 1; }
+      local oldStatus caps name
+      oldStatus="$(_ar_read -r --arg k "$oldKey" '.agents[$k].status // "unknown"')"
+      caps="$(_ar_read -c --arg k "$oldKey" '.agents[$k].capabilities // []')"
+      name="$(_ar_read -r --arg k "$oldKey" '.agents[$k].unicityName // ""')"
+      # Decide the successor's status. denied stays denied; owner-explicit carries the old
+      # status+caps; every automatic path lands PENDING with no caps (owner re-authorizes).
+      local newStatus newCaps
+      if [ "$oldStatus" = "denied" ]; then newStatus="denied"; newCaps="[]";
+      elif [ "$owner" = "1" ]; then newStatus="$oldStatus"; newCaps="$caps";
+      else newStatus="pending"; newCaps="[]"; fi
+      _ar_write '
+        .updated_at=$now
+        # retire the old identity — no capability survives on the harvested/rotated key
+        | .agents[$old].status="retired"
+        | .agents[$old].capabilities=[]
+        | .agents[$old].rotatedTo=$new
+        | .agents[$old].retiredAt=$now
+        # seed/merge the successor keyed by its own hex
+        | .agents[$new] =
+          ( (.agents[$new] // { pubkey:$new, npub:$npub, unicityName:$name, firstSeen:$now, intro:"", note:"" })
+            | .pubkey=$new | .npub=$npub | .lastSeen=$now
+            | (if (.unicityName // "") == "" then .unicityName=$name else . end)
+            | .status=$st | .capabilities=$caps
+            | .rotatedFrom=$old
+            | (if $note != "" then .note=$note else .note=("rotation of " + ($old[0:12]) + "… (" + $ost + ")") end) )
+      ' --arg old "$oldKey" --arg new "$newKey" --arg npub "$newNpub" --arg name "$name" \
+        --arg st "$newStatus" --argjson caps "$newCaps" --arg ost "$oldStatus" \
+        --arg note "$note" --arg now "$(_ar_now)" \
+        && { echo "rotated ${oldKey:0:12}… → ${newKey:0:12}… (successor status=$newStatus)"; _ar_read --arg k "$newKey" '.agents[$k]'; }
+      ;;
+
     set-name)  # set-name <query> <name>  (label a peer, e.g. before outbound first-contact)
       local key; key="$(_ar_resolve_key "${1:-}")"
       [ "$key" = "__AMBIGUOUS__" ] && { echo "ERR: '${1:-}' is ambiguous — pass the exact pubkey or npub" >&2; return 1; }
@@ -541,6 +596,10 @@ Usage: agent-registry.sh <command> [args]
                                          --owner = owner-explicit (the ONLY thing that
                                          un-denies a denied peer; auto paths omit it)
   deny <query> [--note <text>]
+  rotate <oldQuery> --to <newNpub> [--owner] [--note <text>]
+                                         Retire a rotated pubkey → successor; old becomes
+                                         status=retired (caps stripped). Default-deny: successor
+                                         is PENDING unless --owner; a denied identity stays denied.
   set-name <query> <name>
 
 Capabilities: $AGENT_CAPABILITIES
