@@ -80,13 +80,19 @@ else
   CURRENT='{"unread": false, "unread_count": 0, "priority_count": 0, "messages": []}'
 fi
 
+# Cap retained history to the newest N (default 500) so the shared state file can't grow
+# unbounded — see agent-comms-check.sh for the leak this prevents (AGENT_MESSAGES_MAX overrides).
+CAP="${AGENT_MESSAGES_MAX:-500}"; case "$CAP" in ''|*[!0-9]*) CAP=500 ;; esac
+
 UPDATED=$(echo "$CURRENT" | jq \
   --argjson msg "$NEW_MSG" \
   --argjson is_priority "$IS_PRIORITY" \
+  --argjson cap "$CAP" \
   '.messages += [$msg] |
    .unread = true |
    .unread_count = (.unread_count + 1) |
-   .priority_count = (if $is_priority then .priority_count + 1 else .priority_count end)')
+   .priority_count = (if $is_priority then .priority_count + 1 else .priority_count end) |
+   .messages |= .[-$cap:]')
 
 echo "$UPDATED" > "$STATE_FILE"
 

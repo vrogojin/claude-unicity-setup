@@ -258,15 +258,26 @@ deploy_serena_mcp() {
   local SERENA_IMAGE="unicity/serena:${SERENA_IMAGE_VERSION}"
   local SERENA_DOCKERFILE="$CLAUDE_DIR/docker/Dockerfile.serena"
 
-  # Workspace ROOT that Serena is allowed to see: a BROAD, READ-ONLY, identity
-  # mount (host path == container path). Identity-mounting the root is what makes
-  # git worktrees self-consistent inside the container — both a worktree's files
-  # AND its gitdir under <repo>/.git/worktrees/<name> resolve at their true paths
-  # — so Serena's activate_project can open ANY branch/worktree/repo/folder under
-  # the root. Defaults to the target repo's parent dir; override with
-  # SERENA_WORKSPACE_ROOT (e.g. a shared multi-repo parent).
-  local WORKSPACE_ROOT="${SERENA_WORKSPACE_ROOT:-$(dirname "$TARGET_DIR")}"
-  WORKSPACE_ROOT="$(cd "$WORKSPACE_ROOT" 2>/dev/null && pwd)" || WORKSPACE_ROOT="$(dirname "$TARGET_DIR")"
+  # Workspace ROOT that Serena is allowed to see: a READ-ONLY, identity mount
+  # (host path == container path). Identity-mounting the root is what makes git
+  # worktrees self-consistent inside the container — both a worktree's files AND
+  # its gitdir under <repo>/.git/worktrees/<name> resolve at their true paths — so
+  # Serena's activate_project can open any branch/worktree/folder under the root.
+  #
+  # Default = the TARGET REPO ITSELF (not its parent). Previously this defaulted to
+  # `dirname "$TARGET_DIR"`, which for a project at /home/<user>/<repo> mounts the
+  # ENTIRE home dir: Serena's language servers then roam every sibling repo under
+  # it and spin up a tsserver/rust-analyzer/gopls/clangd per repo they touch —
+  # a measured memory-leak vector (uncapped LSP fleet indexing all of $HOME). See
+  # docs/serena-memory-hardening.md. Worktrees created UNDER the project (e.g.
+  # <repo>/.claude/worktrees/<name>) stay visible because they live below the root.
+  #
+  # For a deliberate MULTI-REPO workspace (navigating sibling repos from one
+  # session), set SERENA_WORKSPACE_ROOT to the shared parent explicitly — the
+  # per-container `--memory`/`--pids-limit` caps in .mcp.json then bound whatever
+  # breadth you mount, so a broad root can't exhaust host memory.
+  local WORKSPACE_ROOT="${SERENA_WORKSPACE_ROOT:-$TARGET_DIR}"
+  WORKSPACE_ROOT="$(cd "$WORKSPACE_ROOT" 2>/dev/null && pwd)" || WORKSPACE_ROOT="$TARGET_DIR"
 
   if [ -f "$MCP_TEMPLATE" ] || [ "$DRY_RUN" = "true" ]; then
     if [ "$DRY_RUN" = "true" ]; then
