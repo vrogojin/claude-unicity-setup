@@ -258,12 +258,28 @@ a2a_ingest() {  # ingest-redeem|ingest-grant|ingest-deny  --from H --body J
 # STDIN to the helper (never argv — mirrors rc_emit's secret-safe send).
 # ══════════════════════════════════════════════════════════════════════════════════════
 a2a_dm() {
-  local intro=1 ; local to="" ; local -a words=()
+  local intro=1 ; local to="" ; local body_file="" ; local -a words=()
   while [ $# -gt 0 ]; do case "$1" in
-    --no-intro) intro=0; shift;;
+    --no-intro)  intro=0; shift;;
+    --body-file) body_file="${2:-}"; shift; [ $# -gt 0 ] && shift;;
     *) if [ -z "$to" ]; then to="$1"; else words+=("$1"); fi; shift;; esac; done
-  [ -n "$to" ] && [ "${#words[@]}" -gt 0 ] || { _a2a_err "usage: a2a dm <peer-name-or-npub> <message…> [--no-intro]"; return 1; }
-  local msg="${words[*]}"
+  [ -n "$to" ] || { _a2a_err "usage: a2a dm <peer-name-or-npub> {<message…>|--body-file <path>|-} [--no-intro]"; return 1; }
+  # Message body from EITHER positional words OR --body-file <path> ('-'/'/dev/stdin' = stdin);
+  # never both. Mirrors sphere-helper send-dm's --body-file|stdin (avoids flag text sent literally).
+  local msg
+  if [ -n "$body_file" ]; then
+    [ "${#words[@]}" -eq 0 ] || { _a2a_err "a2a dm: give the message via EITHER positional words OR --body-file, not both"; return 1; }
+    if [ "$body_file" = "-" ] || [ "$body_file" = "/dev/stdin" ]; then
+      msg="$(cat)"
+    else
+      [ -f "$body_file" ] || { _a2a_err "a2a dm: --body-file '$body_file' not found"; return 1; }
+      msg="$(cat -- "$body_file")"
+    fi
+    [ -n "$msg" ] || { _a2a_err "a2a dm: empty message body from --body-file"; return 1; }
+  else
+    [ "${#words[@]}" -gt 0 ] || { _a2a_err "usage: a2a dm <peer-name-or-npub> {<message…>|--body-file <path>|-} [--no-intro]"; return 1; }
+    msg="${words[*]}"
+  fi
   local npub; npub="$(rc_resolve_target "${to#@}" 2>/dev/null)" || { _a2a_err "could not resolve '$to' to an npub (pass a raw npub for a brand-new peer)"; return 1; }
   # First-contact intro unless suppressed and unless we already know this peer.
   local known; known="$(bash "$A2A_REGISTRY" get "$npub" 2>/dev/null | jq -r '.status // ""' 2>/dev/null || echo "")"
@@ -350,7 +366,7 @@ a2a.sh — one turnkey entry point for every A2A operation. All resolution is ba
   a2a ingest-deny   --from HEX --body '<envelope-json>'
 
   # messaging + coordination
-  a2a dm <peer> <message…> [--no-intro]
+  a2a dm <peer> {<message…>|--body-file <path>|-} [--no-intro]
   a2a consult <coord> --intent '…' [--areas csv --repos csv --changes JSON --questions JSON --urgency high]
   a2a advise  <cid> --advisory '…' [--commit 'desc|scope' …]
   a2a emit <kind> --to <peer|--to-all-peers> [--payload JSON] [--consult CID] [--area AREA]
