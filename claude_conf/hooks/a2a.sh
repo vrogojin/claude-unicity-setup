@@ -107,12 +107,25 @@ a2a_check() {
   fi
   local n; n="$(printf '%s' "$poll" | jq '.messages | length')"
   local sd sf; sd="$(_a2a_state_dir)"; sf="$sd/agent-messages.json"; mkdir -p "$sd"
-  [ -f "$sf" ] || printf '{"unread":false,"unread_count":0,"priority_count":0,"messages":[]}' > "$sf"
+  # `-f` alone was not enough. A store that EXISTS but is empty or unparseable fails every merge
+  # from then on, and the poll can never recover by itself — one truncated write became a
+  # permanent outage. Re-seed on missing, empty OR invalid, and keep anything unparseable rather
+  # than deleting it, so a corrupt archive can still be salvaged by hand.
+  if [ ! -s "$sf" ] || ! jq -e . "$sf" >/dev/null 2>&1; then
+    [ -s "$sf" ] && mv "$sf" "$sf.corrupt-backup"
+    printf '{"unread":false,"unread_count":0,"priority_count":0,"messages":[]}' > "$sf"
+  fi
   # Merge only messages whose id is not already in the state file (dedup — an improvement over
   # the cooldown-poll path, which can double-append). Then hand off to the classifier.
+  # The poll travels through a FILE, not through --argjson. A command-line argument is capped
+  # at roughly 32KB on Windows against 2MB on Linux, and a day of traffic passes that: jq died
+  # with "Argument list too long" on every check here while never reproducing on a Linux host.
+  local pf; pf="$sf.poll.$"
+  printf '%s' "$poll" > "$pf"
   local merged
-  merged="$(jq --argjson poll "$poll" '
-    (.messages | map(.id) ) as $have
+  merged="$(jq --slurpfile pollfile "$pf" '
+    ($pollfile[0]) as $poll
+    | (.messages | map(.id) ) as $have
     | ($poll.messages | map(select((.id // "") as $i | ($i=="" or (($have|index($i))==null))))) as $fresh
     | .messages += $fresh
     | .unread = ((.unread) or (($fresh|length)>0))
@@ -120,8 +133,22 @@ a2a_check() {
     | .priority_count = (.priority_count + ($fresh|map(select(.priority==true))|length))
     | ._a2a_fresh = ($fresh|length)
   ' "$sf")"
+  rm -f "$pf"
+
+  # A FAILED merge used to be written straight over the archive. jq reading empty input exits 0
+  # and prints nothing, so the `&& mv` below fired on the failure path and truncated the message
+  # store to zero bytes — 610 messages, twice, before anyone noticed. A failure must never
+  # become a write.
+  if [ -z "$merged" ] || ! printf '%s' "$merged" | jq -e 'has("messages")' >/dev/null 2>&1; then
+    _a2a_err "merge FAILED — the message store was left untouched ($sf)."; return 1
+  fi
   local fresh; fresh="$(printf '%s' "$merged" | jq '._a2a_fresh')"
-  printf '%s' "$merged" | jq 'del(._a2a_fresh)' > "$sf.tmp.$$" && mv "$sf.tmp.$$" "$sf"
+  printf '%s' "$merged" | jq 'del(._a2a_fresh)' > "$sf.tmp.$"
+  if [ -s "$sf.tmp.$" ]; then
+    mv "$sf.tmp.$" "$sf"
+  else
+    rm -f "$sf.tmp.$"; _a2a_err "refusing to overwrite $sf with an empty file."; return 1
+  fi
   if [ -f "$A2A_HOOK_DIR/classify-inbound.sh" ]; then
     CLAUDE_PROJECT_DIR="$(_a2a_project)" bash "$A2A_HOOK_DIR/classify-inbound.sh" >/dev/null 2>&1 || true
   fi

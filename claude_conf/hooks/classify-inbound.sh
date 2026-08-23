@@ -271,7 +271,17 @@ while [ "$i" -lt "$TOTAL" ]; do
   # .authz==null forever, which defeated the UNCLASSIFIED>0 early-exit above and forced a
   # full O(messages) rescan on every daemon hook / poll.) It still creates NO pending entry
   # and no gate, so the no-peer self-test never raises a phantom unknown-agent request. ---
-  if [ -n "$SELF_HEX" ] && [ "$FROM" = "$SELF_HEX" ]; then
+  # --- Unattributable: the message carries no transport pubkey. Identity in this system IS the
+  # signing key — never a claim in the payload — so a message without one has no identity at
+  # all. It cannot be authorized. Calling it "unknown" and queueing it, which is what happened
+  # below, manufactures a pending peer that can never be resolved, only suppressed: it is
+  # rebuilt on every poll, and because its npub matches a real peer the gate then reports it as
+  # an impersonation risk against that peer's own identity. Stamp it classified so it is not
+  # rescanned. The message still sits in the inbox to be read; nothing is acted upon, which is
+  # exactly what default-deny means here. ---
+  if [ -z "$FROM" ]; then
+    AUTHZJSON='{"role":"unattributable","status":"denied","classified":true,"note":"no transport pubkey; identity is the signing key, so this cannot be authorized"}'
+  elif [ -n "$SELF_HEX" ] && [ "$FROM" = "$SELF_HEX" ]; then
     AUTHZJSON='{"role":"self","status":"self","classified":true}'
   # --- Owner: never enters the agent-authorization pipeline ---
   elif [ "$PRI" = "true" ] \
@@ -299,7 +309,7 @@ while [ "$i" -lt "$TOTAL" ]; do
     fi
     AUTHZJSON="$(jq -nc --arg kind "$ENV_KIND" --argjson q "$SIF_Q" '{role:"agent", ticketVerb:$kind, sifQuarantined:($q==1), classified:true}')"
   else
-    [ -n "$FROM" ] || FROM="unknown"
+    # $FROM is guaranteed non-empty here: the unattributable branch above claims that case.
     ST="$(bash "$REGISTRY" status "$FROM" 2>/dev/null || echo unknown)"
     case "$ST" in
       authorized)
