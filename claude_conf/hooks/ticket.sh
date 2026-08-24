@@ -536,12 +536,89 @@ tk_self_test() {
     || { echo "self-test FAILED (v1=$ok v2=$ok2)"; return 1; }
 }
 
+# ════════════════════════════════════════════════════════════════════════════════════
+# VERIFY  (read-only, NON-consuming — the Claude Deck login gate calls this; repeatable)
+# ════════════════════════════════════════════════════════════════════════════════════
+# Verifies a ut2_/v1 ticket's issuer signature + expiry + required cap WITHOUT redeeming it
+# (no redeem DM, no ledger write, no grant — a login gate must be repeatable, unlike the
+# single-use redeem). Mirrors redeem's exact crypto path (relay-fetch -> ticket2-verify for
+# v2; decode -> ticket-verify for v1). Emits ONE compact JSON verdict as the LAST stdout line
+# (all diagnostics go to STDERR so stdout carries only the verdict):
+#   {"ok":true,"tid":..,"iss":..,"exp":<unix>,"caps":[..]}   on success
+#   {"ok":false,"error":".."}                                on failure (also exit 1)
+# A ticket with no embedded scope verifies fine — the caller (deckd) then treats it as the
+# legacy full-view ceiling, which is the intended owner/admin case here.
+tk_verify() {
+  local ticket="" requireCap="" relayOpt="" fromStdin=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --require-cap) requireCap="$2"; shift 2;;
+    --relay)       relayOpt="$2"; shift 2;;
+    -)             fromStdin=1; shift;;
+    -*)            shift;;
+    *)             [ -z "$ticket" ] && ticket="$1"; shift;;
+  esac; done
+  [ "$fromStdin" = "1" ] && ticket="$(cat)"
+  ticket="$(printf '%s' "$ticket" | tr -d '[:space:]')"   # tolerate a trailing newline on stdin
+  _tkv_fail() { printf '{"ok":false,"error":"%s"}\n' "$1"; }   # verdict to STDOUT; caller returns 1
+  [ -n "$ticket" ] || { _tkv_fail "empty-ticket"; return 1; }
+
+  local payload=""
+  case "$ticket" in
+    ut2_*)
+      printf '%s' "$ticket" | grep -Eq '^ut2_[A-Za-z0-9]{43}$' || { _tkv_fail "malformed-v2-ticket"; return 1; }
+      local secret dhash relayUrl evs nEv vin vf2
+      secret="${ticket#ut2_}"
+      dhash="$(_tk_sha256 "$secret")"
+      relayUrl="${relayOpt:-${RELAY_URL:-wss://nostr-relay.testnet.unicity.network}}"
+      evs="$(_tk_run_helper relay-fetch --relay "$relayUrl" --dtag "$dhash" 2>/dev/null)" \
+        || { _tkv_fail "relay-fetch-failed"; return 1; }
+      nEv="$(printf '%s' "$evs" | jq '.events | length' 2>/dev/null || echo 0)"
+      [ "${nEv:-0}" -gt 0 ] || { _tkv_fail "no-ticket-event"; return 1; }
+      vin="$(printf '%s' "$evs" | TKSEC="$secret" jq -c '{secret:env.TKSEC, events:.events}')"
+      vf2="$(_tk_run_helper_stdin "$vin" ticket2-verify 2>/dev/null)" || { _tkv_fail "signature-invalid"; return 1; }
+      [ "$(printf '%s' "$vf2" | jq -r '.valid')" = "true" ] || { _tkv_fail "signature-invalid"; return 1; }
+      payload="$(printf '%s' "$vf2" | jq -c '.payload')"
+      ;;
+    unicity-ticket:v1.*)
+      local event vf
+      event="$(_tk_decode "$ticket" 2>/dev/null)" || { _tkv_fail "malformed-v1-ticket"; return 1; }
+      vf="$(_tk_run_helper_stdin "$event" ticket-verify 2>/dev/null)" || { _tkv_fail "signature-invalid"; return 1; }
+      [ "$(printf '%s' "$vf" | jq -r '.valid')" = "true" ] || { _tkv_fail "signature-invalid"; return 1; }
+      payload="$(printf '%s' "$vf" | jq -c '.payload')"
+      ;;
+    *) _tkv_fail "unrecognized-ticket"; return 1;;
+  esac
+  [ -n "$payload" ] && [ "$payload" != "null" ] || { _tkv_fail "empty-payload"; return 1; }
+
+  local tid iss expEpoch nowEpoch caps
+  tid="$(jq -r '.tid // ""' <<<"$payload")"
+  iss="$(jq -r '.iss // ""' <<<"$payload")"
+  expEpoch="$(jq -r '.exp // 0' <<<"$payload")"
+  nowEpoch="$(_tk_now_epoch)"
+  [ "$expEpoch" -gt "$nowEpoch" ] 2>/dev/null || { _tkv_fail "expired"; return 1; }
+  caps="$(jq -r '(.caps // []) | join(" ")' <<<"$payload")"
+  _ar_validate_caps "$caps" >/dev/null 2>&1 || { _tkv_fail "unknown-caps"; return 1; }
+  if [ -n "$requireCap" ]; then
+    printf ' %s ' "$caps" | grep -q " $requireCap " || { _tkv_fail "missing-required-cap"; return 1; }
+  fi
+  # Issuer-side revocation ledger: a locally revoked/expired tid is refused even with a good sig.
+  local tf st; tf="$(_tk_tickets_file)"
+  if [ -f "$tf" ] && [ -n "$tid" ]; then
+    st="$(jq -r --arg t "$tid" '[.tickets[]? | select(.tid==$t) | .status] | first // ""' "$tf" 2>/dev/null)"
+    case "$st" in revoked|expired) _tkv_fail "revoked"; return 1;; esac
+  fi
+  jq -nc --arg tid "$tid" --arg iss "$iss" --argjson exp "$expEpoch" \
+     --argjson caps "$(printf '%s\n' $caps | jq -R . | jq -sc .)" \
+     '{ok:true, tid:$tid, iss:$iss, exp:$exp, caps:$caps}'
+}
+
 # ── CLI dispatch (only when executed directly, not when sourced) ──────────────────────
 _tk_cli() {
   local cmd="${1:-}"; shift || true
   case "$cmd" in
     issue)         tk_issue "$@";;
     redeem)        tk_redeem "$@";;
+    verify)        tk_verify "$@";;
     list)          tk_list "$@";;
     revoke)        tk_revoke "$@";;
     reap)          tk_reap "$@";;
@@ -550,7 +627,7 @@ _tk_cli() {
     ingest-deny)   tk_ingest_deny   "${1:--}";;
     self-test)     tk_self_test;;
     decode)        _tk_decode "${1:-}";;
-    *) echo "usage: ticket.sh {issue [--v1]|redeem [--relay url]|list|revoke|reap|ingest-redeem|ingest-grant|ingest-deny|self-test} …" >&2; return 1;;
+    *) echo "usage: ticket.sh {issue [--v1]|redeem [--relay url]|verify -|--require-cap C|list|revoke|reap|ingest-redeem|ingest-grant|ingest-deny|self-test} …" >&2; return 1;;
   esac
 }
 if [ "${BASH_SOURCE[0]:-$0}" = "${0}" ]; then

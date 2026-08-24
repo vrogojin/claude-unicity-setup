@@ -128,13 +128,21 @@ else
   CURRENT='{"unread": false, "unread_count": 0, "priority_count": 0, "messages": []}'
 fi
 
-# Merge: append new messages, update counts
+# Cap the retained history so the shared state file cannot grow without bound (an
+# append-only .messages array was a measured O(n) leak: MB-scale files + a per-message
+# jq storm in classify-inbound.sh → 30s ingest timeouts). Keep the newest N (default 500;
+# override AGENT_MESSAGES_MAX). Trimmed-off messages are already classified/acted-on.
+CAP="${AGENT_MESSAGES_MAX:-500}"; case "$CAP" in ''|*[!0-9]*) CAP=500 ;; esac
+
+# Merge: append new messages, update counts, then trim to the newest CAP.
 MERGED=$(echo "$CURRENT" | jq \
   --argjson new_msgs "$(echo "$POLL_RESULT" | jq '.messages')" \
+  --argjson cap "$CAP" \
   '.messages += $new_msgs |
    .unread = true |
    .unread_count = (.unread_count + ($new_msgs | length)) |
-   .priority_count = (.priority_count + ($new_msgs | map(select(.priority == true)) | length))')
+   .priority_count = (.priority_count + ($new_msgs | map(select(.priority == true)) | length)) |
+   .messages |= .[-$cap:]')
 
 echo "$MERGED" > "$STATE_FILE"
 

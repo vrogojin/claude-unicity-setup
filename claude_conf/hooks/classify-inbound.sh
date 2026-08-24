@@ -216,15 +216,21 @@ if ! [ "$UNCLASSIFIED" -gt 0 ] 2>/dev/null; then
   exit 0
 fi
 
-TOTAL="$(jq '.messages | length' "$STATE_FILE" 2>/dev/null || echo 0)"
 STAMPS='[]'   # [{from, ts, body, authz}] — applied to the file under lock at the end.
 
-i=0
-while [ "$i" -lt "$TOTAL" ]; do
-  MSG="$(jq -c ".messages[$i]" "$STATE_FILE" 2>/dev/null)"
-  i=$((i+1))
+# Extract the messages to classify in ONE jq pass — the UNCLASSIFIED ones only, compact,
+# one JSON object per line. The previous index loop ran `jq .messages[$i] "$file"` for every
+# index, re-parsing the WHOLE state file each time (O(messages^2) parses) AND touching already-
+# classified messages; on an unbounded file (now also trimmed on merge) that was the dominant
+# cost behind the per-message jq storm / ~30s ingest timeouts. `select(.authz==null)` here
+# subsumes the old per-message authz recheck. Field extraction inside the loop still operates
+# on the small single-message JSON, so the authorization logic below is byte-for-byte unchanged.
+# The message stream is fed on fd 3 (not the loop's stdin) so body commands that read stdin
+# (sif-guard, ticket.sh, …) keep the caller's stdin, exactly as under the old C-style loop.
+UNCLASSIFIED_MSGS="$(jq -c '.messages[]? | select(.authz == null)' "$STATE_FILE" 2>/dev/null)"
+
+while IFS= read -r MSG <&3; do
   [ -n "$MSG" ] || continue
-  [ "$(echo "$MSG" | jq -r '.authz // "null"')" = "null" ] || continue
 
   FROM="$(echo "$MSG" | jq -r '.from // ""')"
   FROMNAME="$(echo "$MSG" | jq -r '.from_name // ""')"
@@ -441,7 +447,7 @@ while [ "$i" -lt "$TOTAL" ]; do
 
   STAMPS="$(echo "$STAMPS" | jq -c --arg from "$FROM" --arg ts "$TS" --arg body "$BODY" \
     --argjson authz "$AUTHZJSON" '. + [{from:$from, ts:$ts, body:$body, authz:$authz}]')"
-done
+done 3<<< "$UNCLASSIFIED_MSGS"
 
 # --- Apply authz stamps to the message file atomically (match by content, not index,
 #     so a concurrent append by the daemon is never clobbered) ---

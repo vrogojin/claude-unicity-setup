@@ -46,7 +46,7 @@ set -uo pipefail
 # split.propose/agree partitions) → claim-area. Claims are soft — they never forbid
 # parallel work — and a consult can ASK us to apply matching changes on our side, but
 # applying them still runs the normal local workflow with admin confirmation.
-AGENT_CAPABILITIES="read-status chat dev-advice rebuild-reload-service review-merge-pr team-coordinate task-bid knowledge-share self-directed consult claim-area"
+AGENT_CAPABILITIES="read-status chat dev-advice rebuild-reload-service review-merge-pr team-coordinate task-bid knowledge-share self-directed consult claim-area deck"
 AGENT_CAPS_DESTRUCTIVE="rebuild-reload-service review-merge-pr"
 
 # --- Registry path resolution ----------------------------------------------------
