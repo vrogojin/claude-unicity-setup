@@ -107,21 +107,43 @@ coord_root() {
 _rc_ensure_dir() { mkdir -p "$1" 2>/dev/null || true; }
 
 # Atomic locked read-modify-write of a JSON file (same pattern as _tc_write).
-# SECURITY (fail-closed): flock is MANDATORY. A lock timeout (contention) or a missing
-# flock binary FAILS the write with a non-zero return — callers MUST honor it and NOT
-# mark the driving event as seen, so a write lost to contention is retried, never
-# silently dropped. We never fall through to an unlocked read-modify-write.
+# SECURITY (fail-closed): a lock is MANDATORY. A lock timeout (contention) FAILS the write
+# with a non-zero return — callers MUST honor it and NOT mark the driving event as seen, so
+# a write lost to contention is retried, never silently dropped. We never fall through to an
+# unlocked read-modify-write.
+#
+# TWO PRIMITIVES, ONE CONTRACT. Git Bash on Windows ships no `flock`, and treating its
+# absence as a failure disabled every durable path in this engine — inbound advisories
+# included — on an entire platform. That is not fail-closed, it is fail-deaf: the writes did
+# not merely fail, nothing retried them, because there was no contention to retry.
+#
+# `mkdir` is atomic on NTFS as well as POSIX, so it is a real mutual-exclusion primitive
+# rather than a weakening. The contract is unchanged on both paths: acquire or return
+# non-zero, never write unlocked. The directory is removed on both exits so a crashed
+# writer leaves a stale lock at most one timeout long.
 _rc_write() {
   local f="$1"; shift
   local filter="$1"; shift
   local dir; dir="$(dirname "$f")"; _rc_ensure_dir "$dir"
   [ -f "$f" ] || printf '{}' > "$f"
   local lock="$f.lock" tmp="$f.tmp.$$"
-  command -v flock >/dev/null 2>&1 || { echo "ERR: flock unavailable — refusing unlocked write to $f" >&2; return 3; }
-  (
-    flock -w 5 9 || { echo "ERR: lock timeout on $f" >&2; exit 3; }
-    if jq "$@" "$filter" "$f" > "$tmp" 2>/dev/null; then mv "$tmp" "$f"; else rm -f "$tmp"; exit 1; fi
-  ) 9>"$lock"
+  if command -v flock >/dev/null 2>&1; then
+    (
+      flock -w 5 9 || { echo "ERR: lock timeout on $f" >&2; exit 3; }
+      if jq "$@" "$filter" "$f" > "$tmp" 2>/dev/null; then mv "$tmp" "$f"; else rm -f "$tmp"; exit 1; fi
+    ) 9>"$lock"
+    return
+  fi
+  local lockdir="$f.lockd" waited=0
+  while ! mkdir "$lockdir" 2>/dev/null; do
+    waited=$((waited + 1))
+    if [ "$waited" -ge 50 ]; then echo "ERR: lock timeout on $f" >&2; return 3; fi
+    sleep 0.1
+  done
+  if jq "$@" "$filter" "$f" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$f"; rmdir "$lockdir" 2>/dev/null; return 0
+  fi
+  rm -f "$tmp"; rmdir "$lockdir" 2>/dev/null; return 1
 }
 
 _rc_areas_file()       { printf '%s/areas.json'       "$(coord_root)"; }

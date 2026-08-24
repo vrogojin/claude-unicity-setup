@@ -12,6 +12,11 @@
 INPUT=$(cat)
 FILE=$(printf '%s' "$INPUT" | jq -r '.tool_input.file_path // .tool_input.path // empty' 2>/dev/null)
 
+# On Windows the path arrives backslash-spelled. `dirname` then returns "." and the
+# worktree lookup below silently inspects the wrong repository — the guard reads as
+# "allowed" for every file. Normalize once, here, and everything downstream is sane.
+FILE=${FILE//\\//}
+
 # Branch of the worktree containing $1 (walk up to an existing dir first, since
 # a Write target may not exist yet). Empty if the path is not inside a git repo.
 branch_of() {
@@ -20,6 +25,14 @@ branch_of() {
   [ -d "$d" ] || return 1
   git -C "$d" rev-parse --abbrev-ref HEAD 2>/dev/null
 }
+
+
+# Claude Code's own memory store is a git repo in our setup (it syncs itself to
+# a private remote and lives on main by design). It is not repo code, so the
+# branch rule must not apply to it — otherwise every memory write is blocked.
+case "$FILE" in
+  */.claude/projects/*/memory/*) exit 0 ;;
+esac
 
 if [ -n "$FILE" ]; then
   BRANCH=$(branch_of "$(dirname "$FILE")")
