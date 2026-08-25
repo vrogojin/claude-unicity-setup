@@ -95,16 +95,40 @@ _tc_ensure_dir() { mkdir -p "$1" 2>/dev/null || true; }
 
 # Atomic locked read-modify-write of a JSON file in a team dir.
 # _tc_write <file> <jq-filter> [jq-args...]
+# Same contract as _rc_write, which this used to differ from in the worst possible way.
+#
+# It read `flock -w 5 9 2>/dev/null || true`: a missing flock binary — every Git Bash on
+# Windows — and a lock TIMEOUT both fell through to an UNLOCKED read-modify-write, silently.
+# So the two writers of one engine failed in opposite directions: _rc_write refused every
+# write on a platform without flock, and _tc_write performed every one of them with no
+# mutual exclusion at all. A team ledger is a read-modify-write over shared JSON; losing that
+# lock loses whole records under concurrency, and says nothing.
+#
+# Now: flock where it exists, an atomic mkdir where it does not, and a non-zero return if
+# neither can be taken. Never an unlocked write.
 _tc_write() {
   local f="$1"; shift
   local filter="$1"; shift
   local dir; dir="$(dirname "$f")"; _tc_ensure_dir "$dir"
   [ -f "$f" ] || printf '{}' > "$f"
   local lock="$f.lock" tmp="$f.tmp.$$"
-  (
-    flock -w 5 9 2>/dev/null || true
-    if jq "$@" "$filter" "$f" > "$tmp" 2>/dev/null; then mv "$tmp" "$f"; else rm -f "$tmp"; return 1; fi
-  ) 9>"$lock"
+  if command -v flock >/dev/null 2>&1; then
+    (
+      flock -w 5 9 || { echo "ERR: lock timeout on $f" >&2; exit 3; }
+      if jq "$@" "$filter" "$f" > "$tmp" 2>/dev/null; then mv "$tmp" "$f"; else rm -f "$tmp"; exit 1; fi
+    ) 9>"$lock"
+    return
+  fi
+  local lockdir="$f.lockd" waited=0
+  while ! mkdir "$lockdir" 2>/dev/null; do
+    waited=$((waited + 1))
+    if [ "$waited" -ge 50 ]; then echo "ERR: lock timeout on $f" >&2; return 3; fi
+    sleep 0.1
+  done
+  if jq "$@" "$filter" "$f" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$f"; rmdir "$lockdir" 2>/dev/null; return 0
+  fi
+  rm -f "$tmp"; rmdir "$lockdir" 2>/dev/null; return 1
 }
 
 # ============================================================================
