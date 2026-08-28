@@ -443,7 +443,7 @@ done 3<<< "$UNCLASSIFIED_MSGS"
 #     so a concurrent append by the daemon is never clobbered) ---
 if [ "$(echo "$STAMPS" | jq 'length' 2>/dev/null || echo 0)" -gt 0 ]; then
   (
-    flock -w 5 9 2>/dev/null || true
+    _pflock "$LOCK" 5 2>/dev/null || true
     if [ -f "$STATE_FILE" ]; then
       TMP="$STATE_FILE.tmp.$$"
       if jq --argjson stamps "$STAMPS" '

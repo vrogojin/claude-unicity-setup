@@ -92,12 +92,26 @@ _ds_spawn_detached() {
   daemon="$(_ds_daemon)"; proj="$(_ds_project)"; np="$(_ds_nodepath)"
   logf="$(_ds_state_dir)/sphere-daemon.log"
   [ -n "$daemon" ] || { _ds_log "daemon script unresolved (helper not found) — cannot start"; return 1; }
-  # setsid → new session (immune to the shell's SIGHUP); nohup defensive; stdio fully detached;
-  # `&` background; the subshell returns immediately. The daemon writes its own pidfile and
-  # refuses a double-start, so a race between two sessions leaves exactly one daemon.
-  ( setsid nohup env NODE_PATH="$np" node "$daemon" start --project "$proj" --live \
+  # Detach so the daemon OUTLIVES this hook and the launching shell:
+  #   • The `( … & )` subshell orphans the child to init on its own — the primary detach.
+  #   • nohup shields it from SIGHUP.
+  #   • setsid gives a fresh session (belt-and-suspenders) — BUT it does NOT exist on macOS,
+  #     where `setsid …` fails command-not-found and the whole spawn silently dies (the daemon
+  #     "started" but never ran). So use setsid ONLY when present; nohup + the ( & ) subshell
+  #     already detach portably. The daemon writes its own pidfile and refuses a double-start.
+  local _setsid=""
+  command -v setsid >/dev/null 2>&1 && _setsid="setsid"
+  ( $_setsid nohup env NODE_PATH="$np" node "$daemon" start --project "$proj" --live \
       </dev/null >>"$logf" 2>&1 & ) >/dev/null 2>&1
-  _ds_log "started detached daemon for $proj (log: $logf)"
+  # Verify it actually came up rather than blindly claiming success (the old code printed
+  # "started" even when the spawn died instantly). Poll the daemon's own pidfile/status.
+  local _i
+  for _i in 1 2 3 4 5 6; do
+    if _ds_daemon_running; then _ds_log "started detached daemon for $proj (log: $logf)"; return 0; fi
+    sleep 1
+  done
+  _ds_log "daemon spawn did NOT come up within ~6s for $proj — check the log: $logf"
+  return 1
 }
 
 ds_start() {
@@ -113,7 +127,7 @@ ds_start() {
   # Serialize the check-then-start so two concurrent SessionStarts don't both spawn.
   local lock; lock="$(_ds_state_dir)/daemon-session.lock"
   (
-    flock -w 5 9 2>/dev/null || true
+    _pflock "$lock" 5 2>/dev/null || true
     if _ds_daemon_running; then
       if [ "$A2A_DAEMON_RESTART_ON_START" = "1" ]; then
         _ds_log "daemon already running — restarting to pick up fresh config (A2A_DAEMON_RESTART_ON_START=1)"

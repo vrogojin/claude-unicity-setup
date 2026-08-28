@@ -263,10 +263,23 @@ tk_redeem() {
       dhash="$(_tk_sha256 "$secret")"
       relayUrl="${relayOpt:-${RELAY_URL:-wss://nostr-relay.testnet.unicity.network}}"
       evs="$(_tk_run_helper relay-fetch --relay "$relayUrl" --dtag "$dhash")" \
-        || { _tk_err "relay fetch FAILED ($relayUrl) — cannot resolve the ticket event (connectivity? non-default relay ⇒ pass --relay)"; return 1; }
+        || { _tk_err "relay fetch FAILED ($relayUrl) — the helper could not run (node/sdk/argv problem, not the ticket)"; return 1; }
       nEv="$(printf '%s' "$evs" | jq '.events | length' 2>/dev/null || echo 0)"
-      [ "${nEv:-0}" -gt 0 ] \
-        || { _tk_err "no ticket event on $relayUrl for this secret (wrong/expired ticket, or issued against another relay ⇒ --relay)"; return 1; }
+      if [ "${nEv:-0}" -le 0 ]; then
+        # DISTINGUISH the two failure modes that used to be conflated — they need OPPOSITE
+        # reactions from the reader. reachable/eose come from the helper (older helpers omit
+        # them ⇒ fall through to the generic message, preserving old behavior).
+        local reachable eose
+        reachable="$(printf '%s' "$evs" | jq -r '.reachable // empty' 2>/dev/null || echo)"
+        eose="$(printf '%s' "$evs" | jq -r '.eose // empty' 2>/dev/null || echo)"
+        if [ "$reachable" = "false" ]; then
+          _tk_err "RELAY UNREACHABLE ($relayUrl) — could not connect. This is a NETWORK/relay problem, NOT a bad ticket: check your connectivity/DNS, or pass --relay <url> if the ticket was issued against a different relay. Do NOT ask the issuer for a new ticket yet."; return 1
+        elif [ "$reachable" = "true" ] && [ "$eose" != "true" ]; then
+          _tk_err "relay $relayUrl connected but did not return a complete result before timeout (transient/degraded relay). Retry; if it persists the relay is flaky. Not necessarily a bad ticket."; return 1
+        else
+          _tk_err "no ticket event on $relayUrl for this secret — the relay WAS reached and searched, so the ticket is genuinely wrong/expired/revoked, OR it was issued against a DIFFERENT relay (pass --relay). If you've confirmed the relay, ask the issuer for a fresh ticket."; return 1
+        fi
+      fi
       vin="$(printf '%s' "$evs" | TKSEC="$secret" jq -c '{secret:env.TKSEC, events:.events}')"  # secret via env, never argv
       vf2="$(_tk_run_helper_stdin "$vin" ticket2-verify)" \
         || { _tk_err "ticket event INVALID (${vf2:+reason: $(printf '%s' "$vf2" | jq -r '.reason // "?"' 2>/dev/null)}) — refusing to redeem"; return 1; }
@@ -516,7 +529,16 @@ tk_reap() {
   echo "reaped (expired past-exp pending; pruned terminal older than ${RC_REAP_DAYS}d)"
 }
 tk_self_test() {
-  local tmp; tmp="$(mktemp -d)"; local id="$tmp/id.json"
+  # Use $TMPDIR (writable under the sandbox this installer enables) and FAIL LOUDLY if the
+  # temp dir can't be created — a bare unchecked `mktemp -d` yields an empty path under a
+  # sandbox that blocks the default /tmp, and the self-test then fails for a filesystem
+  # reason that callers (a2a verify) misattribute to the SDK.
+  local tmp
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/tk.XXXXXX")" || {
+    echo "self-test: cannot create a temp dir under ${TMPDIR:-/tmp} (is it writable? the sandbox may block it)" >&2
+    return 1
+  }
+  local id="$tmp/id.json"
   _tk_run_helper create-identity > "$id" 2>/dev/null
   local iss; iss="$(jq -r .npub "$id")"
   local p; p="$(jq -nc --arg iss "$iss" '{v:1,tid:"tselftest0001",iss:$iss,issName:"self",relays:["wss://x"],secret:"x",caps:["consult"],grantBack:["consult"],exp:9999999999,bind:"",label:"self"}')"
