@@ -55,6 +55,7 @@ jobs:
           rc=0
           for t in \
             test/portable-lock.test.sh \
+            test/ticket-secret-gen.test.sh \
             test/gitignore-append.test.sh \
             test/remote-sync-fetch-failure.test.sh; do
             echo "== $t =="
