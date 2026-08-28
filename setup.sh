@@ -111,6 +111,15 @@ warn()  { printf '\033[1;33m[warn]\033[0m  %s\n' "$1"; }
 err()   { printf '\033[1;31m[error]\033[0m %s\n' "$1" >&2; }
 die()   { err "$1"; exit 1; }
 
+# Append a line to .gitignore, first guaranteeing the file ends with a newline so a
+# newline-less last line (e.g. ".bug-hunt/") does not get the new entry glued onto it —
+# which both fails to ignore the new entry AND silently un-ignores the previous line.
+# Portable (no GNU-only flags); used by every .gitignore append below. $GITIGNORE is global.
+gi_append() {
+  [ -s "$GITIGNORE" ] && [ -n "$(tail -c1 "$GITIGNORE" 2>/dev/null)" ] && printf '\n' >> "$GITIGNORE"
+  printf '%s\n' "$1" >> "$GITIGNORE"
+}
+
 # In non-interactive mode both prompt helpers NEVER read stdin: prompt_yn
 # silently returns its default, prompt_input silently returns its default.
 # Callers arrange for "the default" to be the existing value, which is what
@@ -295,7 +304,10 @@ deploy_serena_mcp() {
     # Fill in the read-only workspace-root mount, the real project path, and the
     # pinned image tag.
     if [ "$DRY_RUN" != "true" ]; then
-      sed -i "s|__WORKSPACE_ROOT__|$WORKSPACE_ROOT|g; s|__PROJECT_DIR__|$TARGET_DIR|g; s|__SERENA_IMAGE__|$SERENA_IMAGE|g" "$MCP_DEST"
+      # Portable in-place edit (GNU + BSD/macOS): `sed -i "expr" file` breaks on macOS,
+      # where -i consumes the next arg as a backup suffix. Use a temp file + mv instead —
+      # same pattern as the jq merge above.
+      sed "s|__WORKSPACE_ROOT__|$WORKSPACE_ROOT|g; s|__PROJECT_DIR__|$TARGET_DIR|g; s|__SERENA_IMAGE__|$SERENA_IMAGE|g" "$MCP_DEST" > "$MCP_DEST.tmp" && mv "$MCP_DEST.tmp" "$MCP_DEST"
     fi
     # Remove the stray copy under .claude/ so there is a single source of truth
     # (the Dockerfile stays under .claude/docker/ for rebuilds).
@@ -310,7 +322,7 @@ deploy_serena_mcp() {
       elif [ "$DRY_RUN" = "true" ]; then
         info "[dry-run] Append '$ignore' to $GITIGNORE"
       else
-        echo "$ignore" >> "$GITIGNORE"
+        gi_append "$ignore"
         ok "Added $ignore to .gitignore"
       fi
     done
@@ -473,7 +485,7 @@ if [ "$SERENA_ONLY" = "true" ]; then
   elif [ "$DRY_RUN" = "true" ]; then
     info "[dry-run] Append '.claude' to $GITIGNORE"
   else
-    echo '.claude' >> "$GITIGNORE"
+    gi_append '.claude'
     ok "Added .claude to .gitignore"
   fi
   deploy_serena_mcp
@@ -640,7 +652,7 @@ else
   if [ "$DRY_RUN" = "true" ]; then
     info "[dry-run] Append '.claude' to $GITIGNORE"
   else
-    echo '.claude' >> "$GITIGNORE"
+    gi_append '.claude'
   fi
   ok "Added .claude to .gitignore"
 fi
