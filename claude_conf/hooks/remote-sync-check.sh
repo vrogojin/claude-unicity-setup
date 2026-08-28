@@ -26,8 +26,18 @@ if [ -f "$STATE_FILE" ]; then
   fi
 fi
 
-# --- Fetch from remote ---
-git fetch --quiet 2>/dev/null || exit 0
+# --- Fetch from remote (distinguish "remote unreachable" from "behind") ---
+# A failed fetch (e.g. DNS blocked in a sandbox — the NORMAL case there) is NOT the same as
+# being behind. Never let an unreachable remote block Stop: on failure record fetch_ok:false,
+# CLEAR any stale pending state, refresh the cooldown, and exit. Only a SUCCESSFUL fetch can
+# ever set pending=true below.
+if ! git fetch --quiet 2>/dev/null; then
+  jq -n --argjson last_fetch "$NOW" '{
+    last_fetch: $last_fetch, pending: false, fetch_ok: false,
+    main_behind: 0, branch_behind: 0
+  }' > "$STATE_FILE" 2>/dev/null
+  exit 0
+fi
 
 # --- Compare local vs remote ---
 CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
@@ -75,6 +85,7 @@ jq -n \
   '{
     last_fetch: $last_fetch,
     pending: $pending,
+    fetch_ok: true,
     main_behind: $main_behind,
     branch_behind: $branch_behind,
     branch: $branch,
