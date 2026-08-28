@@ -1,0 +1,70 @@
+name: ci
+
+# Portability CI. The installer + hooks target developer laptops, and macOS ships
+# bash 3.2 + BSD userland (no setsid, no flock, GNU-incompatible sed/mktemp). A whole
+# cluster of "Setup Complete but transport unusable" bugs shipped because nothing ever
+# ran setup.sh on a Mac. This workflow runs the syntax sweep, the hermetic test suite,
+# and a dry-run install on BOTH ubuntu-latest AND macos-latest so BSD-userland
+# regressions are caught before release, not by the next Mac user.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  portability:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Report shell + userland (macos-latest ships bash 3.2)
+        run: |
+          echo "bash: $(/bin/bash --version | head -1)"
+          echo "uname: $(uname -a)"
+          for t in setsid flock sed mktemp pnpm yarn; do
+            printf '  %-8s %s\n' "$t" "$(command -v "$t" 2>/dev/null || echo '(absent)')"
+          done
+
+      - name: Syntax sweep — every shell script (uses the runner's /bin/bash)
+        run: |
+          rc=0
+          while IFS= read -r f; do
+            if /bin/bash -n "$f"; then echo "  ok   $f"; else echo "  FAIL $f"; rc=1; fi
+          done < <(find . -name '*.sh' -not -path './.git/*')
+          exit $rc
+
+      - name: Syntax check — every JS module
+        run: |
+          rc=0
+          while IFS= read -r f; do
+            if node --check "$f"; then echo "  ok   $f"; else echo "  FAIL $f"; rc=1; fi
+          done < <(find . -name '*.mjs' -not -path './.git/*' -not -path './node_modules/*')
+          exit $rc
+
+      - name: Hermetic tests (no relay / identity / SDK needed)
+        run: |
+          rc=0
+          for t in \
+            test/portable-lock.test.sh \
+            test/gitignore-append.test.sh \
+            test/remote-sync-fetch-failure.test.sh; do
+            echo "== $t =="
+            if bash "$t"; then echo "  PASS $t"; else echo "  FAIL $t"; rc=1; fi
+          done
+          exit $rc
+
+      - name: setup.sh --dry-run smoke (exercises sed/mktemp/arrays/helper-path on this OS)
+        run: |
+          target="$(mktemp -d)"
+          git init -q "$target"            # setup.sh requires the target to be a git repo
+          # A dry-run must complete cleanly on both userlands and make NO changes.
+          bash setup.sh "$target" --dry-run --yes

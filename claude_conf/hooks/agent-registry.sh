@@ -25,6 +25,42 @@
 # registry queues everything for owner authorization and does nothing else.
 set -uo pipefail
 
+# --- Portable advisory file lock (bug: macOS/BSD ships no flock(1)) ---------------
+# Prefer the real flock(1) when present → byte-identical behavior on Linux. When it
+# is absent (notably macOS), fall back to an atomic mkdir spinlock: mkdir is atomic
+# on every POSIX filesystem and needs no external binary. The mkdir lock auto-releases
+# when the calling (sub)shell exits, mirroring flock's fd-close semantics — so callers
+# keep the existing `( _pflock "$lock" [timeout]; … ) 9>"$lock"` subshell form
+# unchanged. `PFLOCK_FORCE_MKDIR=1` forces the fallback path (used by tests on Linux).
+if ! declare -f _pflock >/dev/null 2>&1; then
+_pflock() {  # _pflock <lockfile> [timeout_s]  — call inside a `( … ) 9>"$lockfile"` subshell
+  local lf="${1:-}" to="${2:-5}"
+  if [ -z "${PFLOCK_FORCE_MKDIR:-}" ] && command -v flock >/dev/null 2>&1; then
+    flock -w "$to" 9            # real flock on the inherited fd 9
+    return
+  fi
+  local d="${lf}.d" hp deadline nap=0.05
+  # Use a sub-second nap where the platform's sleep supports it (BSD/GNU do — and the
+  # mkdir path only runs where flock is absent, i.e. macOS/BSD); fall back to 1s on a
+  # strict POSIX sleep. Coarse 1s naps would throttle throughput to ~1 acquire/sec and
+  # make contended waiters spuriously time out.
+  sleep 0.05 2>/dev/null || nap=1
+  deadline=$(( $(date +%s) + to ))
+  while ! mkdir "$d" 2>/dev/null; do
+    # Steal a stale lock whose recorded holder PID is gone (crash-safe).
+    if [ -f "$d/pid" ]; then
+      hp="$(cat "$d/pid" 2>/dev/null || true)"
+      if [ -n "$hp" ] && ! kill -0 "$hp" 2>/dev/null; then rm -rf "$d" 2>/dev/null || true; continue; fi
+    fi
+    [ "$(date +%s)" -ge "$deadline" ] && return 1
+    sleep "$nap"
+  done
+  echo "$$" > "$d/pid" 2>/dev/null || true
+  trap 'rm -rf "'"$d"'" 2>/dev/null || true' EXIT   # auto-release on subshell exit
+  return 0
+}
+fi
+
 # --- Canonical capability enum ---------------------------------------------------
 # Extend here (and in docs/agent-coordination.md). Each capability is a single
 # lowercase token. Destructive/outward capabilities are additionally listed in
@@ -88,7 +124,7 @@ _ar_write() {
   local f="$AGENT_REGISTRY_FILE" filter="$1"; shift
   local lock="$f.lock" tmp="$f.tmp.$$"
   (
-    flock -w 5 9 2>/dev/null || true
+    _pflock "$lock" 5 2>/dev/null || true
     if jq "$@" "$filter" "$f" > "$tmp" 2>/dev/null; then
       mv "$tmp" "$f"
     else
@@ -263,7 +299,7 @@ _ar_surface_denied_reauth() {  # <hex> [context-note]
   now="$(_ar_now)"
   name="$(_ar_read -r --arg k "$hex" '.agents[$k].unicityName // ""' 2>/dev/null || echo "")"
   (
-    flock -w 5 9 2>/dev/null || true
+    _pflock "$lock" 5 2>/dev/null || true
     [ -f "$sf" ] || printf '%s\n' '{"count":0,"items":[],"updated_at":""}' > "$sf" 2>/dev/null || true
     if jq --arg k "$hex" --arg name "$name" --arg ctx "$ctx" --arg now "$now" '
         ( (.items // [] | map(select(.pubkey == $k)) | first)
@@ -292,7 +328,7 @@ _ar_clear_denied_reauth() {  # <hex> — drop a resolved deny-reauth surface ent
   local lock="$sf.lock" tmp="$sf.tmp.$$"
   [ -f "$sf" ] || return 0
   (
-    flock -w 5 9 2>/dev/null || true
+    _pflock "$lock" 5 2>/dev/null || true
     if jq --arg k "$hex" '
         .items = ((.items // []) | map(select(.pubkey != $k))) | .count = (.items | length)
       ' "$sf" > "$tmp" 2>/dev/null; then

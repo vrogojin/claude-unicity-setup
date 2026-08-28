@@ -102,7 +102,7 @@ _tc_write() {
   [ -f "$f" ] || printf '{}' > "$f"
   local lock="$f.lock" tmp="$f.tmp.$$"
   (
-    flock -w 5 9 2>/dev/null || true
+    _pflock "$lock" 5 2>/dev/null || true
     if jq "$@" "$filter" "$f" > "$tmp" 2>/dev/null; then mv "$tmp" "$f"; else rm -f "$tmp"; return 1; fi
   ) 9>"$lock"
 }
@@ -161,7 +161,7 @@ team_lamport_next() {
   local d; d="$(team_dir "$1")"; _tc_ensure_dir "$d"
   local f="$d/lamport" cur next
   (
-    flock -w 5 9 2>/dev/null || true
+    _pflock "$f.lock" 5 2>/dev/null || true
     cur="$( [ -f "$f" ] && cat "$f" 2>/dev/null || echo 0 )"; [ -n "$cur" ] || cur=0
     next=$((cur+1)); printf '%s' "$next" > "$f"; printf '%s' "$next"
   ) 9>"$f.lock"
@@ -170,7 +170,7 @@ team_lamport_observe() {  # bump local clock to max(local, incoming)+1
   local d; d="$(team_dir "$1")"; _tc_ensure_dir "$d"
   local f="$d/lamport" cur inc="${2:-0}" nv
   (
-    flock -w 5 9 2>/dev/null || true
+    _pflock "$f.lock" 5 2>/dev/null || true
     cur="$( [ -f "$f" ] && cat "$f" 2>/dev/null || echo 0 )"; [ -n "$cur" ] || cur=0
     [ "$inc" -gt "$cur" ] 2>/dev/null && cur="$inc"
     nv=$((cur+1)); printf '%s' "$nv" > "$f"; printf '%s' "$nv"

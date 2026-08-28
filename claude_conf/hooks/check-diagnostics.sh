@@ -31,9 +31,13 @@ fi
 
 # --- TypeScript: Run typecheck if available ---
 if [ -f "package.json" ]; then
+  # Honor the project's actual package manager (pnpm/yarn/npm) — see pre-commit-check.sh.
+  if [ -f "pnpm-lock.yaml" ] && command -v pnpm >/dev/null 2>&1; then PM=pnpm
+  elif [ -f "yarn.lock" ] && command -v yarn >/dev/null 2>&1; then PM=yarn
+  else PM=npm; fi
   if jq -e '.scripts.typecheck' package.json >/dev/null 2>&1; then
-    if ! npm run typecheck --silent >/dev/null 2>&1; then
-      TC_OUTPUT=$(npm run typecheck --silent 2>&1 | tail -10)
+    if ! "$PM" run typecheck >/dev/null 2>&1; then
+      TC_OUTPUT=$("$PM" run typecheck 2>&1 | tail -10)
       jq -n --arg reason "TypeScript type errors found. Fix before finishing:\n${TC_OUTPUT}" '{
         "decision": "block",
         "reason": $reason

@@ -31,21 +31,28 @@ fi
 
 # --- TypeScript / Node.js ---
 if [ -f "package.json" ]; then
+  # Honor the project's ACTUAL package manager (repo may be pnpm/yarn, not npm) — a hardcoded
+  # `npm run` in a pnpm repo runs against the wrong / an absent node_modules. Detect by lockfile,
+  # fall back to npm. Output is redirected anyway, so `<pm> run <script>` (no --silent) is uniform.
+  if [ -f "pnpm-lock.yaml" ] && command -v pnpm >/dev/null 2>&1; then PM=pnpm
+  elif [ -f "yarn.lock" ] && command -v yarn >/dev/null 2>&1; then PM=yarn
+  else PM=npm; fi
+
   # Check if lint script exists
   if jq -e '.scripts.lint' package.json >/dev/null 2>&1; then
-    if ! npm run lint --silent >/dev/null 2>&1; then
-      LINT_OUTPUT=$(npm run lint --silent 2>&1 | tail -5)
+    if ! "$PM" run lint >/dev/null 2>&1; then
+      LINT_OUTPUT=$("$PM" run lint 2>&1 | tail -5)
       BLOCKED=true
-      REASONS="${REASONS}npm run lint failed:\n${LINT_OUTPUT}\n"
+      REASONS="${REASONS}${PM} run lint failed:\n${LINT_OUTPUT}\n"
     fi
   fi
 
   # Check if typecheck script exists
   if jq -e '.scripts.typecheck' package.json >/dev/null 2>&1; then
-    if ! npm run typecheck --silent >/dev/null 2>&1; then
-      TC_OUTPUT=$(npm run typecheck --silent 2>&1 | tail -5)
+    if ! "$PM" run typecheck >/dev/null 2>&1; then
+      TC_OUTPUT=$("$PM" run typecheck 2>&1 | tail -5)
       BLOCKED=true
-      REASONS="${REASONS}npm run typecheck failed:\n${TC_OUTPUT}\n"
+      REASONS="${REASONS}${PM} run typecheck failed:\n${TC_OUTPUT}\n"
     fi
   fi
 fi

@@ -107,19 +107,20 @@ coord_root() {
 _rc_ensure_dir() { mkdir -p "$1" 2>/dev/null || true; }
 
 # Atomic locked read-modify-write of a JSON file (same pattern as _tc_write).
-# SECURITY (fail-closed): flock is MANDATORY. A lock timeout (contention) or a missing
-# flock binary FAILS the write with a non-zero return — callers MUST honor it and NOT
-# mark the driving event as seen, so a write lost to contention is retried, never
-# silently dropped. We never fall through to an unlocked read-modify-write.
+# SECURITY (fail-closed): locking is MANDATORY. A lock timeout (contention) FAILS the
+# write with a non-zero return — callers MUST honor it and NOT mark the driving event as
+# seen, so a write lost to contention is retried, never silently dropped. We never fall
+# through to an unlocked read-modify-write. `_pflock` guarantees mutual exclusion even
+# where flock(1) is absent (macOS) via an atomic mkdir lock — so this path no longer
+# hard-refuses on a missing flock binary (which used to block coordinated writes on Mac).
 _rc_write() {
   local f="$1"; shift
   local filter="$1"; shift
   local dir; dir="$(dirname "$f")"; _rc_ensure_dir "$dir"
   [ -f "$f" ] || printf '{}' > "$f"
   local lock="$f.lock" tmp="$f.tmp.$$"
-  command -v flock >/dev/null 2>&1 || { echo "ERR: flock unavailable — refusing unlocked write to $f" >&2; return 3; }
   (
-    flock -w 5 9 || { echo "ERR: lock timeout on $f" >&2; exit 3; }
+    _pflock "$lock" 5 || { echo "ERR: lock timeout on $f" >&2; exit 3; }
     if jq "$@" "$filter" "$f" > "$tmp" 2>/dev/null; then mv "$tmp" "$f"; else rm -f "$tmp"; exit 1; fi
   ) 9>"$lock"
 }
@@ -146,7 +147,7 @@ rc_lamport_next() {
   local d; d="$(coord_root)"; _rc_ensure_dir "$d"
   local f="$d/lamport" cur next
   (
-    flock -w 5 9 2>/dev/null || true
+    _pflock "$f.lock" 5 2>/dev/null || true
     cur="$( [ -f "$f" ] && cat "$f" 2>/dev/null || echo 0 )"; [ -n "$cur" ] || cur=0
     next=$((cur+1)); printf '%s' "$next" > "$f"; printf '%s' "$next"
   ) 9>"$f.lock"
