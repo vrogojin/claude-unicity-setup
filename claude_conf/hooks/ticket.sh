@@ -151,7 +151,10 @@ tk_issue() {
   # 43 uniform alphanumeric chars from /dev/urandom = 43·log2(62) ≈ 256 bits of entropy —
   # same strength as the old openssl-rand-32 secret, but paste-proof (no punctuation) and
   # short enough that `ut2_<secret>` is 47 chars. Rejection sampling via tr keeps it uniform.
-  secret="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 43)"
+  # LC_ALL=C is MANDATORY: BSD/macOS `tr` fails "Illegal byte sequence" on raw /dev/urandom
+  # bytes under a UTF-8 locale, yielding an EMPTY secret → ticket2-sign dies "missing/short
+  # secret" → issuing is silently broken on a Mac (redeeming still works). C locale = raw bytes.
+  secret="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 43)"
   [ "${#secret}" -eq 43 ] || { _tk_err "could not generate secret"; return 1; }
   tid="t$(_tk_sha256 "$secret" | cut -c1-12)"
   # bind (if given) must be a decodable npub → store as hex for unspoofable compare.
@@ -546,7 +549,7 @@ tk_self_test() {
   local ok; ok="$(_tk_run_helper_stdin "$ev" ticket-verify | jq -r .valid)"
   # v2: sign → stub-publish → stub-fetch → verify, entirely inside the temp dir.
   local sec2 p2 ev2 evs2 ok2
-  sec2="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 43)"
+  sec2="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 43)"   # LC_ALL=C: BSD tr needs it (see gen above)
   p2="$(TKSEC="$sec2" jq -nc --arg iss "$iss" '{secret:env.TKSEC, payload:{iss:$iss,issName:"self",relays:["wss://x"],caps:["consult"],grantBack:["consult"],exp:9999999999,bind:"",label:"self2"}}')"
   ev2="$(_tk_run_helper_stdin "$p2" ticket2-sign --identity "$id")"
   TICKET_RELAY_STUB="$tmp/relay" _tk_run_helper_stdin "$ev2" relay-publish >/dev/null 2>&1
