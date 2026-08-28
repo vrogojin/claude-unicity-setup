@@ -22,7 +22,7 @@ if [ -f "Cargo.toml" ]; then
     REASONS="${REASONS}cargo fmt --all --check failed. Run cargo fmt --all to fix formatting.\n"
   fi
 
-  if ! cargo clippy --workspace -- -D warnings 2>&1 | tail -1 | grep -q "^$\|Finished\|warning: 0 warnings"; then
+  if ! cargo clippy --workspace -- -D warnings >/dev/null 2>&1; then
     CLIPPY_OUTPUT=$(cargo clippy --workspace -- -D warnings 2>&1 | tail -5)
     BLOCKED=true
     REASONS="${REASONS}cargo clippy failed:\n${CLIPPY_OUTPUT}\n"
@@ -33,7 +33,7 @@ fi
 if [ -f "package.json" ]; then
   # Check if lint script exists
   if jq -e '.scripts.lint' package.json >/dev/null 2>&1; then
-    if ! npm run lint --silent 2>&1 | tail -1 | grep -q "^$"; then
+    if ! npm run lint --silent >/dev/null 2>&1; then
       LINT_OUTPUT=$(npm run lint --silent 2>&1 | tail -5)
       BLOCKED=true
       REASONS="${REASONS}npm run lint failed:\n${LINT_OUTPUT}\n"
@@ -52,13 +52,10 @@ fi
 
 # --- Go ---
 if [ -f "go.mod" ]; then
-  if ! go vet ./... 2>&1 | grep -q "^$"; then
+  if ! go vet ./... >/dev/null 2>&1; then
     VET_OUTPUT=$(go vet ./... 2>&1 | tail -5)
-    # go vet outputs nothing on success
-    if [ -n "$VET_OUTPUT" ]; then
-      BLOCKED=true
-      REASONS="${REASONS}go vet failed:\n${VET_OUTPUT}\n"
-    fi
+    BLOCKED=true
+    REASONS="${REASONS}go vet failed:\n${VET_OUTPUT}\n"
   fi
 
   # Check gofmt
