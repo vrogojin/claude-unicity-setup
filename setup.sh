@@ -263,7 +263,7 @@ deploy_serena_mcp() {
   # Bump SERENA_IMAGE_VERSION whenever Dockerfile.serena changes: every machine
   # then transparently rebuilds the image on its next setup run (the tag it looks
   # for no longer exists locally), while unchanged versions are reused as-is.
-  local SERENA_IMAGE_VERSION="1.0.0"
+  local SERENA_IMAGE_VERSION="1.1.0"
   local SERENA_IMAGE="unicity/serena:${SERENA_IMAGE_VERSION}"
   local SERENA_DOCKERFILE="$CLAUDE_DIR/docker/Dockerfile.serena"
 
