@@ -159,9 +159,23 @@ a2a_verify() {
   if bash "$A2A_TICKET" self-test >/dev/null 2>&1; then
     echo "  [ok] crypto/sdk      sign→verify round-trips (node_modules + schnorr + AES-GCM)"
   else
-    echo "  [FAIL] crypto/sdk    ticket self-test failed → @unicitylabs/sphere-sdk not resolvable."
-    echo "         fix:  (cd \"$(cd "$(dirname "$helper")/.." 2>/dev/null && pwd)\" && npm install)"
-    echo "── RESULT: FAIL (sdk/node_modules) ──────────────────────────"; return 1
+    # The self-test failed — do NOT assume the SDK is the cause. TEST the SDK directly and
+    # surface the real self-test error, so a filesystem/temp-dir or runtime failure is not
+    # misdiagnosed as "not resolvable" (which sends people to `npm install` for hours).
+    local _cloneroot _sterr
+    _cloneroot="$(cd "$(dirname "$helper")/.." 2>/dev/null && pwd)"
+    _sterr="$(bash "$A2A_TICKET" self-test 2>&1 | tail -3)"
+    if NODE_PATH="$_cloneroot/node_modules:${NODE_PATH:-}" node -e "require.resolve('@unicitylabs/sphere-sdk')" >/dev/null 2>&1; then
+      echo "  [FAIL] crypto/sdk    self-test failed, but @unicitylabs/sphere-sdk RESOLVES — the SDK is NOT the cause."
+      echo "         Most likely a temp-dir / filesystem-permission issue (can this process write \$TMPDIR?)"
+      echo "         or a runtime error. Do NOT run npm install. Self-test output:"
+      printf '         %s\n' "$_sterr"
+      echo "── RESULT: FAIL (crypto self-test — cause is NOT the SDK) ────"; return 1
+    else
+      echo "  [FAIL] crypto/sdk    @unicitylabs/sphere-sdk does not resolve."
+      echo "         fix:  (cd \"$_cloneroot\" && npm install)"
+      echo "── RESULT: FAIL (sdk/node_modules) ──────────────────────────"; return 1
+    fi
   fi
 
   # Step 2 — live DM round-trip.

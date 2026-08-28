@@ -516,7 +516,16 @@ tk_reap() {
   echo "reaped (expired past-exp pending; pruned terminal older than ${RC_REAP_DAYS}d)"
 }
 tk_self_test() {
-  local tmp; tmp="$(mktemp -d)"; local id="$tmp/id.json"
+  # Use $TMPDIR (writable under the sandbox this installer enables) and FAIL LOUDLY if the
+  # temp dir can't be created — a bare unchecked `mktemp -d` yields an empty path under a
+  # sandbox that blocks the default /tmp, and the self-test then fails for a filesystem
+  # reason that callers (a2a verify) misattribute to the SDK.
+  local tmp
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/tk.XXXXXX")" || {
+    echo "self-test: cannot create a temp dir under ${TMPDIR:-/tmp} (is it writable? the sandbox may block it)" >&2
+    return 1
+  }
+  local id="$tmp/id.json"
   _tk_run_helper create-identity > "$id" 2>/dev/null
   local iss; iss="$(jq -r .npub "$id")"
   local p; p="$(jq -nc --arg iss "$iss" '{v:1,tid:"tselftest0001",iss:$iss,issName:"self",relays:["wss://x"],secret:"x",caps:["consult"],grantBack:["consult"],exp:9999999999,bind:"",label:"self"}')"

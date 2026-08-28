@@ -435,6 +435,30 @@ fi
 
 # Resolve to absolute path
 TARGET_DIR="$(cd "$TARGET_DIR" 2>/dev/null && pwd)" || die "Target directory does not exist: $TARGET_DIR"
+
+# Refuse a throwaway/temporary clone. The helper path recorded later (transport.helper_path /
+# TEAM_SPHERE_HELPER) is an absolute path under THIS clone ($SCRIPT_DIR), and the helper must
+# stay there (it resolves @unicitylabs/sphere-sdk from $SCRIPT_DIR/node_modules). If the clone
+# is in a temp dir (the README's throwaway-clone example, or a $TMPDIR clone), that path
+# vanishes on cleanup and every daemon/A2A call silently breaks. Refuse rather than record it.
+_is_ephemeral_dir() {
+  case "$1/" in
+    /tmp/*|/private/tmp/*|/var/folders/*|/private/var/folders/*) return 0 ;;
+  esac
+  if [ -n "${TMPDIR:-}" ]; then
+    case "$1/" in "${TMPDIR%/}"/*) return 0 ;; esac
+  fi
+  return 1
+}
+if _is_ephemeral_dir "$SCRIPT_DIR"; then
+  EPHEMERAL_MSG="This installer was cloned into a TEMPORARY directory:
+    $SCRIPT_DIR
+setup records this location as the framework helper (transport.helper_path / TEAM_SPHERE_HELPER),
+and the helper must live where it resolves its node_modules — a temp dir is cleaned up and then
+every daemon / A2A call breaks. Clone into a PERSISTENT location and re-run, e.g.:
+    git clone <repo> \"\$HOME/claude-unicity-setup\" && cd \"\$HOME/claude-unicity-setup\" && ./setup.sh \"$TARGET_DIR\""
+  if [ "$DRY_RUN" = "true" ]; then warn "$EPHEMERAL_MSG"; else die "$EPHEMERAL_MSG"; fi
+fi
 CLAUDE_DIR="$TARGET_DIR/.claude"
 GITIGNORE="$TARGET_DIR/.gitignore"
 
@@ -998,7 +1022,7 @@ fi
 if [ -n "${SETUP_DEPS+x}" ]; then
   # Explicit override: all | none | comma-separated dependency names.
   case "$SETUP_DEPS" in
-    all)     SELECTED_DEPS=("${DEP_LIST[@]}") ;;
+    all)     SELECTED_DEPS=(${DEP_LIST[@]+"${DEP_LIST[@]}"}) ;;  # empty-array-safe (bash 3.2 + set -u)
     none|"") SELECTED_DEPS=() ;;
     *)
       IFS=',' read -ra _dep_names <<< "$SETUP_DEPS"
@@ -1018,8 +1042,8 @@ elif [ "$EX_HAS_DEP_CONFIG" = "true" ]; then
   ok "Dependency tracking preserved: ${SELECTED_DEPS[*]:-none} (set SETUP_DEPS=all|none|a,b to change)"
 elif [ "$NONINTERACTIVE" = "true" ]; then
   # Fresh install without prompts: track all detected upstream deps (same as
-  # the interactive default).
-  SELECTED_DEPS=("${DEP_LIST[@]}")
+  # the interactive default). Empty-array-safe for bash 3.2 (macOS) under set -u.
+  SELECTED_DEPS=(${DEP_LIST[@]+"${DEP_LIST[@]}"})
 elif [ ${#DEP_LIST[@]} -gt 0 ]; then
   info "Detected repo: $REPO_BASENAME"
   info "Available upstream dependencies:"
