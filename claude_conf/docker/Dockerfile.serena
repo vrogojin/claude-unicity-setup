@@ -22,8 +22,13 @@ RUN apt-get update \
 
 # --- Go toolchain + gopls (aggregator-go, bft-core) ---
 # TARGETARCH is populated by BuildKit (amd64 / arm64), matching Go's release naming.
-ARG TARGETARCH=amd64
-ARG GO_VERSION=1.22.5
+# Do NOT give it a default: a default value shadows BuildKit's per-platform value, so an
+# arm64 (Apple Silicon) build would still fetch the amd64 Go tarball and fail to build.
+ARG TARGETARCH
+# Keep GO_VERSION current for gopls@latest: too old and `go install` below has to download
+# a newer toolchain at build time (Go's auto-toolchain resolver) — a wasted ~15s + a surprise
+# dependency on go.dev. Bump this when gopls needs a newer Go.
+ARG GO_VERSION=1.26.7
 RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${TARGETARCH}.tar.gz" -o /tmp/go.tgz \
     && tar -C /usr/local -xzf /tmp/go.tgz \
     && rm /tmp/go.tgz
