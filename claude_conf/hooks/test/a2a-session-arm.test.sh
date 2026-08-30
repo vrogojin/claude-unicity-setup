@@ -116,7 +116,7 @@ EOF
 chmod +x "$WH"/*.sh
 export A2A_QUEUE_WATCH_INTERVAL=1
 printf '{"id":"w-old","status":"queued"}' > "$WSD/agent-workitems/w-old.json"   # backlog present BEFORE start
-mkdir -p "$WSD/a2a-queue-watch-notified/wi-w-race"                                # pretend another watcher claimed w-race (scope-keyed)
+mkdir -p "$WSD/a2a-queue-watch-seen/wi-w-race"                                    # pretend another watcher claimed w-race (scope-keyed)
 ( timeout 6 bash "$WH/a2a-queue-watch.sh" > "$WORK/watch.log" 2>/dev/null ) &
 WPID=$!
 sleep 2                                                                           # let it prime the backlog

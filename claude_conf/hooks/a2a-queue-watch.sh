@@ -12,15 +12,14 @@
 # enqueues an item for an `authorized` peer, so a queued id is by construction an authorized
 # request. The capability-scoped processor in the skill remains the sole executor.
 #
-# CHEAP IDLE PATH: a new arrival is detected by NEW FILENAME — classify-inbound creates each
-# item file already `queued`, so the steady state is just three directory listings per tick;
-# jq runs only when a file is genuinely new. CROSS-WATCHER DEDUP: many sessions may each arm a
-# watcher; an atomic per-id claim (mkdir under a2a-queue-watch-notified/, keyed <scope>-<id> so
-# a peer-supplied id in one queue cannot suppress a same-id item in another) guarantees a new
-# id wakes EXACTLY ONE session, not all of them. A heartbeat file lets the SessionStart hook
-# keep normally ONE watcher live (it only arms a new one when the heartbeat goes stale).
-#
-# Requires bash 4+ (associative array), as sibling hooks (serena-reaper.sh) already do.
+# CHEAP + PORTABLE: a new arrival is detected by an ATOMIC per-item claim under a `seen/`
+# marker dir (`mkdir` — the first watcher to create $scope-$id examines it; the rest skip).
+# The scope prefix (wi-/ce-/te-) means a peer-supplied id in one queue cannot suppress a
+# same-id item in another. This is filesystem-only (no bash-4 associative array → runs under
+# stock macOS bash 3.2) and BOUNDED — old claims are reaped by mtime. CROSS-WATCHER: many
+# sessions may each arm a watcher; the atomic claim guarantees a new id wakes EXACTLY ONE.
+# A heartbeat file lets the SessionStart hook keep normally ONE watcher live (it re-arms only
+# when the heartbeat goes stale).
 set -uo pipefail
 
 WATCH_HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo .)"
@@ -30,54 +29,63 @@ INTERVAL="${A2A_QUEUE_WATCH_INTERVAL:-3}"; case "$INTERVAL" in ''|0|*[!0-9]*) IN
 WI_DIR="$STATE_DIR/agent-workitems"
 CE_DIR="$STATE_DIR/agent-consult-events"
 TE_DIR="$STATE_DIR/agent-team-events"
-NOTIFIED="$STATE_DIR/a2a-queue-watch-notified"
+SEENDIR="$STATE_DIR/a2a-queue-watch-seen"   # atomic per-item claim: created = examined
 HB="$STATE_DIR/a2a-queue-watch.heartbeat"
-mkdir -p "$NOTIFIED" 2>/dev/null || true
-find "$NOTIFIED" -maxdepth 1 -type d -mmin +1440 -exec rm -rf {} + 2>/dev/null || true
+mkdir -p "$SEENDIR" 2>/dev/null || true
+find "$SEENDIR" -maxdepth 1 -type d -mmin +1440 -exec rm -rf {} + 2>/dev/null || true
 
-declare -A SEEN   # filenames already examined by THIS process → jq only genuinely-new files
+# Queue table: "dir|scope|label|skill-hint". Indexed array (bash 3.2 safe); label may contain
+# spaces, hint has no '|', so a single IFS='|' split is unambiguous.
+QUEUES=(
+  "$WI_DIR|wi|WORK request|/process-agent-requests"
+  "$CE_DIR|ce|CONSULT|/coordinator-advise"
+  "$TE_DIR|te|TEAM event|/team-work"
+)
 
 _is_queued() { [ -f "$1" ] && [ "$(jq -r '.status // "queued"' "$1" 2>/dev/null)" = "queued" ]; }
 
-# Prime: mark everything currently present as seen WITHOUT emitting — the SessionStart
-# drain-once nudge already covers the at-start backlog; the watcher reports only NEW arrivals.
+# Prime: claim everything currently present WITHOUT emitting — the SessionStart drain-once
+# nudge already covers the at-start backlog; the watcher reports only NEW arrivals.
 _prime() {
-  local d f
-  for d in "$WI_DIR" "$CE_DIR" "$TE_DIR"; do
-    [ -d "$d" ] || continue
-    for f in "$d"/*.json; do [ -e "$f" ] || continue; SEEN["$f"]=1; done
+  local q dir scope label hint f id
+  for q in "${QUEUES[@]}"; do
+    IFS='|' read -r dir scope label hint <<< "$q"
+    [ -d "$dir" ] || continue
+    for f in "$dir"/*.json; do [ -e "$f" ] || continue
+      id="$(basename "$f" .json)"
+      mkdir "$SEENDIR/$scope-$id" 2>/dev/null || true
+    done
   done
 }
 _prime
 
-_scan() {  # <dir> <scope> <label> <skill-hint>
-  local d="$1" scope="$2" label="$3" hint="$4" f id
-  [ -d "$d" ] || return 0
-  for f in "$d"/*.json; do
-    [ -e "$f" ] || continue
-    [ -n "${SEEN["$f"]:-}" ] && continue   # already examined this process
-    SEEN["$f"]=1
-    _is_queued "$f" || continue            # only newly-QUEUED items
-    id="$(basename "$f" .json)"
-    # First watcher to claim the scope-keyed id emits; the rest stay quiet (one wake per id).
-    if mkdir "$NOTIFIED/$scope-$id" 2>/dev/null; then
+_scan() {
+  local q dir scope label hint f id
+  for q in "${QUEUES[@]}"; do
+    IFS='|' read -r dir scope label hint <<< "$q"
+    [ -d "$dir" ] || continue
+    for f in "$dir"/*.json; do [ -e "$f" ] || continue
+      id="$(basename "$f" .json)"
+      # Atomic claim: if we cannot create the marker, this id was already examined (by us on a
+      # prior tick, by prime, or by another watcher) → skip. First claimer of a NEW id proceeds.
+      mkdir "$SEENDIR/$scope-$id" 2>/dev/null || continue
+      # classify-inbound writes item files atomically (tmp+rename) already `queued`, so a first
+      # sighting that is NOT queued is a done/other file we simply never emit for.
+      _is_queued "$f" || continue
       printf 'A2A: new authorized %s queued (id %s) → run %s now\n' "$label" "$id" "$hint"
-    fi
+    done
   done
 }
 
 TICK=0
 while :; do
   date -u +%s > "$HB" 2>/dev/null || true   # heartbeat: proves a watcher is live (SessionStart reads this)
-  _scan "$WI_DIR" "wi" "WORK request" "/process-agent-requests"
-  _scan "$CE_DIR" "ce" "CONSULT"      "/coordinator-advise"
-  _scan "$TE_DIR" "te" "TEAM event"   "/team-work"
-  # Periodic housekeeping for a long-lived watcher (~every 300 ticks): reap old dedup claims
-  # and drop SEEN entries whose file is gone, so neither grows without bound over days.
+  _scan
+  # Periodic housekeeping for a long-lived watcher (~every 300 ticks): reap old claim markers
+  # so the seen/ tree cannot grow without bound over days.
   TICK=$((TICK+1))
   if [ $(( TICK % 300 )) -eq 0 ]; then
-    find "$NOTIFIED" -maxdepth 1 -type d -mmin +1440 -exec rm -rf {} + 2>/dev/null || true
-    for k in "${!SEEN[@]}"; do [ -e "$k" ] || unset "SEEN[$k]"; done
+    find "$SEENDIR" -maxdepth 1 -type d -mmin +1440 -exec rm -rf {} + 2>/dev/null || true
   fi
   sleep "$INTERVAL"
 done
