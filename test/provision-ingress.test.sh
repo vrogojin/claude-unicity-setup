@@ -126,6 +126,13 @@ chk "haproxy on-net container → planned"       "[ \"\$(ipchk 'track42-web:80')
 # the real control: a name that is NOT a container on haproxy-net is rejected regardless of spelling
 chk "haproxy off-net container → invalid"      "[ \"\$(ipchk 'offnet-svc:80')\" = 'invalid' ]"
 chk "haproxy nonexistent container → invalid"  "[ \"\$(ipchk 'ghost-svc:80')\" = 'invalid' ]"
+# belt-and-suspenders: with the existence check OFF (no-docker fallback), the IP-literal
+# reject alone must still block IPs in every inet_aton notation incl. mixed-radix hex octets.
+bchk(){ printf '{"hostname":"x.staging.concierge-dev.app","target":"%s"}' "$1" | INGRESS_VERIFY_CONTAINER=off INGRESS_MODE=haproxy INGRESS_HAPROXY_HOST=haproxy-test INGRESS_CURL="$STUB/curl-haproxy-post" bash "$SH" provision --plan | j .status; }
+chk "belt: mixed-radix hex IP → invalid"       "[ \"\$(bchk '169.254.0xA9.0xFE:80')\" = 'invalid' ]"
+chk "belt: hex 2nd-octet IP → invalid"         "[ \"\$(bchk '172.0x11.0.1:80')\" = 'invalid' ]"
+chk "belt: canonical IP → invalid"             "[ \"\$(bchk '8.8.8.8:80')\" = 'invalid' ]"
+chk "belt: legit name still OK (verify off)"   "[ \"\$(bchk 'track42-web:80')\" = 'planned' ]"
 # require mode + no docker → blocked_config (fail-closed)
 RC="$(printf '{\"hostname\":\"x.staging.concierge-dev.app\",\"target\":\"track42-web:80\"}' | env -u DOCKER_BIN DOCKER_BIN=/nonexistent-docker INGRESS_VERIFY_CONTAINER=require INGRESS_MODE=haproxy INGRESS_HAPROXY_HOST=h bash "$SH" provision --plan | j .status)"
 chk "verify=require + no docker → blocked_config" "[ \"$RC\" = 'blocked_config' ]"

@@ -203,14 +203,15 @@ _derive() {
       *[!a-zA-Z0-9_.-]* ) return 14;;                         # invalid docker name chars (also bars [] : )
       [!a-zA-Z0-9]* ) return 14;;                             # must start alnum
     esac
-    # Belt-and-suspenders IP-literal reject (the existence allowlist below is the real
-    # control). Reject anything that could be an IP literal, never a container name:
-    #   • all digits+dots  → dotted-quad / octal / decimal-int / trailing-dot forms
-    #   • 0x… / 0X…         → hex IP literal
+    # Belt-and-suspenders IP-literal reject (the existence allowlist below is the REAL
+    # control; this only matters in the no-docker fallback). Reject IP literals in any
+    # inet_aton-parseable notation:
+    #   • all digits+dots            → dotted-quad / octal / decimal-int / trailing-dot
+    #   • any octet starting 0x/0X   → hex, at ANY position (e.g. 169.254.0xA9.0xFE)
     # (IPv6 / v4-in-v6 already fall out: their ':' / '[' fail the split or the charset check.)
-    case "$TARGET_HOST" in
-      0[xX]* ) return 16;;
-    esac
+    local _oct _o
+    IFS=. read -ra _oct <<< "$TARGET_HOST"
+    for _o in "${_oct[@]}"; do case "$_o" in 0[xX]*) return 16;; esac; done
     case "$TARGET_HOST" in
       *[!0-9.]* ) : ;;                                        # has a name char → OK
       * ) return 16;;                                         # all digits/dots → IP/numeric → reject
