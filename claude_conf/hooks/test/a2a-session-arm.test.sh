@@ -87,6 +87,8 @@ C5="$(ctx "$(run sess-C)")"
 echo "$C5" | grep -q 'Monitor'                 && pass "arms via Monitor tool" || fail "no Monitor arm: $C5"
 echo "$C5" | grep -q 'a2a-queue-watch.sh'       && pass "names the watcher script" || fail "no watcher script"
 echo "$C5" | grep -qi 'do NOT set up an unconditional /loop' && pass "explicitly forbids /loop interval" || fail "no anti-loop note"
+echo "$C5" | grep -qE 'bash /[^ ]*/a2a-queue-watch\.sh' && pass "watcher path is ABSOLUTE (runnable in the tool shell)" || fail "watcher path not absolute: $C5"
+echo "$C5" | grep -q 'CLAUDE_PROJECT_DIR' && fail "emitted nudge still contains unresolved \$CLAUDE_PROJECT_DIR" || pass "no unresolved \$CLAUDE_PROJECT_DIR in nudge"
 
 echo "── fresh heartbeat suppresses re-arming; empty queue → silent ──"
 date -u +%s > "$SD/a2a-queue-watch.heartbeat"
