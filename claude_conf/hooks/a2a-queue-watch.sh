@@ -15,22 +15,24 @@
 # CHEAP IDLE PATH: a new arrival is detected by NEW FILENAME — classify-inbound creates each
 # item file already `queued`, so the steady state is just three directory listings per tick;
 # jq runs only when a file is genuinely new. CROSS-WATCHER DEDUP: many sessions may each arm a
-# watcher; an atomic per-id claim (mkdir under a2a-queue-watch-notified/) guarantees a new id
-# wakes EXACTLY ONE session, not all of them. A heartbeat file lets the SessionStart hook keep
-# normally ONE watcher live (it only arms a new one when the heartbeat goes stale).
+# watcher; an atomic per-id claim (mkdir under a2a-queue-watch-notified/, keyed <scope>-<id> so
+# a peer-supplied id in one queue cannot suppress a same-id item in another) guarantees a new
+# id wakes EXACTLY ONE session, not all of them. A heartbeat file lets the SessionStart hook
+# keep normally ONE watcher live (it only arms a new one when the heartbeat goes stale).
+#
+# Requires bash 4+ (associative array), as sibling hooks (serena-reaper.sh) already do.
 set -uo pipefail
 
 WATCH_HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo .)"
 . "$WATCH_HOOK_DIR/state-dir.sh" 2>/dev/null || STATE_DIR="/tmp/claude"
 
-INTERVAL="${A2A_QUEUE_WATCH_INTERVAL:-3}"; case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=3;; esac
+INTERVAL="${A2A_QUEUE_WATCH_INTERVAL:-3}"; case "$INTERVAL" in ''|0|*[!0-9]*) INTERVAL=3;; esac
 WI_DIR="$STATE_DIR/agent-workitems"
 CE_DIR="$STATE_DIR/agent-consult-events"
 TE_DIR="$STATE_DIR/agent-team-events"
 NOTIFIED="$STATE_DIR/a2a-queue-watch-notified"
 HB="$STATE_DIR/a2a-queue-watch.heartbeat"
 mkdir -p "$NOTIFIED" 2>/dev/null || true
-# Reap dedup markers older than a day so the claim tree cannot grow without bound.
 find "$NOTIFIED" -maxdepth 1 -type d -mmin +1440 -exec rm -rf {} + 2>/dev/null || true
 
 declare -A SEEN   # filenames already examined by THIS process → jq only genuinely-new files
@@ -48,8 +50,8 @@ _prime() {
 }
 _prime
 
-_scan() {  # <dir> <label> <skill-hint>
-  local d="$1" label="$2" hint="$3" f id
+_scan() {  # <dir> <scope> <label> <skill-hint>
+  local d="$1" scope="$2" label="$3" hint="$4" f id
   [ -d "$d" ] || return 0
   for f in "$d"/*.json; do
     [ -e "$f" ] || continue
@@ -57,17 +59,25 @@ _scan() {  # <dir> <label> <skill-hint>
     SEEN["$f"]=1
     _is_queued "$f" || continue            # only newly-QUEUED items
     id="$(basename "$f" .json)"
-    # First watcher to claim the id emits; the rest stay quiet (one wake per new id).
-    if mkdir "$NOTIFIED/$id" 2>/dev/null; then
+    # First watcher to claim the scope-keyed id emits; the rest stay quiet (one wake per id).
+    if mkdir "$NOTIFIED/$scope-$id" 2>/dev/null; then
       printf 'A2A: new authorized %s queued (id %s) → run %s now\n' "$label" "$id" "$hint"
     fi
   done
 }
 
+TICK=0
 while :; do
   date -u +%s > "$HB" 2>/dev/null || true   # heartbeat: proves a watcher is live (SessionStart reads this)
-  _scan "$WI_DIR" "WORK request" "/process-agent-requests"
-  _scan "$CE_DIR" "CONSULT"      "/coordinator-advise"
-  _scan "$TE_DIR" "TEAM event"   "/team-work"
+  _scan "$WI_DIR" "wi" "WORK request" "/process-agent-requests"
+  _scan "$CE_DIR" "ce" "CONSULT"      "/coordinator-advise"
+  _scan "$TE_DIR" "te" "TEAM event"   "/team-work"
+  # Periodic housekeeping for a long-lived watcher (~every 300 ticks): reap old dedup claims
+  # and drop SEEN entries whose file is gone, so neither grows without bound over days.
+  TICK=$((TICK+1))
+  if [ $(( TICK % 300 )) -eq 0 ]; then
+    find "$NOTIFIED" -maxdepth 1 -type d -mmin +1440 -exec rm -rf {} + 2>/dev/null || true
+    for k in "${!SEEN[@]}"; do [ -e "$k" ] || unset "SEEN[$k]"; done
+  fi
   sleep "$INTERVAL"
 done

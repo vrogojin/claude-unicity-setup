@@ -9,13 +9,12 @@
 #     QUEUES: authorized 1:1 requests → agent-workitems/*.json; coordination verbs →
 #     agent-consult-events/*.json (consults) + agent-team-events/*.json (team) (QUEUE).
 #   • check-diagnostics.sh (Stop) BLOCKS idle while any authorized item is `queued`
-#     — §4 work-items → /process-agent-requests, §5 consults/team → /coordinator-advise.
+#     — work-items → /process-agent-requests, consults/team → /coordinator-advise.
 # What is missing is the IN-SESSION proactive lever: a hook CANNOT itself spawn the
 # capability-scoped processor subagent (only the model can, via the skills), so a busy
-# session would leave queued peer requests untouched until it tried to Stop. The incident
-# that motivated this: two authorized CONSULTS sat unserviced (one 3 days old) because only
-# the work-item queue was ever drained — the coordination queue was not. So this hook covers
-# BOTH queues.
+# session would leave queued peer requests untouched until it tried to Stop. The consult
+# queue is the one that bit in the field: it is serviced by /coordinator-advise, NOT
+# /process-agent-requests, so a DM-only drain left consults sitting. This hook covers BOTH.
 #
 # TWO LEVERS, both zero-idle-cost:
 #   (i)  DRAIN-ONCE — if anything is queued at SessionStart, nudge the session to run
@@ -23,8 +22,8 @@
 #   (ii) ARM AN EVENT-DRIVEN WATCHER — nudge the session to arm a persistent Monitor over
 #        a2a-queue-watch.sh, which wakes the session ONLY when a NEW authorized item appears.
 #        This is deliberately NOT an unconditional `/loop` interval that runs a skill every N
-#        minutes regardless of queue state — the owner rejected that (burns tokens + clutters
-#        the console while idle). The watcher costs nothing while the queue is quiet.
+#        minutes regardless of queue state — that burns tokens + clutters the console while
+#        idle. The watcher costs nothing while the queue is quiet.
 #
 # IT NUDGES ONLY. It never dispatches, never authorizes, never widens scope. DEFAULT-DENY and
 # the capability-scoped processor remain the sole executors; destructive/outward asks
@@ -65,48 +64,48 @@ PROJ="${CLAUDE_PROJECT_DIR:-}"
 
 # Per-session debounce: arm each distinct session ONCE. SessionStart also fires on
 # resume/clear/compact of the SAME session — do not re-inject the nudge every time.
+# If session_id is ever absent the fallback is per-INVOCATION, so debounce is best-effort then.
 SID="$(_arm_field '.session_id')"; [ -n "$SID" ] || SID="anon-$$"
 SID_SAFE="$(printf '%s' "$SID" | tr -c 'A-Za-z0-9._-' '_')"
 ARM_MARK_DIR="$STATE_DIR/agent-session-arm"
 mkdir -p "$ARM_MARK_DIR" 2>/dev/null || true
-find "$ARM_MARK_DIR" -type f -mmin +1440 -delete 2>/dev/null || true   # bounded
-ARM_MARK="$ARM_MARK_DIR/$SID_SAFE.mark"
-[ -f "$ARM_MARK" ] && exit 0
-: > "$ARM_MARK" 2>/dev/null || true
+find "$ARM_MARK_DIR" -maxdepth 1 -type d -mmin +1440 -exec rm -rf {} + 2>/dev/null || true   # bounded
+# Atomic once-per-session claim — mkdir can't race the way test-then-write can.
+mkdir "$ARM_MARK_DIR/$SID_SAFE.d" 2>/dev/null || exit 0
 
 # --- Best-effort: classify any leftover inbound so counts are fresh (idempotent, bounded).
 if [ -f "$ARM_HOOK_DIR/classify-inbound.sh" ]; then
-  timeout 8 bash "$ARM_HOOK_DIR/classify-inbound.sh" >/dev/null 2>&1 || true
+  timeout 6 bash "$ARM_HOOK_DIR/classify-inbound.sh" >/dev/null 2>&1 || true
 fi
 
 # --- Count queued AUTHORIZED items (COUNTS ONLY — never bodies). ---
 # Only status=="queued" is counted; done/skipped/quarantined are ignored. classify-inbound
 # only ever enqueues items for peers the registry marks `authorized`, so a queued item is by
 # construction an authorized peer's request (DEFAULT-DENY is enforced upstream, not here).
-_count_queued() {  # <dir> [<space-separated allowed kinds; empty kind is always allowed>]
-  local dir="$1" allowed="${2:-}" n=0 f st k
+_count_queued() {  # <dir>
+  local dir="$1" n=0 f st
   [ -d "$dir" ] || { echo 0; return; }
   for f in "$dir"/*.json; do
     [ -e "$f" ] || continue
     st="$(jq -r '.status // "queued"' "$f" 2>/dev/null)"; [ "$st" = "queued" ] || continue
-    if [ -n "$allowed" ]; then
-      k="$(jq -r '.kind // ""' "$f" 2>/dev/null)"
-      if [ -n "$k" ] && [ "$k" != "null" ]; then
-        case " $allowed " in *" $k "*) ;; *) continue;; esac
-      fi
-    fi
     n=$((n+1))
   done
   echo "$n"
 }
 WI="$(_count_queued "$STATE_DIR/agent-workitems")"
-CE="$(_count_queued "$STATE_DIR/agent-consult-events" "consult.request consult.open")"
+# No kind filter — mirror check-diagnostics' consult gate, which counts EVERY queued event in
+# this dir (consult.request / conflict.open / split.propose / area.claim / peer.announce …).
+CE="$(_count_queued "$STATE_DIR/agent-consult-events")"
 TE="$(_count_queued "$STATE_DIR/agent-team-events")"
-# Open consult THREADS tracked by remote-coord (beyond the event queue) — mirror the Stop-gate
-# §5 source so coverage matches. Best-effort + bounded; 0 if the lib is absent or slow.
+# Open consult THREADS tracked by remote-coord (beyond the per-event queue). Best-effort +
+# bounded; 0 if the lib is absent or slow. NOTE: this covers the QUEUED INBOUND coordination
+# sources (consult/team events + open consults). The Stop-gate ADDITIONALLY gates DERIVED
+# coordination state (who's-on-this / splits / conflicts / unapplied commitments); those are
+# advisory/TTL-dismissable and are intentionally NOT re-counted here (each is a separate
+# remote-coord subprocess, too costly for every SessionStart) — the Stop-gate is their backstop.
 RC_OPEN=0
 if [ -f "$ARM_HOOK_DIR/remote-coord.sh" ]; then
-  RC_OPEN="$(timeout 6 bash "$ARM_HOOK_DIR/remote-coord.sh" consult-list open 2>/dev/null | jq 'length' 2>/dev/null || echo 0)"
+  RC_OPEN="$(timeout 4 bash "$ARM_HOOK_DIR/remote-coord.sh" consult-list open 2>/dev/null | jq 'length' 2>/dev/null || echo 0)"
   case "$RC_OPEN" in ''|*[!0-9]*) RC_OPEN=0;; esac
 fi
 COORD=$(( CE + TE + RC_OPEN ))
@@ -141,7 +140,7 @@ if [ "$WI" -gt 0 ] 2>/dev/null; then
   _add "• ${WI} authorized 1:1 agent request(s) QUEUED now → run /process-agent-requests (each handed to a capability-scoped processor)."
 fi
 if [ "$COORD" -gt 0 ] 2>/dev/null; then
-  _add "• ${COORD} coordination item(s) QUEUED (consults/claims/splits + team events) → run /coordinator-advise, and /team-work for team events/invites. Do NOT let consults sit — they are serviced by /coordinator-advise, NOT /process-agent-requests."
+  _add "• ${COORD} coordination item(s) QUEUED (consults/claims/splits/conflicts + team events) → run /coordinator-advise, and /team-work for team events/invites. Do NOT let consults sit — they are serviced by /coordinator-advise, NOT /process-agent-requests."
 fi
 if [ "$WATCH_ARM" = "1" ]; then
   _add "• ARM THE EVENT-DRIVEN WATCHER so you are woken ONLY when a NEW authorized item appears (no idle polling): use the Monitor tool, persistent:true, command \"bash \$CLAUDE_PROJECT_DIR/.claude/hooks/a2a-queue-watch.sh\", description \"A2A queue: new authorized items\". Each emitted line names the queue + the skill to run — on a WORK line run /process-agent-requests, on a CONSULT line run /coordinator-advise, on a TEAM line run /team-work. Do NOT set up an unconditional /loop that runs a skill on a timer regardless of queue state — the watcher already fires only on real arrivals."

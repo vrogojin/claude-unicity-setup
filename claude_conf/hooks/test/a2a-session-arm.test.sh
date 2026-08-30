@@ -54,14 +54,15 @@ echo "$OUT" | jq -e '.hookSpecificOutput.hookEventName=="SessionStart"' >/dev/nu
 echo "── per-session debounce (same session_id → no re-nag) ──"
 OUT2="$(run sess-A)"; [ -z "$OUT2" ] && pass "second SessionStart for sess-A is silent" || fail "re-nagged: $OUT2"
 
-echo "── COORDINATION queue is first-class (consult + team) ──"
+echo "── COORDINATION queue is first-class (consult + NON-consult kinds + team) ──"
 rm -f "$SD/agent-workitems/"*.json
 printf '{"id":"c1","status":"queued","kind":"consult.request"}' > "$SD/agent-consult-events/c1.json"
+printf '{"id":"c2","status":"queued","kind":"conflict.open"}'   > "$SD/agent-consult-events/c2.json"
 printf '{"id":"t1","status":"queued"}' > "$SD/agent-team-events/t1.json"
 C3="$(ctx "$(run sess-B)")"
 echo "$C3" | grep -q '/coordinator-advise' && pass "→ /coordinator-advise" || fail "no coordinator nudge: $C3"
 echo "$C3" | grep -q '/team-work'          && pass "→ /team-work"          || fail "no team-work nudge"
-echo "$C3" | grep -q '2 coordination'      && pass "counts consult+team (2)" || fail "coord count wrong: $C3"
+echo "$C3" | grep -q '3 coordination'      && pass "counts ALL queued consult events incl conflict.open (2) + team (1)" || fail "coord count wrong (kind filter regressed?): $C3"
 
 echo "── remote-coord OPEN consults are counted too ──"
 rm -f "$SD/agent-consult-events/"*.json "$SD/agent-team-events/"*.json
@@ -115,7 +116,7 @@ EOF
 chmod +x "$WH"/*.sh
 export A2A_QUEUE_WATCH_INTERVAL=1
 printf '{"id":"w-old","status":"queued"}' > "$WSD/agent-workitems/w-old.json"   # backlog present BEFORE start
-mkdir -p "$WSD/a2a-queue-watch-notified/w-race"                                   # pretend another watcher claimed w-race
+mkdir -p "$WSD/a2a-queue-watch-notified/wi-w-race"                                # pretend another watcher claimed w-race (scope-keyed)
 ( timeout 6 bash "$WH/a2a-queue-watch.sh" > "$WORK/watch.log" 2>/dev/null ) &
 WPID=$!
 sleep 2                                                                           # let it prime the backlog
