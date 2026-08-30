@@ -76,13 +76,20 @@ non-secret `reason`, `remediation[]`. **No token/secret value is ever a field.**
   "tunnel_name": "ingress-track-42", "reason": "…" }
 ```
 
-`status`: `planned` (plan preview) · `ok` · `exists` (idempotent hit) · `not_found` ·
-`blocked_config` (haproxy: `HAPROXY_HOST` unresolved) · `blocked_scope` (tunnel: no usable
-Cloudflare credential — never faked) · `blocked_confirm` (`--apply` without
-`INGRESS_APPLY_CONFIRM=1`) · `partial` · `invalid` · `error` (rolled back).
+`status`: `planned` (plan preview) · `ok` · `exists` (idempotent no-op) · `changed`
+(haproxy: an existing route was repointed to a new target) · `not_found` · `blocked_config`
+(haproxy: `HAPROXY_HOST` unresolved) · `blocked_scope` (tunnel: no usable Cloudflare
+credential — never faked) · `blocked_confirm` (`--apply` without `INGRESS_APPLY_CONFIRM=1`) ·
+`partial` · `invalid` · `error` (rolled back).
 
-**Idempotent** — re-provisioning an existing hostname returns it (`exists`), never a
-duplicate. `deprovision` is idempotent too (`not_found` when already gone).
+**Idempotent** — re-provisioning an existing hostname to the SAME target returns `exists`,
+never a duplicate; to a DIFFERENT target it returns `changed` (and `--plan` says "would
+REPOINT …"), so a live public route is never silently retargeted. `deprovision` is
+idempotent too (`not_found` when already gone). The haproxy **target pin** also rejects IP
+literals / numeric hosts (only a real container NAME on `haproxy-net` is accepted), closing
+an SSRF/open-proxy vector (arbitrary IP, docker gateway, or cloud metadata endpoint) under
+the owned public hostname. All API calls are timeout-bounded so a down dependency can never
+hang the unattended `--plan`.
 
 ## haproxy mode — what `--apply` does (no secret)
 

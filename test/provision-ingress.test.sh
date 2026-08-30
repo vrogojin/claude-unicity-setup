@@ -52,14 +52,17 @@ chmod +x "$STUB/curl-haproxy"
 # use a tiny wrapper that records the domain from --data before delegating.
 cat > "$STUB/curl-haproxy-post" <<'EOF'
 #!/usr/bin/env bash
+# haproxy Registration API stub. Stores the POST body per domain; serves it on GET (body)
+# or a code on GET -w; honors DELETE. Ignores leading --connect-timeout/--max-time flags.
 set -u
-data=""; method=GET; url=""
-while [ $# -gt 0 ]; do case "$1" in -X) method="$2"; shift;; --data) data="$2"; shift;; http*://*) url="$1";; esac; shift; done
+data=""; method=GET; url=""; want_code=0
+while [ $# -gt 0 ]; do case "$1" in -X) method="$2"; shift;; --data) data="$2"; shift;; -w) want_code=1;; http*://*) url="$1";; esac; shift; done
 S="${HP_STATE:?}"
-if [ "$method" = POST ]; then d="$(printf '%s' "$data" | jq -r .domain)"; : > "$S/$d"; printf '200'; exit 0; fi
+if [ "$method" = POST ]; then d="$(printf '%s' "$data" | jq -r .domain)"; printf '%s' "$data" > "$S/$d"; printf '200'; exit 0; fi
 dom="${url##*/v1/backends/}"
 case "$method" in
-  GET) { [ -f "$S/$dom" ] && printf '200' || printf '404'; };;
+  GET) if [ "$want_code" = 1 ]; then { [ -f "$S/$dom" ] && printf '200' || printf '404'; }
+       else { [ -f "$S/$dom" ] && cat "$S/$dom" || exit 22; }; fi;;
   DELETE) if [ -f "$S/$dom" ]; then rm -f "$S/$dom"; printf '200'; else printf '404'; fi;;
 esac
 EOF
@@ -79,8 +82,13 @@ OUT_A="$(printf '%s' "$REQ_HP" | hp provision --apply)"
 chk "haproxy apply → ok"                       "[ \"\$(printf '%s' \"\$OUT_A\" | j .status)\" = 'ok' ]"
 chk "haproxy registered the domain"           "[ -f \"$HP_STATE/track-42.staging.concierge-dev.app\" ]"
 OUT_I="$(printf '%s' "$REQ_HP" | hp provision --apply)"
-chk "haproxy re-provision → exists"           "[ \"\$(printf '%s' \"\$OUT_I\" | j .status)\" = 'exists' ]"
+chk "haproxy re-provision same target → exists" "[ \"\$(printf '%s' \"\$OUT_I\" | j .status)\" = 'exists' ]"
 chk "still exactly one registration"          "[ \"\$(ls \"$HP_STATE\" | wc -l | tr -d ' ')\" = '1' ]"
+# retarget the SAME hostname to a DIFFERENT container → must be reported as 'changed', not a no-op
+OUT_C="$(printf '{\"hostname\":\"track-42.staging.concierge-dev.app\",\"target\":\"track42-web:9090\"}' | hp provision --apply)"
+chk "haproxy retarget → changed (not silent)"  "[ \"\$(printf '%s' \"\$OUT_C\" | j .status)\" = 'changed' ]"
+OUT_CP="$(printf '{\"hostname\":\"track-42.staging.concierge-dev.app\",\"target\":\"track42-web:7000\"}' | INGRESS_MODE=haproxy INGRESS_HAPROXY_HOST=haproxy-test INGRESS_CURL="$STUB/curl-haproxy-post" INGRESS_PROJECT_DIR="$TMP/noproj" bash "$SH" provision --plan)"
+chk "haproxy plan retarget → planned+REPOINT"  "printf '%s' \"\$OUT_CP\" | jq -e '.status==\"planned\" and (.reason|test(\"REPOINT\"))' >/dev/null"
 OUT_D="$(printf '%s' "$REQ_HP" | hp deprovision --apply)"
 chk "haproxy deprovision → ok"                 "[ \"\$(printf '%s' \"\$OUT_D\" | j .status)\" = 'ok' ]"
 chk "registration removed"                     "[ ! -f \"$HP_STATE/track-42.staging.concierge-dev.app\" ]"
@@ -92,6 +100,12 @@ LB="$(printf '{\"hostname\":\"x.staging.concierge-dev.app\",\"target\":\"127.0.0
 chk "haproxy loopback target → invalid"        "[ \"$LB\" = 'invalid' ]"
 BADC="$(printf '{\"hostname\":\"x.staging.concierge-dev.app\",\"target\":\"bad name:80\"}' | INGRESS_MODE=haproxy INGRESS_HAPROXY_HOST=h bash "$SH" provision --plan | j .status)"
 chk "haproxy invalid container chars → invalid" "[ \"$BADC\" = 'invalid' ]"
+# SSRF/open-proxy guard: an IP literal / numeric host must NEVER be accepted as a container
+ipchk(){ printf '{"hostname":"x.staging.concierge-dev.app","target":"%s"}' "$1" | INGRESS_MODE=haproxy INGRESS_HAPROXY_HOST=h bash "$SH" provision --plan | j .status; }
+chk "haproxy public IP target → invalid"       "[ \"\$(ipchk '8.8.8.8:80')\" = 'invalid' ]"
+chk "haproxy metadata IP target → invalid"     "[ \"\$(ipchk '169.254.169.254:80')\" = 'invalid' ]"
+chk "haproxy docker-gw IP target → invalid"    "[ \"\$(ipchk '172.17.0.1:80')\" = 'invalid' ]"
+chk "haproxy numeric host → invalid"           "[ \"\$(ipchk '2130706433:80')\" = 'invalid' ]"
 # zone-pin under staging.concierge-dev.app
 WZ="$(printf '{\"hostname\":\"x.evil.net\",\"target\":\"c:80\"}' | INGRESS_MODE=haproxy INGRESS_HAPROXY_HOST=h bash "$SH" provision --plan | j .status)"
 chk "haproxy wrong zone → invalid"             "[ \"$WZ\" = 'invalid' ]"

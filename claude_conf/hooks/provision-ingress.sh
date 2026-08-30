@@ -95,7 +95,9 @@ INGRESS_SUPERVISOR="${INGRESS_SUPERVISOR:-systemd}"    # systemd|none
 _ts()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
 _log() { printf '%s [provision-ingress] %s\n' "$(_ts)" "$*" >&2; }
 _have() { command -v "$1" >/dev/null 2>&1; }
-_curl() { "${INGRESS_CURL:-curl}" "$@"; }             # curl wrapper (stub-able in tests)
+# curl wrapper (stub-able). ALWAYS bounded — an unreachable HAPROXY_HOST/Cloudflare must
+# never hang --plan, which the unattended /process-agent-requests processor runs per request.
+_curl() { "${INGRESS_CURL:-curl}" --connect-timeout "${INGRESS_CURL_CONNECT_TIMEOUT:-3}" --max-time "${INGRESS_CURL_MAX_TIME:-8}" "$@"; }
 _cf()   { "$CLOUDFLARED_BIN" "$@"; }                  # cloudflared wrapper (stub-able)
 
 # --- JSON emit: single object to stdout, then exit. A token/secret value is never a field.
@@ -174,11 +176,20 @@ _derive() {
   [ "$TARGET_PORT" -ge 1 ] && [ "$TARGET_PORT" -le 65535 ] || return 13
 
   if [ "$INGRESS_MODE" = haproxy ]; then
-    # haproxy routes to a CONTAINER on haproxy-net BY NAME — loopback is unreachable.
+    # haproxy routes to a CONTAINER on haproxy-net BY NAME. The target must be a real
+    # container NAME — never loopback, and never an IP literal / numeric host. Rejecting
+    # IPs closes an SSRF/open-proxy hole: without it a peer could point our owned public
+    # wildcard hostname at an arbitrary internet IP, the docker bridge gateway
+    # (172.17.0.1 → host services), or a cloud metadata endpoint (169.254.169.254).
     case "$TARGET_HOST" in
-      127.0.0.1|localhost|::1|"") return 14;;                 # not a container
-      *[!a-zA-Z0-9_.-]* ) return 14;;                         # invalid docker name chars
+      127.0.0.1|localhost|::1|"") return 14;;                 # loopback / empty
+      *[!a-zA-Z0-9_.-]* ) return 14;;                         # invalid docker name chars (also bars [] : )
       [!a-zA-Z0-9]* ) return 14;;                             # must start alnum
+    esac
+    # Only digits and dots ⇒ an IPv4 literal or a numeric host, never a container name.
+    case "$TARGET_HOST" in
+      *[!0-9.]* ) : ;;                                        # has a name char → OK
+      * ) return 16;;                                         # all digits/dots → IP/numeric → reject
     esac
     BACKEND_DESC="$TARGET_HOST:$TARGET_PORT"
     # https_port: request > config default; empty/0/"null" → HTTP-only (null in the API).
@@ -204,28 +215,40 @@ _validate_or_die() {
     13) _emit invalid "target port must be an integer 1-65535; got '${TARGET##*:}'"; exit 0;;
     14) _emit invalid "haproxy-mode target must be a container name:port on haproxy-net (not loopback); got '$TARGET_HOST'"; exit 0;;
     15) _emit invalid "https_port must be an integer or null; got '$HTTPS_PORT'"; exit 0;;
+    16) _emit invalid "haproxy-mode target must be a container NAME on haproxy-net, not an IP address or numeric host; got '$TARGET_HOST'"; exit 0;;
   esac
 }
 
 # ========================================================================================
 # HAPROXY MODE (primary) — register/deregister with the shared Registration API. No secret.
 # ========================================================================================
+_urlenc() { jq -rn --arg s "$1" '$s|@uri'; }
 _haproxy_base() {  # the Registration API base URL, or empty if host unresolved
   local host="$INGRESS_HAPROXY_HOST"
   if [ -z "$host" ] && [ -f "$PROJECT_DIR/.env" ]; then
-    host="$(sed -n 's/^[[:space:]]*HAPROXY_HOST[[:space:]]*=[[:space:]]*//p' "$PROJECT_DIR/.env" | tail -1 | tr -d '"'"'"'')"
+    # strip a trailing inline comment + surrounding quotes/space (config hygiene).
+    host="$(sed -n 's/^[[:space:]]*HAPROXY_HOST[[:space:]]*=[[:space:]]*//p' "$PROJECT_DIR/.env" \
+      | tail -1 | sed 's/[[:space:]]*#.*$//; s/[[:space:]]*$//' | tr -d '"'"'"'')"
   fi
   [ -n "$host" ] || return 1
   printf 'http://%s:%s/v1/backends' "$host" "$INGRESS_HAPROXY_API_PORT"
 }
-# GET the current registration for the domain (best-effort; some API builds lack GET).
+# Existence probe (HTTP code; best-effort — some API builds lack GET).
 _haproxy_exists() {
   local base; base="$(_haproxy_base)" || return 2
-  local code
-  code="$(_curl -fsS -o /dev/null -w '%{http_code}' "$base/$(_urlenc "$HOSTNAME_REQ")" 2>/dev/null)" || return 1
+  local code; code="$(_curl -fsS -o /dev/null -w '%{http_code}' "$base/$(_urlenc "$HOSTNAME_REQ")" 2>/dev/null)" || return 1
   [ "$code" = 200 ]
 }
-_urlenc() { jq -rn --arg s "$1" '$s|@uri'; }
+# The CURRENTLY-registered backend "<container>:<http_port>" for the domain, or empty if
+# none/unreadable. Lets us detect a RETARGET (existing route repointed) vs a true no-op.
+_haproxy_backend_now() {
+  local base; base="$(_haproxy_base)" || return 1
+  _curl -fsS "$base/$(_urlenc "$HOSTNAME_REQ")" 2>/dev/null | jq -r '
+    if type=="object" then
+      ((.container // .backend // "") ) as $c | (.http_port // .port // empty) as $p |
+      (if ($c|length)>0 then $c + (if $p then ":"+($p|tostring) else "" end) else "" end)
+    else "" end' 2>/dev/null
+}
 
 _plan_haproxy() {
   local base; if ! base="$(_haproxy_base)"; then
@@ -233,9 +256,14 @@ _plan_haproxy() {
       "$(jq -cn '["Set HAPROXY_HOST to the shared haproxy container/host reachable on the :8404 Registration API."]')"
     return
   fi
-  if _haproxy_exists 2>/dev/null; then
-    _emit exists "domain '$HOSTNAME_REQ' is already registered with haproxy; provision would be a no-op (idempotent)"
+  local cur; cur="$(_haproxy_backend_now)"
+  if [ -n "$cur" ]; then
+    if [ "$cur" = "$BACKEND_DESC" ]; then _emit exists "'$HOSTNAME_REQ' is already registered to the SAME target $BACKEND_DESC; provision would be a no-op"
+    else _emit planned "would REPOINT '$HOSTNAME_REQ' from $cur to $BACKEND_DESC — an existing public route would change (not a no-op)"; fi
     return
+  fi
+  if _haproxy_exists 2>/dev/null; then
+    _emit planned "a registration for '$HOSTNAME_REQ' already exists (current target unreadable); apply would (re)point it to $BACKEND_DESC"; return
   fi
   _emit planned "would register '$HOSTNAME_REQ' -> $BACKEND_DESC (https_port=${HTTPS_PORT:-null}) with the haproxy Registration API at $base"
 }
@@ -245,16 +273,19 @@ _apply_haproxy() {
       "$(jq -cn '["Set HAPROXY_HOST (env / project .env / .ingress.haproxy_host)."]')"
     return
   fi
-  local existed=0; _haproxy_exists 2>/dev/null && existed=1
+  local cur existed=0; cur="$(_haproxy_backend_now)"; [ -n "$cur" ] && existed=1
+  [ "$existed" = 0 ] && _haproxy_exists 2>/dev/null && existed=1   # exists but body unreadable
   local hp; if [ -n "$HTTPS_PORT" ]; then hp="$HTTPS_PORT"; else hp="null"; fi
   local body; body="$(jq -cn --arg d "$HOSTNAME_REQ" --arg c "$TARGET_HOST" \
       --argjson http "$TARGET_PORT" --argjson https "$hp" \
       '{domain:$d, container:$c, http_port:$http, https_port:$https}')"
-  local out code
-  out="$(_curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' \
-      "$base" --data "$body" 2>&1)"; code="$out"
+  local code
+  code="$(_curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' \
+      "$base" --data "$body" 2>/dev/null)"
   case "$code" in
-    2??) if [ "$existed" = 1 ]; then _emit exists "domain '$HOSTNAME_REQ' already registered; re-POST is idempotent (no duplicate)";
+    2??) if [ "$existed" = 1 ]; then
+           if [ -n "$cur" ] && [ "$cur" = "$BACKEND_DESC" ]; then _emit exists "'$HOSTNAME_REQ' already registered to $BACKEND_DESC; no change"
+           else _emit changed "re-pointed '$HOSTNAME_REQ' to $BACKEND_DESC via haproxy${cur:+ (was $cur)}"; fi
          else _emit ok "registered '$HOSTNAME_REQ' -> $BACKEND_DESC via haproxy (https_port=${HTTPS_PORT:-null})"; fi;;
     000|"") _emit error "haproxy Registration API unreachable at $base (curl failed)";;
     *) _emit error "haproxy Registration API returned HTTP $code registering '$HOSTNAME_REQ'";;
