@@ -1,16 +1,12 @@
 #!/usr/bin/env bash
 # provision-ingress.test.sh — hermetic contract test for the provision-ingress verb backend.
-#
-# Proves, with cloudflared + the Cloudflare API fully STUBBED (no network, no real tunnels):
-#   • the JSON response contract: always {hostname, connector_token_path, tunnel_name, status}
-#   • input validation: zone-escape, non-loopback target, bad port, non-JSON → status:invalid
-#   • deterministic + idempotent tunnel-name derivation
-#   • the KNOWN scope gap → status:blocked_scope with remediation (never faked success)
-#   • idempotency: an existing tunnel+token → status:exists (no duplicate)
-#   • apply provisions end-to-end when the create path is available (stubbed cert.pem)
-#   • the connector TOKEN VALUE never appears in the response; token file is 0600
-#   • deprovision removes tunnel + CNAME + token file
-#
+# Covers BOTH modes with all network fully STUBBED (no real haproxy, tunnels, or Cloudflare):
+#   A. haproxy mode (PRIMARY) — Registration API register/deregister, idempotency,
+#      target-pin (container not loopback), zone-pin, blocked_config, response shape.
+#   B. tunnel mode (FALLBACK) — scope gap (blocked_scope), CLI + API backends, Option-A
+#      token auto-read from cloudflare.ini, ingress-rule config, rollback, token never
+#      emitted, deprovision, idempotency.
+#   C. validation (both modes) · D. owner-confirm gate · E. per-project config.
 # Run:  bash test/provision-ingress.test.sh
 set -uo pipefail
 
@@ -18,240 +14,239 @@ FAIL=0
 pass() { printf '  \033[32mPASS\033[0m %s\n' "$1"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=1; }
 chk()  { if eval "$2"; then pass "$1"; else fail "$1 — [$2]"; fi; }
+j()    { jq -r "$1"; }
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SH="$REPO/claude_conf/hooks/provision-ingress.sh"
-
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/provingress.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
+STUB="$TMP/bin"; mkdir -p "$STUB"
 
-# --- Hermetic env ------------------------------------------------------------------------
+# ========================================================================================
+echo "== A. haproxy mode (primary) =="
+export HP_STATE="$TMP/hpstate"; mkdir -p "$HP_STATE"
+cat > "$STUB/curl-haproxy" <<'EOF'
+#!/usr/bin/env bash
+# Stub of the haproxy Registration API. Honors -X, --data, and -w '%{http_code}' (prints code).
+set -u
+method=GET; url=""; want_code=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -X) method="$2"; shift;;
+    -w) want_code=1;;
+    --data) shift;;
+    http*://*) url="$1";;
+  esac; shift
+done
+S="${HP_STATE:?}"; path="${url#*:*/}"; dom="${url##*/v1/backends/}"; [ "$dom" = "$url" ] && dom=""
+code=200
+case "$method" in
+  GET)    [ -n "$dom" ] && { [ -f "$S/$dom" ] && code=200 || code=404; };;
+  POST)   : > "$S/${dom:-_last}";;  # POST has no domain in path; body carries it — track via _mark below
+  DELETE) if [ -n "$dom" ] && [ -f "$S/$dom" ]; then rm -f "$S/$dom"; code=200; else code=404; fi;;
+esac
+printf '%s' "$code"
+EOF
+chmod +x "$STUB/curl-haproxy"
+# The POST body carries the domain; a stub can't read the fd body from -w mode easily, so
+# use a tiny wrapper that records the domain from --data before delegating.
+cat > "$STUB/curl-haproxy-post" <<'EOF'
+#!/usr/bin/env bash
+set -u
+data=""; method=GET; url=""
+while [ $# -gt 0 ]; do case "$1" in -X) method="$2"; shift;; --data) data="$2"; shift;; http*://*) url="$1";; esac; shift; done
+S="${HP_STATE:?}"
+if [ "$method" = POST ]; then d="$(printf '%s' "$data" | jq -r .domain)"; : > "$S/$d"; printf '200'; exit 0; fi
+dom="${url##*/v1/backends/}"
+case "$method" in
+  GET) { [ -f "$S/$dom" ] && printf '200' || printf '404'; };;
+  DELETE) if [ -f "$S/$dom" ]; then rm -f "$S/$dom"; printf '200'; else printf '404'; fi;;
+esac
+EOF
+chmod +x "$STUB/curl-haproxy-post"
+
+hp() { INGRESS_MODE=haproxy INGRESS_HAPROXY_HOST=haproxy-test INGRESS_CURL="$STUB/curl-haproxy-post" \
+         INGRESS_PROJECT_DIR="$TMP/noproj" INGRESS_APPLY_CONFIRM=1 bash "$SH" "$@"; }
+REQ_HP='{"hostname":"track-42.staging.concierge-dev.app","target":"track42-web:8080","https_port":443,"purpose":"spawned track"}'
+
+OUT="$(printf '%s' "$REQ_HP" | INGRESS_MODE=haproxy INGRESS_HAPROXY_HOST=haproxy-test INGRESS_CURL="$STUB/curl-haproxy-post" INGRESS_PROJECT_DIR="$TMP/noproj" bash "$SH" provision --plan)"
+chk "haproxy plan → planned"                 "[ \"\$(printf '%s' \"\$OUT\" | j .status)\" = 'planned' ]"
+chk "response mode=haproxy"                   "[ \"\$(printf '%s' \"\$OUT\" | j .mode)\" = 'haproxy' ]"
+chk "response backend=container:port"         "[ \"\$(printf '%s' \"\$OUT\" | j .backend)\" = 'track42-web:8080' ]"
+chk "no tunnel/token fields leak a value"     "[ \"\$(printf '%s' \"\$OUT\" | j .connector_token_path)\" = '' ]"
+
+OUT_A="$(printf '%s' "$REQ_HP" | hp provision --apply)"
+chk "haproxy apply → ok"                       "[ \"\$(printf '%s' \"\$OUT_A\" | j .status)\" = 'ok' ]"
+chk "haproxy registered the domain"           "[ -f \"$HP_STATE/track-42.staging.concierge-dev.app\" ]"
+OUT_I="$(printf '%s' "$REQ_HP" | hp provision --apply)"
+chk "haproxy re-provision → exists"           "[ \"\$(printf '%s' \"\$OUT_I\" | j .status)\" = 'exists' ]"
+chk "still exactly one registration"          "[ \"\$(ls \"$HP_STATE\" | wc -l | tr -d ' ')\" = '1' ]"
+OUT_D="$(printf '%s' "$REQ_HP" | hp deprovision --apply)"
+chk "haproxy deprovision → ok"                 "[ \"\$(printf '%s' \"\$OUT_D\" | j .status)\" = 'ok' ]"
+chk "registration removed"                     "[ ! -f \"$HP_STATE/track-42.staging.concierge-dev.app\" ]"
+OUT_D2="$(printf '%s' "$REQ_HP" | hp deprovision --apply)"
+chk "haproxy deprovision again → not_found"    "[ \"\$(printf '%s' \"\$OUT_D2\" | j .status)\" = 'not_found' ]"
+
+# target-pin: haproxy rejects loopback (unreachable from the proxy container)
+LB="$(printf '{\"hostname\":\"x.staging.concierge-dev.app\",\"target\":\"127.0.0.1:8080\"}' | INGRESS_MODE=haproxy INGRESS_HAPROXY_HOST=h bash "$SH" provision --plan | j .status)"
+chk "haproxy loopback target → invalid"        "[ \"$LB\" = 'invalid' ]"
+BADC="$(printf '{\"hostname\":\"x.staging.concierge-dev.app\",\"target\":\"bad name:80\"}' | INGRESS_MODE=haproxy INGRESS_HAPROXY_HOST=h bash "$SH" provision --plan | j .status)"
+chk "haproxy invalid container chars → invalid" "[ \"$BADC\" = 'invalid' ]"
+# zone-pin under staging.concierge-dev.app
+WZ="$(printf '{\"hostname\":\"x.evil.net\",\"target\":\"c:80\"}' | INGRESS_MODE=haproxy INGRESS_HAPROXY_HOST=h bash "$SH" provision --plan | j .status)"
+chk "haproxy wrong zone → invalid"             "[ \"$WZ\" = 'invalid' ]"
+# blocked_config when HAPROXY_HOST unresolvable
+BC="$(printf '%s' "$REQ_HP" | env -u HAPROXY_HOST INGRESS_MODE=haproxy INGRESS_HAPROXY_HOST= INGRESS_PROJECT_DIR=$TMP/noproj bash "$SH" provision --plan | j .status)"
+chk "haproxy no HAPROXY_HOST → blocked_config"  "[ \"$BC\" = 'blocked_config' ]"
+# confirm gate applies in haproxy mode too
+NC="$(printf '%s' "$REQ_HP" | env -u INGRESS_APPLY_CONFIRM INGRESS_MODE=haproxy INGRESS_HAPROXY_HOST=haproxy-test INGRESS_CURL="$STUB/curl-haproxy-post" INGRESS_PROJECT_DIR=$TMP/noproj bash "$SH" provision --apply | j .status)"
+chk "haproxy unconfirmed apply → blocked_confirm" "[ \"$NC\" = 'blocked_confirm' ]"
+chk "haproxy needs ZERO cloudflare/secret"     "printf '%s' \"\$OUT_A\" | jq -e '.mode==\"haproxy\" and .connector_token_path==\"\" and (.reason|test(\"[Cc]loudflare\")|not)' >/dev/null"
+
+# ========================================================================================
+echo "== B. tunnel mode (fallback) =="
+export INGRESS_MODE="tunnel"
 export INGRESS_PROJECT_DIR="$TMP/proj"
 export INGRESS_SECRETS_DIR="$TMP/proj/.secrets"
 export INGRESS_TOKEN_DIR="$TMP/proj/.secrets/ingress"
 export INGRESS_CF_INI="$TMP/proj/.secrets/staging-tls/cloudflare.ini"
 export INGRESS_ZONE="concierge-dev.app"
-export INGRESS_DNS_MODE="skip"       # do not touch the Cloudflare API
-export INGRESS_SUPERVISOR="none"     # do not touch systemd
-export INGRESS_APPLY_CONFIRM="1"     # owner-confirmation gate satisfied for the apply tests
-export HOME="$TMP/home"              # controls whether cert.pem "exists"
+export INGRESS_DNS_MODE="skip"
+export INGRESS_SUPERVISOR="none"
+export INGRESS_APPLY_CONFIRM="1"
+export HOME="$TMP/home"
 mkdir -p "$INGRESS_TOKEN_DIR" "$TMP/proj/.secrets/staging-tls" "$HOME"
 printf 'dns_cloudflare_api_token = testtoken\n' > "$INGRESS_CF_INI"
-
-# --- Stub cloudflared. State dir tracks "created" tunnels so list/token/delete cohere. ---
-STUB="$TMP/bin"; mkdir -p "$STUB"
 export CF_STATE="$TMP/cfstate"; mkdir -p "$CF_STATE"
+REQ='{"hostname":"track-42.concierge-dev.app","target":"127.0.0.1:8931","purpose":"spawned track","ttl_hint":"6h"}'
+TOKEN_VALUE="eyJTdHViQ29ubmVjdG9yVG9rZW5WYWx1ZSJ9"
+
 cat > "$STUB/cloudflared" <<'EOF'
 #!/usr/bin/env bash
-# Minimal cloudflared stub driven by env:
-#   CF_STATE            dir of created tunnel marker files
-#   CF_CREATE_FAILS=1   make `tunnel create` fail with an AUTH error (scope gap)
 set -u
 sub="${1:-}"; act="${2:-}"
 case "$sub $act" in
   "--version "*|"--version") echo "cloudflared version 0.0.0-stub"; exit 0;;
-  "tunnel create")
-    name="$3"
-    if [ "${CF_CREATE_FAILS:-0}" = "1" ]; then
-      echo "failed to create tunnel: Unauthorized: cert.pem not found / please run cloudflared tunnel login" >&2
-      exit 1
-    fi
-    : > "$CF_STATE/$name"; echo "Created tunnel $name with id 00000000-0000-4000-8000-000000000000"; exit 0;;
-  "tunnel list")
-    # supports:  tunnel list --name NAME --output json   |  tunnel list --output json
-    name=""; while [ $# -gt 0 ]; do [ "$1" = "--name" ] && name="${2:-}"; shift; done
-    if [ -n "$name" ]; then
-      if [ -f "$CF_STATE/$name" ]; then
-        printf '[{"id":"00000000-0000-4000-8000-000000000000","name":"%s"}]' "$name"
-      else printf '[]'; fi
-    else
-      printf '['; first=1; for f in "$CF_STATE"/*; do [ -e "$f" ] || continue; b="$(basename "$f")"; [ $first = 1 ] || printf ','; first=0; printf '{"id":"00000000-0000-4000-8000-000000000000","name":"%s"}' "$b"; done; printf ']'
-    fi
-    exit 0;;
+  "tunnel create") name="$3"
+    [ "${CF_CREATE_FAILS:-0}" = 1 ] && { echo "Unauthorized: cert.pem not found / cloudflared tunnel login" >&2; exit 1; }
+    : > "$CF_STATE/$name"; mkdir -p "$HOME/.cloudflared"; : > "$HOME/.cloudflared/00000000-0000-4000-8000-000000000000.json"
+    echo "Created tunnel $name"; exit 0;;
+  "tunnel list") name=""; while [ $# -gt 0 ]; do [ "$1" = "--name" ] && name="${2:-}"; shift; done
+    if [ -n "$name" ]; then [ -f "$CF_STATE/$name" ] && printf '[{"id":"00000000-0000-4000-8000-000000000000","name":"%s"}]' "$name" || printf '[]'
+    else printf '['; f1=1; for f in "$CF_STATE"/*; do [ -e "$f" ] || continue; b="$(basename "$f")"; [ $f1 = 1 ]||printf ','; f1=0; printf '{"id":"00000000-0000-4000-8000-000000000000","name":"%s"}' "$b"; done; printf ']'; fi; exit 0;;
   "tunnel token") echo "eyJTdHViQ29ubmVjdG9yVG9rZW5WYWx1ZSJ9"; exit 0;;
   "tunnel delete") dn="${!#}"; rm -f "$CF_STATE/$dn" 2>/dev/null; echo "Deleted $dn"; exit 0;;
-  "tunnel route") echo "route ok"; exit 0;;
-  *) echo "stub: unhandled: $*" >&2; exit 1;;
+  *) echo "stub: $*" >&2; exit 1;;
 esac
 EOF
 chmod +x "$STUB/cloudflared"
 export CLOUDFLARED_BIN="$STUB/cloudflared"
 
-REQ='{"hostname":"track-42.concierge-dev.app","target":"127.0.0.1:8931","purpose":"spawned track","ttl_hint":"6h"}'
-TOKEN_VALUE="eyJTdHViQ29ubmVjdG9yVG9rZW5WYWx1ZSJ9"
+# --- B1: scope gap — no cert.pem AND no token at all → blocked_scope, cheaply (no network)
+OUT="$(printf '%s' "$REQ" | INGRESS_CF_INI=/nonexistent-ini HOME="$TMP/home" bash "$SH" provision --plan)"
+chk "no cert + no token → blocked_scope"       "[ \"\$(printf '%s' \"\$OUT\" | j .status)\" = 'blocked_scope' ]"
+chk "blocked_scope carries 2 remediations"     "printf '%s' \"\$OUT\" | jq -e '.remediation|length==2' >/dev/null"
+chk "remediation A is zero-touch (auto-read)"  "printf '%s' \"\$OUT\" | jq -e '.remediation|any(test(\"no export needed\"))' >/dev/null"
+OA="$(printf '%s' "$REQ" | INGRESS_CF_INI=/nonexistent-ini HOME="$TMP/home" bash "$SH" provision --apply)"
+chk "no-cred apply → blocked_scope"            "[ \"\$(printf '%s' \"\$OA\" | j .status)\" = 'blocked_scope' ]"
+chk "no-cred apply wrote NO token file"        "[ ! -f \"$INGRESS_TOKEN_DIR/ingress-track-42.env\" ]"
 
-j() { jq -r "$1"; }   # read a field from a captured response
-
-# ========================================================================================
-echo "— contract shape + canonical fields —"
-OUT="$(printf '%s' "$REQ" | HOME="$TMP/home" bash "$SH" provision --plan)"
-chk "response is a single JSON object"          "printf '%s' \"\$OUT\" | jq -e 'type==\"object\"' >/dev/null"
-chk "has hostname key"                          "printf '%s' \"\$OUT\" | jq -e 'has(\"hostname\")' >/dev/null"
-chk "has connector_token_path key"              "printf '%s' \"\$OUT\" | jq -e 'has(\"connector_token_path\")' >/dev/null"
-chk "has tunnel_name key"                        "printf '%s' \"\$OUT\" | jq -e 'has(\"tunnel_name\")' >/dev/null"
-chk "has status key"                            "printf '%s' \"\$OUT\" | jq -e 'has(\"status\")' >/dev/null"
-chk "tunnel_name derived deterministically"     "[ \"\$(printf '%s' \"\$OUT\" | j .tunnel_name)\" = 'ingress-track-42' ]"
-chk "token path under .secrets/ingress 0600 loc" "printf '%s' \"\$OUT\" | j .connector_token_path | grep -q '/.secrets/ingress/ingress-track-42.env'"
-
-# ========================================================================================
-echo "— scope gap: no cert.pem, no api token → blocked_scope —"
-chk "plan with no create path → blocked_scope"  "[ \"\$(printf '%s' \"\$OUT\" | j .status)\" = 'blocked_scope' ]"
-chk "blocked_scope carries remediation (2 opts)" "printf '%s' \"\$OUT\" | jq -e '.remediation|length==2' >/dev/null"
-chk "remediation names the token-scope fix"      "printf '%s' \"\$OUT\" | jq -e '.remediation|any(test(\"Cloudflare Tunnel\"))' >/dev/null"
-chk "remediation names the login fix"            "printf '%s' \"\$OUT\" | jq -e '.remediation|any(test(\"tunnel login\"))' >/dev/null"
-
-OUT_APPLY="$(printf '%s' "$REQ" | HOME="$TMP/home" bash "$SH" provision --apply)"
-chk "apply with no create path → blocked_scope"  "[ \"\$(printf '%s' \"\$OUT_APPLY\" | j .status)\" = 'blocked_scope' ]"
-chk "blocked apply creates NO token file"         "[ ! -f \"$INGRESS_TOKEN_DIR/ingress-track-42.env\" ]"
-
-# ========================================================================================
-echo "— create path fails on auth (CF_CREATE_FAILS) → blocked_scope, never faked —"
-mkdir -p "$TMP/home/.cloudflared"; : > "$TMP/home/.cloudflared/cert.pem"
-OUT_AF="$(printf '%s' "$REQ" | CF_CREATE_FAILS=1 HOME="$TMP/home" bash "$SH" provision --apply)"
-chk "cloudflared create-fail → blocked_scope"    "[ \"\$(printf '%s' \"\$OUT_AF\" | j .status)\" = 'blocked_scope' ]"
-chk "create-fail creates NO token file"           "[ ! -f \"$INGRESS_TOKEN_DIR/ingress-track-42.env\" ]"
-
-# ========================================================================================
-echo "— happy path: cert.pem present, create succeeds → ok —"
-OUT_OK="$(printf '%s' "$REQ" | HOME="$TMP/home" bash "$SH" provision --apply)"
-chk "apply → status ok"                          "[ \"\$(printf '%s' \"\$OUT_OK\" | j .status)\" = 'ok' ]"
-chk "token file created"                          "[ -f \"$INGRESS_TOKEN_DIR/ingress-track-42.env\" ]"
-chk "token file is 0600"                          "[ \"\$(stat -c '%a' \"$INGRESS_TOKEN_DIR/ingress-track-42.env\")\" = '600' ]"
-chk "token VALUE not in response"                 "! printf '%s' \"\$OUT_OK\" | grep -q \"$TOKEN_VALUE\""
-chk "token file DOES hold the value (0600 path)"  "grep -q \"$TOKEN_VALUE\" \"$INGRESS_TOKEN_DIR/ingress-track-42.env\""
-chk "cli ingress config.yml written"              "[ -f \"$INGRESS_TOKEN_DIR/ingress-track-42.config.yml\" ]"
-chk "cli config.yml maps host -> target"          "grep -q 'service: http://127.0.0.1:8931' \"$INGRESS_TOKEN_DIR/ingress-track-42.config.yml\" && grep -q 'hostname: track-42.concierge-dev.app' \"$INGRESS_TOKEN_DIR/ingress-track-42.config.yml\""
-
-# ========================================================================================
-echo "— idempotency: re-provision existing → exists, no duplicate —"
-OUT_IDEM="$(printf '%s' "$REQ" | HOME="$TMP/home" bash "$SH" provision --apply)"
-chk "re-provision → status exists"               "[ \"\$(printf '%s' \"\$OUT_IDEM\" | j .status)\" = 'exists' ]"
-chk "still exactly one tunnel marker"             "[ \"\$(ls \"$CF_STATE\" | wc -l | tr -d ' ')\" = '1' ]"
-
-# ========================================================================================
-echo "— input validation → status invalid —"
-BADZONE="$(printf '{\"hostname\":\"evil.example.com\",\"target\":\"127.0.0.1:80\"}' | HOME="$TMP/home" bash "$SH" provision --plan | j .status)"
-chk "wrong zone → invalid"                        "[ \"$BADZONE\" = 'invalid' ]"
-BADHOST="$(printf '{\"hostname\":\"ok.concierge-dev.app\",\"target\":\"10.0.0.5:80\"}' | HOME="$TMP/home" bash "$SH" provision --plan | j .status)"
-chk "non-loopback target → invalid"               "[ \"$BADHOST\" = 'invalid' ]"
-BADPORT="$(printf '{\"hostname\":\"ok.concierge-dev.app\",\"target\":\"127.0.0.1:nope\"}' | HOME="$TMP/home" bash "$SH" provision --plan | j .status)"
-chk "bad port → invalid"                          "[ \"$BADPORT\" = 'invalid' ]"
-BADJSON="$(printf 'not json' | HOME="$TMP/home" bash "$SH" provision --plan | j .status)"
-chk "non-JSON body → invalid"                     "[ \"$BADJSON\" = 'invalid' ]"
-APEX="$(printf '{\"hostname\":\"concierge-dev.app\",\"target\":\"127.0.0.1:80\"}' | HOME="$TMP/home" bash "$SH" provision --plan | j .status)"
-chk "bare zone apex → invalid"                     "[ \"$APEX\" = 'invalid' ]"
-
-# ========================================================================================
-echo "— deprovision: removes tunnel + token, idempotent —"
-OUT_DEP="$(printf '%s' "$REQ" | HOME="$TMP/home" bash "$SH" deprovision --apply)"
-chk "deprovision → status ok"                     "[ \"\$(printf '%s' \"\$OUT_DEP\" | j .status)\" = 'ok' ]"
-chk "token file removed"                          "[ ! -f \"$INGRESS_TOKEN_DIR/ingress-track-42.env\" ]"
-chk "tunnel marker removed"                       "[ \"\$(ls \"$CF_STATE\" | wc -l | tr -d ' ')\" = '0' ]"
-OUT_DEP2="$(printf '%s' "$REQ" | HOME="$TMP/home" bash "$SH" deprovision --apply)"
-chk "deprovision again → not_found (idempotent)"  "[ \"\$(printf '%s' \"\$OUT_DEP2\" | j .status)\" = 'not_found' ]"
-
-# ========================================================================================
-echo "— API path (owner fix A): no cert.pem, account-scoped token → real API lifecycle —"
-# Fresh hermetic sub-scope with a stubbed Cloudflare API (curl) + tunnel/dns state.
+# --- CF API stub (honors -w '%{http_code}' → prints code; else JSON body) --------------
 API_STATE="$TMP/apistate"; mkdir -p "$API_STATE/tunnels" "$API_STATE/dns"
 cat > "$STUB/curl" <<'EOF'
 #!/usr/bin/env bash
-# Minimal Cloudflare API stub. Understands the exact endpoints provision-ingress.sh calls.
 set -u
-method=GET; url=""; data=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -X) method="$2"; shift;;
-    --data) data="$2"; shift;;
-    http*://*) url="$1";;
-  esac; shift
-done
-S="${API_STATE:?}"
-path="${url#*client/v4}"; path="${path%%\?*}"; q="${url#*\?}"
+method=GET; url=""; data=""; want_code=0
+while [ $# -gt 0 ]; do case "$1" in -X) method="$2"; shift;; --data) data="$2"; shift;; -w) want_code=1;; http*://*) url="$1";; esac; shift; done
+S="${API_STATE:?}"; path="${url#*client/v4}"; path="${path%%\?*}"; q="${url#*\?}"
+emit(){ if [ "$want_code" = 1 ]; then printf '%s' "${2:-200}"; else printf '%s' "$1"; fi; }
 case "$method $path" in
-  "GET /accounts") echo '{"result":[{"id":"acct-TEST"}]}';;
-  "GET /zones")    echo '{"result":[{"id":"zone-TEST"}]}';;
+  "GET /accounts") emit '{"result":[{"id":"acct-TEST"}]}' 200;;
+  "GET /zones")    emit '{"result":[{"id":"zone-TEST"}]}' 200;;
   "GET /accounts/acct-TEST/cfd_tunnel")
+    # scope probe uses -w (want code); existence check parses JSON
+    if [ "${CF_SCOPE_403:-0}" = 1 ]; then emit '{"success":false}' 403; exit 0; fi
     name="$(printf '%s' "$q" | sed -n 's/.*name=\([^&]*\).*/\1/p')"
-    if [ -f "$S/tunnels/$name" ]; then echo "{\"result\":[{\"id\":\"$(cat "$S/tunnels/$name")\"}]}"; else echo '{"result":[]}'; fi;;
+    if [ -n "$name" ] && [ -f "$S/tunnels/$name" ]; then emit "{\"result\":[{\"id\":\"$(cat "$S/tunnels/$name")\"}]}" 200
+    else emit '{"result":[]}' 200; fi;;
   "POST /accounts/acct-TEST/cfd_tunnel")
-    name="$(printf '%s' "$data" | jq -r .name)"; id="tid-$name"
-    printf '%s' "$id" > "$S/tunnels/$name"
+    [ "${CF_SCOPE_403:-0}" = 1 ] && { echo '{"success":false,"errors":[{"code":9109}],"messages":["Forbidden"]}'; exit 0; }
+    name="$(printf '%s' "$data" | jq -r .name)"; id="tid-$name"; printf '%s' "$id" > "$S/tunnels/$name"
     echo "{\"result\":{\"id\":\"$id\",\"token\":\"APITOKENVALUE-$name\"}}";;
-  "PUT /accounts/acct-TEST/cfd_tunnel/"*"/configurations")
-    tid="${path%/configurations}"; tid="${tid##*/}"
-    # record the ingress config keyed by tunnel id, for the assertion
-    printf '%s' "$data" > "$S/config-$tid"; echo '{"result":{"config":{}}}';;
-  "DELETE /accounts/acct-TEST/cfd_tunnel/"*)
-    tid="${path##*/}"; for f in "$S/tunnels"/*; do [ -e "$f" ] || continue; [ "$(cat "$f")" = "$tid" ] && rm -f "$f"; done; echo '{"result":null}';;
-  "GET /zones/zone-TEST/dns_records")
-    n="$(printf '%s' "$q" | sed -n 's/.*name=\([^&]*\).*/\1/p')"
-    if [ -f "$S/dns/$n" ]; then echo "{\"result\":[{\"id\":\"rec-$n\"}]}"; else echo '{"result":[]}'; fi;;
+  "PUT /accounts/acct-TEST/cfd_tunnel/"*"/configurations") tid="${path%/configurations}"; tid="${tid##*/}"; printf '%s' "$data" > "$S/config-$tid"; echo '{"result":{}}';;
+  "DELETE /accounts/acct-TEST/cfd_tunnel/"*) tid="${path##*/}"; for f in "$S/tunnels"/*; do [ -e "$f" ]||continue; [ "$(cat "$f")" = "$tid" ] && rm -f "$f"; done; echo '{"result":null}';;
+  "GET /zones/zone-TEST/dns_records") n="$(printf '%s' "$q" | sed -n 's/.*name=\([^&]*\).*/\1/p')"; [ -f "$S/dns/$n" ] && echo "{\"result\":[{\"id\":\"rec-$n\"}]}" || echo '{"result":[]}';;
   "POST /zones/zone-TEST/dns_records") n="$(printf '%s' "$data" | jq -r .name)"; : > "$S/dns/$n"; echo '{"result":{"id":"rec-new"}}';;
-  "PUT /zones/zone-TEST/dns_records/"*) echo '{"result":{"id":"rec-upd"}}';;
   "DELETE /zones/zone-TEST/dns_records/"*) rid="${path##*/}"; n="${rid#rec-}"; rm -f "$S/dns/$n" 2>/dev/null; echo '{"result":null}';;
   *) echo "curl-stub: unhandled $method $path" >&2; exit 22;;
 esac
 EOF
 chmod +x "$STUB/curl"
 
-api_run() { # runs the hook in API mode (no cert.pem, account token set), stubbed curl
-  API_STATE="$API_STATE" INGRESS_CURL="$STUB/curl" INGRESS_DNS_MODE=api \
-    INGRESS_TUNNEL_MODE=api CLOUDFLARED_API_TOKEN=acct-scoped-tok HOME="$TMP/nohomecert" \
-    bash "$SH" "$@"
-}
-mkdir -p "$TMP/nohomecert"   # deliberately NO ~/.cloudflared/cert.pem here
-OUT_API="$(printf '%s' "$REQ" | api_run provision --apply)"
-chk "API apply → ok"                              "[ \"\$(printf '%s' \"\$OUT_API\" | j .status)\" = 'ok' ]"
-chk "API created tunnel via /cfd_tunnel"          "[ -f \"$API_STATE/tunnels/ingress-track-42\" ]"
-chk "API created the CNAME record"                "[ -f \"$API_STATE/dns/track-42.concierge-dev.app\" ]"
-chk "API configured the ingress rule (PUT config)" "[ -f \"$API_STATE/config-tid-ingress-track-42\" ]"
-chk "API ingress rule maps host -> target"        "jq -e '.config.ingress[0].hostname==\"track-42.concierge-dev.app\" and .config.ingress[0].service==\"http://127.0.0.1:8931\"' \"$API_STATE/config-tid-ingress-track-42\" >/dev/null"
-chk "API token file 0600"                          "[ \"\$(stat -c '%a' \"$INGRESS_TOKEN_DIR/ingress-track-42.env\")\" = '600' ]"
-chk "API token value not in response"             "! printf '%s' \"\$OUT_API\" | grep -q 'APITOKENVALUE'"
-OUT_API2="$(printf '%s' "$REQ" | api_run provision --apply)"
-chk "API re-provision → exists (idempotent)"      "[ \"\$(printf '%s' \"\$OUT_API2\" | j .status)\" = 'exists' ]"
-OUT_APIDEP="$(printf '%s' "$REQ" | api_run deprovision --apply)"
-chk "API deprovision → ok"                        "[ \"\$(printf '%s' \"\$OUT_APIDEP\" | j .status)\" = 'ok' ]"
-chk "API tunnel removed"                          "[ ! -f \"$API_STATE/tunnels/ingress-track-42\" ]"
-chk "API CNAME removed"                            "[ ! -f \"$API_STATE/dns/track-42.concierge-dev.app\" ]"
+# --- B2: happy CLI path (cert.pem present) → ok + ingress config.yml --------------------
+mkdir -p "$TMP/home/.cloudflared"; : > "$TMP/home/.cloudflared/cert.pem"
+OK="$(printf '%s' "$REQ" | INGRESS_CURL="$STUB/curl" HOME="$TMP/home" bash "$SH" provision --apply)"
+chk "cli apply → ok"                           "[ \"\$(printf '%s' \"\$OK\" | j .status)\" = 'ok' ]"
+chk "cli token file 0600"                       "[ \"\$(stat -c '%a' \"$INGRESS_TOKEN_DIR/ingress-track-42.env\")\" = '600' ]"
+chk "token VALUE not in response"               "! printf '%s' \"\$OK\" | grep -q \"$TOKEN_VALUE\""
+chk "cli ingress config.yml written"            "[ -f \"$INGRESS_TOKEN_DIR/ingress-track-42.config.yml\" ]"
+chk "cli config maps host -> target"            "grep -q 'service: http://127.0.0.1:8931' \"$INGRESS_TOKEN_DIR/ingress-track-42.config.yml\""
+IDEM="$(printf '%s' "$REQ" | INGRESS_CURL="$STUB/curl" HOME="$TMP/home" bash "$SH" provision --apply)"
+chk "cli re-provision → exists"                 "[ \"\$(printf '%s' \"\$IDEM\" | j .status)\" = 'exists' ]"
+DEP="$(printf '%s' "$REQ" | INGRESS_CURL="$STUB/curl" HOME="$TMP/home" bash "$SH" deprovision --apply)"
+chk "cli deprovision → ok"                       "[ \"\$(printf '%s' \"\$DEP\" | j .status)\" = 'ok' ]"
+chk "cli token removed"                          "[ ! -f \"$INGRESS_TOKEN_DIR/ingress-track-42.env\" ]"
+
+# --- B3: API path via Option-A token AUTO-READ (no CLOUDFLARED_API_TOKEN, no cert) ------
+api() { env -u CLOUDFLARED_API_TOKEN API_STATE="$API_STATE" INGRESS_CURL="$STUB/curl" \
+          INGRESS_DNS_MODE=api INGRESS_TUNNEL_MODE=api HOME="$TMP/nohome" bash "$SH" "$@"; }
+mkdir -p "$TMP/nohome"
+APIOK="$(printf '%s' "$REQ" | api provision --apply)"
+chk "api apply (ini token auto-read) → ok"      "[ \"\$(printf '%s' \"\$APIOK\" | j .status)\" = 'ok' ]"
+chk "api created tunnel"                         "[ -f \"$API_STATE/tunnels/ingress-track-42\" ]"
+chk "api configured ingress rule"               "[ -f \"$API_STATE/config-tid-ingress-track-42\" ]"
+chk "api ingress maps host -> target"           "jq -e '.config.ingress[0].service==\"http://127.0.0.1:8931\"' \"$API_STATE/config-tid-ingress-track-42\" >/dev/null"
+chk "api token value not in response"           "! printf '%s' \"\$APIOK\" | grep -q 'APITOKENVALUE'"
+DEPI="$(printf '%s' "$REQ" | api deprovision --apply)"
+chk "api deprovision → ok"                        "[ \"\$(printf '%s' \"\$DEPI\" | j .status)\" = 'ok' ]"
+
+# --- B4: token present but LACKS tunnel scope → blocked_scope (plan probe + apply 403) --
+SP="$(printf '%s' "$REQ" | env -u CLOUDFLARED_API_TOKEN CF_SCOPE_403=1 API_STATE="$API_STATE" INGRESS_CURL="$STUB/curl" INGRESS_TUNNEL_MODE=api HOME="$TMP/nohome" bash "$SH" provision --plan | j .status)"
+chk "plan: token w/o tunnel scope → blocked_scope" "[ \"$SP\" = 'blocked_scope' ]"
+SA="$(printf '%s' "$REQ" | env -u CLOUDFLARED_API_TOKEN CF_SCOPE_403=1 API_STATE="$API_STATE" INGRESS_CURL="$STUB/curl" INGRESS_TUNNEL_MODE=api HOME="$TMP/nohome" bash "$SH" provision --apply | j .status)"
+chk "apply: token w/o tunnel scope → blocked_scope" "[ \"$SA\" = 'blocked_scope' ]"
 
 # ========================================================================================
-echo "— per-project config (direct mode): zone + tunnel_prefix from .claude/agent/config.json —"
-PROJ2="$TMP/proj2"; mkdir -p "$PROJ2/.claude/agent" "$PROJ2/.secrets/ingress"
+echo "== C. validation (tunnel mode) =="
+V(){ printf '%s' "$1" | INGRESS_CURL="$STUB/curl" HOME="$TMP/home" bash "$SH" provision --plan | j .status; }
+chk "wrong zone → invalid"        "[ \"\$(V '{\"hostname\":\"evil.example.com\",\"target\":\"127.0.0.1:80\"}')\" = 'invalid' ]"
+chk "non-loopback target → invalid" "[ \"\$(V '{\"hostname\":\"ok.concierge-dev.app\",\"target\":\"10.0.0.5:80\"}')\" = 'invalid' ]"
+chk "bad port → invalid"          "[ \"\$(V '{\"hostname\":\"ok.concierge-dev.app\",\"target\":\"127.0.0.1:nope\"}')\" = 'invalid' ]"
+chk "non-JSON → invalid"          "[ \"\$(V 'not json')\" = 'invalid' ]"
+chk "bare apex → invalid"         "[ \"\$(V '{\"hostname\":\"concierge-dev.app\",\"target\":\"127.0.0.1:80\"}')\" = 'invalid' ]"
+
+# ========================================================================================
+echo "== D. owner-confirm gate (tunnel) =="
+CF2="$TMP/cfstate2"; mkdir -p "$CF2"
+NC="$(printf '%s' "$REQ" | env -u INGRESS_APPLY_CONFIRM CF_STATE="$CF2" INGRESS_CURL="$STUB/curl" HOME="$TMP/home" bash "$SH" provision --apply | j .status)"
+chk "unconfirmed --apply → blocked_confirm"     "[ \"$NC\" = 'blocked_confirm' ]"
+chk "unconfirmed --apply created NO tunnel"     "[ \"\$(ls \"$CF2\" | wc -l | tr -d ' ')\" = '0' ]"
+NCP="$(printf '%s' "$REQ" | env -u INGRESS_APPLY_CONFIRM CF_STATE="$CF2" INGRESS_CURL="$STUB/curl" HOME="$TMP/home" bash "$SH" provision --plan | j .status)"
+chk "--plan needs no confirmation"              "[ \"$NCP\" != 'blocked_confirm' ]"
+
+# ========================================================================================
+echo "== E. per-project config (mode + zone from .claude/agent/config.json) =="
+PROJ2="$TMP/proj2"; mkdir -p "$PROJ2/.claude/agent"
 cat > "$PROJ2/.claude/agent/config.json" <<EOF
-{ "ingress": { "zone": "apps.example.net", "tunnel_prefix": "amc-", "token_dir": "$PROJ2/.secrets/ingress" } }
+{ "ingress": { "mode": "haproxy", "zone": "apps.example.net", "haproxy_host": "hp2" } }
 EOF
-cfg_plan() { # runs the hook against PROJ2's config, with the top-level zone/dir exports CLEARED
-  # so resolution must come from the project config block (env -u strips the inherited exports).
-  env -u INGRESS_ZONE -u INGRESS_TOKEN_DIR -u INGRESS_TUNNEL_PREFIX -u INGRESS_SECRETS_DIR \
-    INGRESS_PROJECT_DIR="$PROJ2" INGRESS_SECRETS_DIR="$PROJ2/.secrets" \
-    INGRESS_CF_INI="$INGRESS_CF_INI" INGRESS_DNS_MODE=skip INGRESS_SUPERVISOR=none \
-    HOME="$TMP/home" bash "$SH" "$@"
-}
-OUT_CFG="$(printf '{"target":"127.0.0.1:9000","hostname":"foo.apps.example.net"}' | cfg_plan provision --plan)"
-chk "config zone accepted (foo.apps.example.net)"  "[ \"\$(printf '%s' \"\$OUT_CFG\" | j .status)\" != 'invalid' ]"
-chk "config tunnel_prefix applied (amc-foo)"        "[ \"\$(printf '%s' \"\$OUT_CFG\" | j .tunnel_name)\" = 'amc-foo' ]"
-chk "config token_dir applied"                      "printf '%s' \"\$OUT_CFG\" | j .connector_token_path | grep -q '/proj2/.secrets/ingress/amc-foo.env'"
-OUT_CFG_BAD="$(printf '{"target":"127.0.0.1:9000","hostname":"foo.concierge-dev.app"}' | cfg_plan provision --plan)"
-chk "default zone rejected when config overrides it" "[ \"\$(printf '%s' \"\$OUT_CFG_BAD\" | j .status)\" = 'invalid' ]"
-OUT_ENV="$(printf '{"target":"127.0.0.1:9000","hostname":"bar.zone.dev"}' | \
-  env -u INGRESS_TOKEN_DIR -u INGRESS_TUNNEL_PREFIX -u INGRESS_SECRETS_DIR \
-    INGRESS_PROJECT_DIR="$PROJ2" INGRESS_SECRETS_DIR="$PROJ2/.secrets" INGRESS_CF_INI="$INGRESS_CF_INI" \
-    INGRESS_DNS_MODE=skip INGRESS_SUPERVISOR=none INGRESS_ZONE=zone.dev HOME="$TMP/home" \
-    bash "$SH" provision --plan)"
-chk "ENV zone overrides project config"             "[ \"\$(printf '%s' \"\$OUT_ENV\" | j .status)\" != 'invalid' ]"
-
-# ========================================================================================
-echo "— owner-confirmation gate: --apply without INGRESS_APPLY_CONFIRM refuses + no mutation —"
-CF_STATE2="$TMP/cfstate2"; mkdir -p "$CF_STATE2"
-OUT_NC="$(printf '%s' "$REQ" | env -u INGRESS_APPLY_CONFIRM CF_STATE="$CF_STATE2" HOME="$TMP/home" bash "$SH" provision --apply)"
-chk "unconfirmed --apply → blocked_confirm"        "[ \"\$(printf '%s' \"\$OUT_NC\" | j .status)\" = 'blocked_confirm' ]"
-chk "unconfirmed --apply created NO tunnel"        "[ \"\$(ls \"$CF_STATE2\" | wc -l | tr -d ' ')\" = '0' ]"
-chk "unconfirmed --apply wrote NO token file"      "[ ! -f \"$INGRESS_TOKEN_DIR/ingress-track-42.env\" ]"
-# --plan needs no confirmation:
-OUT_NCP="$(printf '%s' "$REQ" | env -u INGRESS_APPLY_CONFIRM CF_STATE="$CF_STATE2" HOME="$TMP/home" bash "$SH" provision --plan | j .status)"
-chk "--plan needs no confirmation"                 "[ \"$OUT_NCP\" != 'blocked_confirm' ]"
+cfg() { env -u INGRESS_MODE -u INGRESS_ZONE -u INGRESS_HAPROXY_HOST -u INGRESS_TOKEN_DIR -u INGRESS_SECRETS_DIR -u INGRESS_CF_INI \
+          INGRESS_PROJECT_DIR="$PROJ2" INGRESS_CURL="$STUB/curl-haproxy-post" HP_STATE="$HP_STATE" bash "$SH" "$@"; }
+CM="$(printf '{"hostname":"foo.apps.example.net","target":"c1:80"}' | cfg provision --plan)"
+chk "config selects haproxy mode"               "[ \"\$(printf '%s' \"\$CM\" | j .mode)\" = 'haproxy' ]"
+chk "config zone accepted"                       "[ \"\$(printf '%s' \"\$CM\" | j .status)\" != 'invalid' ]"
+CMB="$(printf '{"hostname":"foo.concierge-dev.app","target":"c1:80"}' | cfg provision --plan | j .status)"
+chk "default zone rejected when config overrides" "[ \"$CMB\" = 'invalid' ]"
 
 echo
 if [ "$FAIL" = 0 ]; then printf '\033[32mALL PASS\033[0m\n'; else printf '\033[31mSOME FAILED\033[0m\n'; fi

@@ -168,7 +168,7 @@ An explicit, extensible enum (defined in `agent-registry.sh`, `caps` subcommand)
 | `dev-advice` | receive development/design guidance | read |
 | `rebuild-reload-service` | request a service rebuild/reload | **destructive** |
 | `review-merge-pr` | request a PR review/merge | **outward** |
-| `provision-ingress` | request a public hostname for a service they spawned (provision/deprovision; see [`provision-ingress.README.md`](../claude_conf/hooks/provision-ingress.README.md)) | **destructive/outward** |
+| `provision-ingress` | request a public hostname for a service they spawned — haproxy-register (primary, no secret) or Cloudflare tunnel (fallback); provision/deprovision; see [`provision-ingress.README.md`](../claude_conf/hooks/provision-ingress.README.md) | **destructive/outward** |
 | `team-coordinate` | participate in team coordination (invite/cfp/award/progress/snapshot/lease) | team |
 | `task-bid` | bid on and deliver team tasks (bid/result) | team |
 | `knowledge-share` | publish/receive team knowledge cards (kb.publish) | team |
