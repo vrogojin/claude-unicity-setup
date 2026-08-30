@@ -46,9 +46,11 @@ Two hard input controls, enforced before any mutation:
     accepting), which is the PRIMARY control — it rejects every off-network target *by
     construction*, so no IP-literal spelling (dotted-quad, decimal, octal, hex, v4-in-v6,
     trailing-dot, the docker gateway, or a cloud metadata endpoint) can be reached. An
-    IP-literal reject runs as belt-and-suspenders. `INGRESS_VERIFY_CONTAINER`: `auto`
-    (default — enforce when docker is available, else fall back to the IP reject), `require`
-    (fail-closed → `blocked_config` if docker is unavailable), `off`. Loopback is rejected.
+    IP-literal reject runs as belt-and-suspenders. `INGRESS_VERIFY_CONTAINER` is
+    **fail-closed by default**: `require` (default — enforce; if docker is unavailable →
+    `blocked_config`, never a silent downgrade); `auto` (explicit opt-in — enforce when
+    docker is present, else fall back to the IP reject **and mark the result reason
+    `UNVERIFIED (…)`** so the downgrade is visible in the plan); `off`. Loopback is rejected.
   - tunnel → `target` must be `127.0.0.1:<port>` (or `localhost`). No open proxy.
 
 ## Request / response contract
@@ -155,7 +157,7 @@ Only paths/names live in config — secrets stay env/secret-file only.
 | `INGRESS_HAPROXY_API_PORT` | `.ingress.haproxy_api_port` | `8404` | Registration API port |
 | `INGRESS_HAPROXY_HTTPS_PORT` | `.ingress.haproxy_https_port` | `443` | https_port advertised (null = HTTP-only) |
 | `INGRESS_HAPROXY_NET` | `.ingress.haproxy_net` | `haproxy-net` | the shared proxy network the target container must be on |
-| `INGRESS_VERIFY_CONTAINER` | `.ingress.verify_container` | `auto` | container allowlist: `auto` \| `require` \| `off` |
+| `INGRESS_VERIFY_CONTAINER` | `.ingress.verify_container` | `require` | container allowlist (fail-closed default): `require` \| `auto` (marks UNVERIFIED on fallback) \| `off` |
 | `DOCKER_BIN` | — | `docker` | docker CLI used for the container-membership check |
 | `INGRESS_APPLY_CONFIRM` | — (env only) | — | must be `1` for `--apply` (owner-confirm gate) |
 | `INGRESS_CF_INI` | `.ingress.cloudflare_ini` | `<project>/.secrets/staging-tls/cloudflare.ini` | tunnel: token file (auto-read) |

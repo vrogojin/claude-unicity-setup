@@ -133,9 +133,18 @@ chk "belt: mixed-radix hex IP → invalid"       "[ \"\$(bchk '169.254.0xA9.0xFE
 chk "belt: hex 2nd-octet IP → invalid"         "[ \"\$(bchk '172.0x11.0.1:80')\" = 'invalid' ]"
 chk "belt: canonical IP → invalid"             "[ \"\$(bchk '8.8.8.8:80')\" = 'invalid' ]"
 chk "belt: legit name still OK (verify off)"   "[ \"\$(bchk 'track42-web:80')\" = 'planned' ]"
-# require mode + no docker → blocked_config (fail-closed)
+# DEFAULT is fail-closed: no docker → blocked_config, never a silent blacklist-only pass.
+DEF="$(printf '{\"hostname\":\"x.staging.concierge-dev.app\",\"target\":\"track42-web:80\"}' | env -u INGRESS_VERIFY_CONTAINER -u DOCKER_BIN DOCKER_BIN=/nonexistent-docker INGRESS_MODE=haproxy INGRESS_HAPROXY_HOST=h bash "$SH" provision --plan | j .status)"
+chk "DEFAULT + no docker → blocked_config (fail-closed)" "[ \"$DEF\" = 'blocked_config' ]"
 RC="$(printf '{\"hostname\":\"x.staging.concierge-dev.app\",\"target\":\"track42-web:80\"}' | env -u DOCKER_BIN DOCKER_BIN=/nonexistent-docker INGRESS_VERIFY_CONTAINER=require INGRESS_MODE=haproxy INGRESS_HAPROXY_HOST=h bash "$SH" provision --plan | j .status)"
-chk "verify=require + no docker → blocked_config" "[ \"$RC\" = 'blocked_config' ]"
+chk "explicit require + no docker → blocked_config" "[ \"$RC\" = 'blocked_config' ]"
+# auto is the explicit weaker opt-in: no docker → passes on blacklist BUT marked UNVERIFIED,
+# and IPs (incl. mixed-radix) are still rejected by the blacklist even in this fallback.
+AUV="$(printf '{\"hostname\":\"x.staging.concierge-dev.app\",\"target\":\"track42-web:80\"}' | env -u DOCKER_BIN DOCKER_BIN=/nonexistent-docker INGRESS_VERIFY_CONTAINER=auto INGRESS_MODE=haproxy INGRESS_HAPROXY_HOST=haproxy-test INGRESS_CURL="$STUB/curl-haproxy-post" bash "$SH" provision --plan)"
+chk "auto + no docker → planned"                "[ \"\$(printf '%s' \"\$AUV\" | j .status)\" = 'planned' ]"
+chk "auto + no docker → reason marked UNVERIFIED" "printf '%s' \"\$AUV\" | jq -e '.reason|test(\"UNVERIFIED\")' >/dev/null"
+AIV="$(printf '{\"hostname\":\"x.staging.concierge-dev.app\",\"target\":\"169.254.0xA9.0xFE:80\"}' | env -u DOCKER_BIN DOCKER_BIN=/nonexistent-docker INGRESS_VERIFY_CONTAINER=auto INGRESS_MODE=haproxy INGRESS_HAPROXY_HOST=h bash "$SH" provision --plan | j .status)"
+chk "auto + no docker + mixed-radix IP → invalid" "[ \"$AIV\" = 'invalid' ]"
 # zone-pin under staging.concierge-dev.app
 WZ="$(printf '{\"hostname\":\"x.evil.net\",\"target\":\"c:80\"}' | INGRESS_MODE=haproxy INGRESS_HAPROXY_HOST=h bash "$SH" provision --plan | j .status)"
 chk "haproxy wrong zone → invalid"             "[ \"$WZ\" = 'invalid' ]"

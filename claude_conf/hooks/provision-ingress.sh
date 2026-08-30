@@ -81,10 +81,14 @@ INGRESS_HAPROXY_HOST="$(_pick "${INGRESS_HAPROXY_HOST:-${HAPROXY_HOST:-}}" '.ing
 INGRESS_HAPROXY_API_PORT="$(_pick "${INGRESS_HAPROXY_API_PORT:-}" '.ingress.haproxy_api_port' '8404')"
 INGRESS_HAPROXY_HTTPS_PORT="$(_pick "${INGRESS_HAPROXY_HTTPS_PORT:-}" '.ingress.haproxy_https_port' '443')"
 INGRESS_HAPROXY_NET="$(_pick "${INGRESS_HAPROXY_NET:-}" '.ingress.haproxy_net' 'haproxy-net')"
-# Container allowlist enforcement: auto = enforce when docker is available, else fall back to
-# the IP-literal reject (SSRF still closed); require = fail-closed if docker is unavailable;
-# off = skip (rely on the IP reject only).
-INGRESS_VERIFY_CONTAINER="$(_pick "${INGRESS_VERIFY_CONTAINER:-}" '.ingress.verify_container' 'auto')"
+# Container allowlist enforcement (the PRIMARY SSRF control). DEFAULT is fail-closed:
+#   require (default) = enforce membership; if docker is unavailable → blocked_config (never
+#                       silently downgrade to blacklist-only).
+#   auto              = enforce when docker is available; if not, fall back to the IP-literal
+#                       reject AND stamp the result reason "UNVERIFIED (…)" so the downgrade
+#                       is visible in the plan the owner reviews. Explicit opt-in.
+#   off               = skip the membership check (blacklist only). Explicit opt-in.
+INGRESS_VERIFY_CONTAINER="$(_pick "${INGRESS_VERIFY_CONTAINER:-}" '.ingress.verify_container' 'require')"
 DOCKER_BIN="${DOCKER_BIN:-docker}"
 
 # --- tunnel (fallback) knobs ---
@@ -117,9 +121,16 @@ _container_on_haproxy_net() {  # <container>
   return 1
 }
 
+# Set when INGRESS_VERIFY_CONTAINER=auto had to fall back to blacklist-only (docker absent).
+INGRESS_UNVERIFIED=""
+
 # --- JSON emit: single object to stdout, then exit. A token/secret value is never a field.
 _emit() {  # <status> <reason> [remediation-json-array]
   local status="$1" reason="${2:-}" remediation="${3:-[]}"
+  # Make an auto-mode blacklist-fallback VISIBLE on any pass — never a silent downgrade.
+  if [ -n "${INGRESS_UNVERIFIED:-}" ]; then
+    case "$status" in planned|ok|exists) reason="UNVERIFIED (docker unavailable — container membership NOT checked; IP-blacklist only): $reason";; esac
+  fi
   jq -cn \
     --arg hostname "${HOSTNAME_REQ:-}" \
     --arg status "$status" --arg mode "$INGRESS_MODE" \
@@ -219,13 +230,13 @@ _derive() {
     # PRIMARY control — EXISTENCE-BASED ALLOWLIST: the target must be a real container
     # ATTACHED to haproxy-net. Any IP/hostname (in any encoding) is not a container on that
     # network, so this rejects the whole SSRF class by construction, not by spelling.
+    # Fail-closed by default (require): never SILENTLY downgrade to the blacklist.
     case "$INGRESS_VERIFY_CONTAINER" in
       off) : ;;
-      *) if _have "$DOCKER_BIN"; then
-           _container_on_haproxy_net "$TARGET_HOST" || return 17
-         elif [ "$INGRESS_VERIFY_CONTAINER" = require ]; then
-           return 18
-         fi;;
+      auto) if _have "$DOCKER_BIN"; then _container_on_haproxy_net "$TARGET_HOST" || return 17
+            else INGRESS_UNVERIFIED=1; fi;;               # visible-marked blacklist fallback
+      require|*) if _have "$DOCKER_BIN"; then _container_on_haproxy_net "$TARGET_HOST" || return 17
+                 else return 18; fi;;                     # fail-closed
     esac
     BACKEND_DESC="$TARGET_HOST:$TARGET_PORT"
     # https_port: request > config default; empty/0/"null" → HTTP-only (null in the API).
@@ -253,7 +264,7 @@ _validate_or_die() {
     15) _emit invalid "https_port must be an integer or null; got '$HTTPS_PORT'"; exit 0;;
     16) _emit invalid "haproxy-mode target must be a container NAME on haproxy-net, not an IP address or numeric host; got '$TARGET_HOST'"; exit 0;;
     17) _emit invalid "haproxy-mode target container '$TARGET_HOST' is not a running container attached to the '$INGRESS_HAPROXY_NET' network — refusing (only real containers on the shared proxy network may be exposed)"; exit 0;;
-    18) _emit blocked_config "cannot verify container membership: docker CLI unavailable and INGRESS_VERIFY_CONTAINER=require. Install docker access or set INGRESS_VERIFY_CONTAINER=auto."; exit 0;;
+    18) _emit blocked_config "cannot verify the target is a container on '$INGRESS_HAPROXY_NET': docker CLI unavailable. The default is fail-closed. Give this runner docker access, or explicitly set INGRESS_VERIFY_CONTAINER=auto (blacklist fallback, result marked UNVERIFIED) or =off."; exit 0;;
   esac
 }
 
