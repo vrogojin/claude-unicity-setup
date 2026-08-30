@@ -134,6 +134,11 @@
             "type": "command",
             "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/serena-reaper.sh start",
             "timeout": 20
+          },
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/a2a-session-arm.sh",
+            "timeout": 15
           }
         ]
       }
