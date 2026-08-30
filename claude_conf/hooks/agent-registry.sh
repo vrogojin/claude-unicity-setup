@@ -82,8 +82,16 @@ fi
 # split.propose/agree partitions) → claim-area. Claims are soft — they never forbid
 # parallel work — and a consult can ASK us to apply matching changes on our side, but
 # applying them still runs the normal local workflow with admin confirmation.
-AGENT_CAPABILITIES="read-status chat dev-advice rebuild-reload-service review-merge-pr team-coordinate task-bid knowledge-share self-directed consult claim-area deck"
-AGENT_CAPS_DESTRUCTIVE="rebuild-reload-service review-merge-pr"
+#
+# provision-ingress powers the pluggable DNS/ingress provider (see
+# provision-ingress.README.md). An authorized peer (e.g. Mission Control / AMC) may REQUEST
+# a public hostname for a service it spawned; THIS instance does the Cloudflare provisioning
+# under ITS OWN credential + owner consent, and the credential NEVER leaves this side. It is
+# DESTRUCTIVE/outward (owner-granted AND owner-confirmed PER provision, rebuild-reload class):
+# /process-agent-requests only PLANS it (read-only) and STOPS; the owner disposes. The one
+# capability gates both the provision and deprovision operations (op named in the request).
+AGENT_CAPABILITIES="read-status chat dev-advice rebuild-reload-service review-merge-pr team-coordinate task-bid knowledge-share self-directed consult claim-area deck provision-ingress"
+AGENT_CAPS_DESTRUCTIVE="rebuild-reload-service review-merge-pr provision-ingress"
 
 # --- Registry path resolution ----------------------------------------------------
 # Precedence: explicit override → CLAUDE_PROJECT_DIR → derive from this script's dir.
