@@ -32,10 +32,13 @@
 #
 # USAGE:
 #   provision-ingress.sh provision   --plan   [--in FILE | --json '<obj>' | -<stdin>]
-#   provision-ingress.sh provision   --apply  [ ... ]
+#   INGRESS_APPLY_CONFIRM=1 provision-ingress.sh provision   --apply  [ ... ]
 #   provision-ingress.sh deprovision --plan   [ ... ]
-#   provision-ingress.sh deprovision --apply  [ ... ]
+#   INGRESS_APPLY_CONFIRM=1 provision-ingress.sh deprovision --apply  [ ... ]
 #   provision-ingress.sh --help
+# --apply mutates PUBLIC DNS + a cloud credential, so it is technically gated: it refuses
+# (status:"blocked_confirm") unless the OWNER sets INGRESS_APPLY_CONFIRM=1. The /process-
+# agent-requests processor runs ONLY --plan and must never set that env.
 #
 # REQUEST  (stdin/--in/--json): { "hostname", "target":"127.0.0.1:<port>", "purpose", "ttl_hint" }
 # RESPONSE (stdout, one JSON object): { "hostname", "connector_token_path", "tunnel_name",
@@ -43,15 +46,38 @@
 #   The token VALUE is never present. All logs go to stderr.
 set -uo pipefail
 
-# --- Resolvable knobs (all overridable; defaults target the concierge dev runtime) -------
+# --- Resolvable knobs -------------------------------------------------------------------
+# Precedence for every project-specific bit: ENV override  >  the project's own config
+# block  >  built-in default. This is what makes the verb a GENERIC reference impl: AMC's
+# OTHER projects supply their own zone + token path (the "direct" mode) by dropping an
+# `ingress` block into .claude/agent/config.json — WITHOUT editing this script. The defaults
+# target the concierge dev runtime (the "delegated" mode).
+#
+# Project config block (all keys optional), $PROJECT_DIR/.claude/agent/config.json:
+#   { "ingress": { "zone": "...", "cloudflare_ini": "<path>", "token_dir": "<path>",
+#                  "tunnel_prefix": "ingress-", "cf_api": "https://api.cloudflare.com/client/v4" } }
+# NOTE: only PATHS/NAMES live in config — the account-scoped secret stays env-only
+# (CLOUDFLARED_API_TOKEN), never persisted to a project config.
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo .)"
 PROJECT_DIR="${INGRESS_PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-/home/vrogojin/concierge}}"
-INGRESS_ZONE="${INGRESS_ZONE:-concierge-dev.app}"
+INGRESS_CONFIG_FILE="${INGRESS_CONFIG_FILE:-$PROJECT_DIR/.claude/agent/config.json}"
+
+# _cfg <jq-path> : value from the project's .ingress config block, or empty.
+_cfg() {
+  [ -f "$INGRESS_CONFIG_FILE" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  jq -r "$1 // empty" "$INGRESS_CONFIG_FILE" 2>/dev/null
+}
+# _pick <env-value> <config-jq-path> <default> : ENV > project config > default.
+_pick() { if [ -n "$1" ]; then printf '%s' "$1"; else local c; c="$(_cfg "$2")"; printf '%s' "${c:-$3}"; fi; }
+
+INGRESS_ZONE="$(_pick "${INGRESS_ZONE:-}" '.ingress.zone' 'concierge-dev.app')"
 SECRETS_DIR="${INGRESS_SECRETS_DIR:-$PROJECT_DIR/.secrets}"
-INGRESS_DIR="${INGRESS_TOKEN_DIR:-$SECRETS_DIR/ingress}"
-CF_INI="${INGRESS_CF_INI:-$SECRETS_DIR/staging-tls/cloudflare.ini}"
+INGRESS_DIR="$(_pick "${INGRESS_TOKEN_DIR:-}" '.ingress.token_dir' "$SECRETS_DIR/ingress")"
+CF_INI="$(_pick "${INGRESS_CF_INI:-}" '.ingress.cloudflare_ini' "$SECRETS_DIR/staging-tls/cloudflare.ini")"
+INGRESS_TUNNEL_PREFIX="$(_pick "${INGRESS_TUNNEL_PREFIX:-}" '.ingress.tunnel_prefix' 'ingress-')"
+CF_API="$(_pick "${INGRESS_CF_API:-}" '.ingress.cf_api' 'https://api.cloudflare.com/client/v4')"
 CLOUDFLARED_BIN="${CLOUDFLARED_BIN:-cloudflared}"
-CF_API="${INGRESS_CF_API:-https://api.cloudflare.com/client/v4}"
 # Tunnel lifecycle backend: "auto" (cert.pem→cli, else account-token→api) | "cli" | "api"
 INGRESS_TUNNEL_MODE="${INGRESS_TUNNEL_MODE:-auto}"
 # DNS backend: "api" (Cloudflare API w/ dns token) | "cli" (cloudflared route dns) | "skip" (tests)
@@ -147,7 +173,7 @@ _derive() {
   label="${HOSTNAME_REQ%%.*}"
   sane="$(printf '%s' "$label" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/^-*//;s/-*$//')"
   [ -n "$sane" ] || return 10
-  TUNNEL_NAME="ingress-$sane"
+  TUNNEL_NAME="${INGRESS_TUNNEL_PREFIX}$sane"
   CONNECTOR_TOKEN_PATH="$INGRESS_DIR/$TUNNEL_NAME.env"
   return 0
 }
@@ -324,25 +350,58 @@ _apply_provision() {
     token="$(_cf tunnel token "$TUNNEL_NAME" 2>/dev/null)"
   fi
 
-  # 2) Persist the connector token 0600 (VALUE never emitted).
+  # 2) Persist the connector token 0600 (VALUE never emitted). The write is CHECKED — a
+  # silent failure must never be reported as ok.
   if [ -z "$token" ]; then
-    _emit error "tunnel '$TUNNEL_NAME' created but its connector token could not be read"
+    _rollback_provision "$mode"
+    _emit error "tunnel '$TUNNEL_NAME' created but its connector token could not be read; rolled back"
     return
   fi
-  ( umask 077; printf 'TUNNEL_TOKEN=%s\n' "$token" > "$CONNECTOR_TOKEN_PATH" )
+  if ! ( umask 077; printf 'TUNNEL_TOKEN=%s\n' "$token" > "$CONNECTOR_TOKEN_PATH" ) \
+     || [ ! -s "$CONNECTOR_TOKEN_PATH" ]; then
+    unset token; _rollback_provision "$mode"
+    _emit error "could not persist the connector token to $CONNECTOR_TOKEN_PATH; rolled back"
+    return
+  fi
   chmod 600 "$CONNECTOR_TOKEN_PATH" 2>/dev/null || true
   unset token
 
-  # 3) DNS CNAME → <tunnel-uuid>.cfargotunnel.com (works with the DNS-only token).
-  if ! _dns_upsert; then
-    _emit error "tunnel provisioned + token persisted, but DNS CNAME for $HOSTNAME_REQ could not be created"
+  # 3) Configure the tunnel's INGRESS rule (hostname -> http://target). Without this the
+  # edge has no route and traffic 404s — so a failure here is fatal, never "ok".
+  if ! _configure_ingress "$mode"; then
+    _rollback_provision "$mode"
+    _emit error "tunnel + token created but the ingress rule for $HOSTNAME_REQ could not be configured; rolled back"
     return
   fi
 
-  # 4) Start the connector (systemd --user unit, or skip when INGRESS_SUPERVISOR=none).
-  _start_service || _log "service start reported a problem (tunnel + DNS are in place)"
+  # 4) DNS CNAME → <tunnel-uuid>.cfargotunnel.com (works with the DNS-only token).
+  if ! _dns_upsert; then
+    _rollback_provision "$mode"
+    _emit error "tunnel + ingress configured but the DNS CNAME for $HOSTNAME_REQ could not be created; rolled back"
+    return
+  fi
+
+  # 5) Start the connector (systemd --user unit, or skip when INGRESS_SUPERVISOR=none).
+  _start_service "$mode" || _log "service start reported a problem (tunnel + ingress + DNS are in place)"
 
   _emit ok "provisioned $HOSTNAME_REQ -> http://$TARGET via tunnel '$TUNNEL_NAME'"
+}
+
+# Best-effort teardown of a half-built provision so a failed --apply never orphans a tunnel
+# or leaves a stale token/config on disk. Never emits — the caller emits the outcome.
+_rollback_provision() {  # <mode>
+  local mode="${1:-cli}"
+  _log "rolling back partial provision of '$TUNNEL_NAME'"
+  if _tunnel_exists 2>/dev/null; then
+    if [ "$mode" = api ]; then
+      local tok acct; tok="$(_cf_acct_token)"; acct="$(_cf_acct_id)"
+      [ -n "$acct" ] && _curl -fsS -X DELETE -H "Authorization: Bearer $tok" \
+        "$CF_API/accounts/$acct/cfd_tunnel/$TUNNEL_UUID" >/dev/null 2>&1 || true
+    else
+      _cf tunnel delete -f "$TUNNEL_NAME" >/dev/null 2>&1 || true
+    fi
+  fi
+  rm -f "$CONNECTOR_TOKEN_PATH" "$INGRESS_DIR/$TUNNEL_NAME.config.yml" 2>/dev/null || true
 }
 
 _apply_deprovision() {
@@ -375,8 +434,9 @@ _apply_deprovision() {
     fi
   fi
 
-  # 3) Remove the token file.
+  # 3) Remove the token file + any local ingress config.
   [ -f "$CONNECTOR_TOKEN_PATH" ] && rm -f "$CONNECTOR_TOKEN_PATH"
+  rm -f "$INGRESS_DIR/$TUNNEL_NAME.config.yml" 2>/dev/null || true
 
   if [ "$existed" = 0 ]; then _emit not_found "nothing to deprovision for '$TUNNEL_NAME'"
   elif [ "$problem" = 1 ]; then _emit partial "deprovisioned '$TUNNEL_NAME' with one or more non-fatal warnings (see logs)"
@@ -426,14 +486,57 @@ _dns_delete() {
     "$CF_API/zones/$zid/dns_records/$rid" >/dev/null 2>&1
 }
 
+# --- Ingress-rule configuration (maps the public hostname to http://<target>) ------------
+# api: the tunnel is remotely-managed (config_src:cloudflare) → PUT its configuration so the
+#      edge routes <hostname> → http://<target>. cloudflared then pulls it at token-run.
+# cli: the tunnel is locally-managed → write a config.yml (ingress + credentials-file) that
+#      the connector runs with (`--config`). Either way, WITHOUT this step traffic 404s.
+_ingress_config_yml() { printf '%s' "$INGRESS_DIR/$TUNNEL_NAME.config.yml"; }
+_configure_ingress() {  # <mode>
+  local mode="${1:-cli}"
+  if [ "$mode" = api ]; then
+    case "$INGRESS_DNS_MODE" in skip) _log "DNS_MODE=skip — ingress config PUT skipped"; return 0;; esac
+    local tok acct body
+    tok="$(_cf_acct_token)"; acct="$(_cf_acct_id)"
+    [ -n "$acct" ] && [ -n "$TUNNEL_UUID" ] || { _log "ingress config: no account id / tunnel uuid"; return 1; }
+    body="$(jq -cn --arg h "$HOSTNAME_REQ" --arg s "http://$TARGET" \
+      '{config:{ingress:[{hostname:$h,service:$s},{service:"http_status:404"}]}}')"
+    _curl -fsS -X PUT -H "Authorization: Bearer $tok" -H "Content-Type: application/json" \
+      "$CF_API/accounts/$acct/cfd_tunnel/$TUNNEL_UUID/configurations" --data "$body" >/dev/null 2>&1
+    return $?
+  fi
+  # cli path: a locally-managed tunnel is run from a config.yml with its credentials file.
+  local yml cred; yml="$(_ingress_config_yml)"; cred="$HOME/.cloudflared/$TUNNEL_UUID.json"
+  ( umask 077; cat > "$yml" <<YML
+tunnel: $TUNNEL_UUID
+credentials-file: $cred
+ingress:
+  - hostname: $HOSTNAME_REQ
+    service: http://$TARGET
+  - service: http_status:404
+YML
+  ) || { _log "ingress config: could not write $yml"; return 1; }
+  [ -s "$yml" ]
+}
+
 # --- Service supervision (systemd --user unit; matches gptbridge-tunnel.service) ---------
 _unit_name() { printf '%s.service' "$TUNNEL_NAME"; }
-_start_service() {
+_start_service() {  # <mode>
+  local mode="${1:-cli}"
   [ "$INGRESS_SUPERVISOR" = "systemd" ] || { _log "supervisor=$INGRESS_SUPERVISOR — start skipped"; return 0; }
   _have systemctl || { _log "no systemctl — start skipped"; return 0; }
   local unit_dir="$HOME/.config/systemd/user"
   mkdir -p "$unit_dir" 2>/dev/null || true
   local cfbin; cfbin="$(command -v "$CLOUDFLARED_BIN" 2>/dev/null || printf '%s' "$CLOUDFLARED_BIN")"
+  # api → token-run (config pulled from the edge); cli → run the local config.yml.
+  local envline execline
+  if [ "$mode" = api ]; then
+    envline="EnvironmentFile=$CONNECTOR_TOKEN_PATH"
+    execline="ExecStart=$cfbin tunnel --no-autoupdate run"
+  else
+    envline="# (cli mode: credentials + ingress come from the config file)"
+    execline="ExecStart=$cfbin tunnel --no-autoupdate --config $(_ingress_config_yml) run $TUNNEL_NAME"
+  fi
   cat > "$unit_dir/$(_unit_name)" <<UNIT
 [Unit]
 Description=ingress tunnel $TUNNEL_NAME ($HOSTNAME_REQ -> http://$TARGET)
@@ -441,8 +544,8 @@ After=network.target
 
 [Service]
 Type=simple
-EnvironmentFile=$CONNECTOR_TOKEN_PATH
-ExecStart=$cfbin tunnel --no-autoupdate run
+$envline
+$execline
 Restart=always
 RestartSec=5
 
@@ -462,7 +565,7 @@ _stop_service() {
 
 # --- Help --------------------------------------------------------------------------------
 _usage() {
-  sed -n '1,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,46p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # --- Main --------------------------------------------------------------------------------
@@ -475,6 +578,18 @@ main() {
 
   if ! _load_request; then _emit invalid "request must be a JSON object on stdin/--in/--json"; exit 0; fi
   _derive; _validate_or_die $?
+
+  # OWNER-CONFIRMATION GATE (defense-in-depth). --apply mutates PUBLIC DNS + a cloud
+  # credential, so it refuses unless the owner explicitly sets INGRESS_APPLY_CONFIRM=1.
+  # The capability-scoped /process-agent-requests processor runs ONLY --plan and must NOT
+  # set this; copying the plan command verbatim therefore yields a safe refusal, not a
+  # provision. (A determined injected agent with shell access is out of scope for a single
+  # env var — the registry grant + this gate + the permission system are the layered
+  # controls; this converts the common accidental/auto path into a hard stop.)
+  if [ "$MODE" = apply ] && [ "${INGRESS_APPLY_CONFIRM:-}" != "1" ]; then
+    _emit blocked_confirm "refusing to --apply without owner confirmation: this mutates public DNS. The OWNER re-runs with INGRESS_APPLY_CONFIRM=1 after reviewing the --plan. The capability-scoped processor must NOT set this."
+    exit 0
+  fi
 
   case "$OP:$MODE" in
     provision:plan)    _plan_provision;;

@@ -86,8 +86,9 @@ here.
    >   The planner NEVER mutates anything and NEVER emits the token value. Return its JSON
    >   `{hostname, connector_token_path, tunnel_name, status, reason, remediation}` verbatim
    >   as the proposal. If `status` is `blocked_scope`, relay the `remediation` to the owner
-   >   — it names the exact one-time fix. Do NOT run `--apply`; only the owner does, after
-   >   confirming.
+   >   — it names the exact one-time fix. Do NOT run `--apply`, and NEVER set
+   >   `INGRESS_APPLY_CONFIRM` — `--apply` is technically gated on that env and refuses
+   >   (`blocked_confirm`) without it; only the owner sets it after confirming the plan.
    >
    > If the request asks for anything OUTSIDE `<caps>`, do not do it — return a short
    > refusal naming the missing capability. Never touch secrets, identity/registry files,
@@ -101,10 +102,10 @@ here.
    ```
    For a `rebuild-reload-service` / `review-merge-pr` / `provision-ingress` request, surface
    the proposed action to the owner and get confirmation BEFORE executing anything or
-   promising completion. For `provision-ingress`, the owner runs the `--apply` step
-   (`provision-ingress.sh provision|deprovision --apply`) after confirming the plan; the
-   reply back to the peer carries only `{hostname, connector_token_path, tunnel_name,
-   status}` — never the connector token value.
+   promising completion. For `provision-ingress`, the owner runs the `--apply` step with the
+   confirmation gate (`INGRESS_APPLY_CONFIRM=1 provision-ingress.sh provision|deprovision
+   --apply`) after confirming the plan; the reply back to the peer carries only `{hostname,
+   connector_token_path, tunnel_name, status}` — never the connector token value.
 
 5. Mark the work item done so it is not re-dispatched:
    ```bash

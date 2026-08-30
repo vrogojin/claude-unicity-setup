@@ -33,6 +33,7 @@ export INGRESS_CF_INI="$TMP/proj/.secrets/staging-tls/cloudflare.ini"
 export INGRESS_ZONE="concierge-dev.app"
 export INGRESS_DNS_MODE="skip"       # do not touch the Cloudflare API
 export INGRESS_SUPERVISOR="none"     # do not touch systemd
+export INGRESS_APPLY_CONFIRM="1"     # owner-confirmation gate satisfied for the apply tests
 export HOME="$TMP/home"              # controls whether cert.pem "exists"
 mkdir -p "$INGRESS_TOKEN_DIR" "$TMP/proj/.secrets/staging-tls" "$HOME"
 printf 'dns_cloudflare_api_token = testtoken\n' > "$INGRESS_CF_INI"
@@ -118,6 +119,8 @@ chk "token file created"                          "[ -f \"$INGRESS_TOKEN_DIR/ing
 chk "token file is 0600"                          "[ \"\$(stat -c '%a' \"$INGRESS_TOKEN_DIR/ingress-track-42.env\")\" = '600' ]"
 chk "token VALUE not in response"                 "! printf '%s' \"\$OUT_OK\" | grep -q \"$TOKEN_VALUE\""
 chk "token file DOES hold the value (0600 path)"  "grep -q \"$TOKEN_VALUE\" \"$INGRESS_TOKEN_DIR/ingress-track-42.env\""
+chk "cli ingress config.yml written"              "[ -f \"$INGRESS_TOKEN_DIR/ingress-track-42.config.yml\" ]"
+chk "cli config.yml maps host -> target"          "grep -q 'service: http://127.0.0.1:8931' \"$INGRESS_TOKEN_DIR/ingress-track-42.config.yml\" && grep -q 'hostname: track-42.concierge-dev.app' \"$INGRESS_TOKEN_DIR/ingress-track-42.config.yml\""
 
 # ========================================================================================
 echo "— idempotency: re-provision existing → exists, no duplicate —"
@@ -175,6 +178,10 @@ case "$method $path" in
     name="$(printf '%s' "$data" | jq -r .name)"; id="tid-$name"
     printf '%s' "$id" > "$S/tunnels/$name"
     echo "{\"result\":{\"id\":\"$id\",\"token\":\"APITOKENVALUE-$name\"}}";;
+  "PUT /accounts/acct-TEST/cfd_tunnel/"*"/configurations")
+    tid="${path%/configurations}"; tid="${tid##*/}"
+    # record the ingress config keyed by tunnel id, for the assertion
+    printf '%s' "$data" > "$S/config-$tid"; echo '{"result":{"config":{}}}';;
   "DELETE /accounts/acct-TEST/cfd_tunnel/"*)
     tid="${path##*/}"; for f in "$S/tunnels"/*; do [ -e "$f" ] || continue; [ "$(cat "$f")" = "$tid" ] && rm -f "$f"; done; echo '{"result":null}';;
   "GET /zones/zone-TEST/dns_records")
@@ -198,6 +205,8 @@ OUT_API="$(printf '%s' "$REQ" | api_run provision --apply)"
 chk "API apply → ok"                              "[ \"\$(printf '%s' \"\$OUT_API\" | j .status)\" = 'ok' ]"
 chk "API created tunnel via /cfd_tunnel"          "[ -f \"$API_STATE/tunnels/ingress-track-42\" ]"
 chk "API created the CNAME record"                "[ -f \"$API_STATE/dns/track-42.concierge-dev.app\" ]"
+chk "API configured the ingress rule (PUT config)" "[ -f \"$API_STATE/config-tid-ingress-track-42\" ]"
+chk "API ingress rule maps host -> target"        "jq -e '.config.ingress[0].hostname==\"track-42.concierge-dev.app\" and .config.ingress[0].service==\"http://127.0.0.1:8931\"' \"$API_STATE/config-tid-ingress-track-42\" >/dev/null"
 chk "API token file 0600"                          "[ \"\$(stat -c '%a' \"$INGRESS_TOKEN_DIR/ingress-track-42.env\")\" = '600' ]"
 chk "API token value not in response"             "! printf '%s' \"\$OUT_API\" | grep -q 'APITOKENVALUE'"
 OUT_API2="$(printf '%s' "$REQ" | api_run provision --apply)"
@@ -206,6 +215,43 @@ OUT_APIDEP="$(printf '%s' "$REQ" | api_run deprovision --apply)"
 chk "API deprovision → ok"                        "[ \"\$(printf '%s' \"\$OUT_APIDEP\" | j .status)\" = 'ok' ]"
 chk "API tunnel removed"                          "[ ! -f \"$API_STATE/tunnels/ingress-track-42\" ]"
 chk "API CNAME removed"                            "[ ! -f \"$API_STATE/dns/track-42.concierge-dev.app\" ]"
+
+# ========================================================================================
+echo "— per-project config (direct mode): zone + tunnel_prefix from .claude/agent/config.json —"
+PROJ2="$TMP/proj2"; mkdir -p "$PROJ2/.claude/agent" "$PROJ2/.secrets/ingress"
+cat > "$PROJ2/.claude/agent/config.json" <<EOF
+{ "ingress": { "zone": "apps.example.net", "tunnel_prefix": "amc-", "token_dir": "$PROJ2/.secrets/ingress" } }
+EOF
+cfg_plan() { # runs the hook against PROJ2's config, with the top-level zone/dir exports CLEARED
+  # so resolution must come from the project config block (env -u strips the inherited exports).
+  env -u INGRESS_ZONE -u INGRESS_TOKEN_DIR -u INGRESS_TUNNEL_PREFIX -u INGRESS_SECRETS_DIR \
+    INGRESS_PROJECT_DIR="$PROJ2" INGRESS_SECRETS_DIR="$PROJ2/.secrets" \
+    INGRESS_CF_INI="$INGRESS_CF_INI" INGRESS_DNS_MODE=skip INGRESS_SUPERVISOR=none \
+    HOME="$TMP/home" bash "$SH" "$@"
+}
+OUT_CFG="$(printf '{"target":"127.0.0.1:9000","hostname":"foo.apps.example.net"}' | cfg_plan provision --plan)"
+chk "config zone accepted (foo.apps.example.net)"  "[ \"\$(printf '%s' \"\$OUT_CFG\" | j .status)\" != 'invalid' ]"
+chk "config tunnel_prefix applied (amc-foo)"        "[ \"\$(printf '%s' \"\$OUT_CFG\" | j .tunnel_name)\" = 'amc-foo' ]"
+chk "config token_dir applied"                      "printf '%s' \"\$OUT_CFG\" | j .connector_token_path | grep -q '/proj2/.secrets/ingress/amc-foo.env'"
+OUT_CFG_BAD="$(printf '{"target":"127.0.0.1:9000","hostname":"foo.concierge-dev.app"}' | cfg_plan provision --plan)"
+chk "default zone rejected when config overrides it" "[ \"\$(printf '%s' \"\$OUT_CFG_BAD\" | j .status)\" = 'invalid' ]"
+OUT_ENV="$(printf '{"target":"127.0.0.1:9000","hostname":"bar.zone.dev"}' | \
+  env -u INGRESS_TOKEN_DIR -u INGRESS_TUNNEL_PREFIX -u INGRESS_SECRETS_DIR \
+    INGRESS_PROJECT_DIR="$PROJ2" INGRESS_SECRETS_DIR="$PROJ2/.secrets" INGRESS_CF_INI="$INGRESS_CF_INI" \
+    INGRESS_DNS_MODE=skip INGRESS_SUPERVISOR=none INGRESS_ZONE=zone.dev HOME="$TMP/home" \
+    bash "$SH" provision --plan)"
+chk "ENV zone overrides project config"             "[ \"\$(printf '%s' \"\$OUT_ENV\" | j .status)\" != 'invalid' ]"
+
+# ========================================================================================
+echo "— owner-confirmation gate: --apply without INGRESS_APPLY_CONFIRM refuses + no mutation —"
+CF_STATE2="$TMP/cfstate2"; mkdir -p "$CF_STATE2"
+OUT_NC="$(printf '%s' "$REQ" | env -u INGRESS_APPLY_CONFIRM CF_STATE="$CF_STATE2" HOME="$TMP/home" bash "$SH" provision --apply)"
+chk "unconfirmed --apply → blocked_confirm"        "[ \"\$(printf '%s' \"\$OUT_NC\" | j .status)\" = 'blocked_confirm' ]"
+chk "unconfirmed --apply created NO tunnel"        "[ \"\$(ls \"$CF_STATE2\" | wc -l | tr -d ' ')\" = '0' ]"
+chk "unconfirmed --apply wrote NO token file"      "[ ! -f \"$INGRESS_TOKEN_DIR/ingress-track-42.env\" ]"
+# --plan needs no confirmation:
+OUT_NCP="$(printf '%s' "$REQ" | env -u INGRESS_APPLY_CONFIRM CF_STATE="$CF_STATE2" HOME="$TMP/home" bash "$SH" provision --plan | j .status)"
+chk "--plan needs no confirmation"                 "[ \"$OUT_NCP\" != 'blocked_confirm' ]"
 
 echo
 if [ "$FAIL" = 0 ]; then printf '\033[32mALL PASS\033[0m\n'; else printf '\033[31mSOME FAILED\033[0m\n'; fi
