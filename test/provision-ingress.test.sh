@@ -25,6 +25,19 @@ STUB="$TMP/bin"; mkdir -p "$STUB"
 # ========================================================================================
 echo "== A. haproxy mode (primary) =="
 export HP_STATE="$TMP/hpstate"; mkdir -p "$HP_STATE"
+# docker stub for the existence-based container allowlist (primary target pin).
+cat > "$STUB/docker" <<'EOF'
+#!/usr/bin/env bash
+set -u
+name="${!#}"
+case " ${DOCKER_NET_MEMBERS:-} " in *" $name "*) printf 'bridge\nhaproxy-net\n'; exit 0;; esac
+case " ${DOCKER_OFFNET:-} " in *" $name "*) printf 'bridge\n'; exit 0;; esac
+exit 1
+EOF
+chmod +x "$STUB/docker"
+export DOCKER_BIN="$STUB/docker"
+export DOCKER_NET_MEMBERS="track42-web c1"   # containers attached to haproxy-net
+export DOCKER_OFFNET="offnet-svc"            # exists but NOT on haproxy-net
 cat > "$STUB/curl-haproxy" <<'EOF'
 #!/usr/bin/env bash
 # Stub of the haproxy Registration API. Honors -X, --data, and -w '%{http_code}' (prints code).
@@ -84,11 +97,12 @@ chk "haproxy registered the domain"           "[ -f \"$HP_STATE/track-42.staging
 OUT_I="$(printf '%s' "$REQ_HP" | hp provision --apply)"
 chk "haproxy re-provision same target → exists" "[ \"\$(printf '%s' \"\$OUT_I\" | j .status)\" = 'exists' ]"
 chk "still exactly one registration"          "[ \"\$(ls \"$HP_STATE\" | wc -l | tr -d ' ')\" = '1' ]"
-# retarget the SAME hostname to a DIFFERENT container → must be reported as 'changed', not a no-op
+# retarget the SAME hostname to a DIFFERENT target → must REFUSE with 'conflict', no repoint
 OUT_C="$(printf '{\"hostname\":\"track-42.staging.concierge-dev.app\",\"target\":\"track42-web:9090\"}' | hp provision --apply)"
-chk "haproxy retarget → changed (not silent)"  "[ \"\$(printf '%s' \"\$OUT_C\" | j .status)\" = 'changed' ]"
-OUT_CP="$(printf '{\"hostname\":\"track-42.staging.concierge-dev.app\",\"target\":\"track42-web:7000\"}' | INGRESS_MODE=haproxy INGRESS_HAPROXY_HOST=haproxy-test INGRESS_CURL="$STUB/curl-haproxy-post" INGRESS_PROJECT_DIR="$TMP/noproj" bash "$SH" provision --plan)"
-chk "haproxy plan retarget → planned+REPOINT"  "printf '%s' \"\$OUT_CP\" | jq -e '.status==\"planned\" and (.reason|test(\"REPOINT\"))' >/dev/null"
+chk "haproxy retarget → conflict (refuse)"     "[ \"\$(printf '%s' \"\$OUT_C\" | j .status)\" = 'conflict' ]"
+chk "conflict did NOT repoint the route"        "jq -e '.http_port==8080' \"$HP_STATE/track-42.staging.concierge-dev.app\" >/dev/null"
+OUT_CP="$(printf '{\"hostname\":\"track-42.staging.concierge-dev.app\",\"target\":\"track42-web:7000\"}' | hp provision --plan)"
+chk "haproxy plan retarget → conflict"          "[ \"\$(printf '%s' \"\$OUT_CP\" | j .status)\" = 'conflict' ]"
 OUT_D="$(printf '%s' "$REQ_HP" | hp deprovision --apply)"
 chk "haproxy deprovision → ok"                 "[ \"\$(printf '%s' \"\$OUT_D\" | j .status)\" = 'ok' ]"
 chk "registration removed"                     "[ ! -f \"$HP_STATE/track-42.staging.concierge-dev.app\" ]"
@@ -100,15 +114,21 @@ LB="$(printf '{\"hostname\":\"x.staging.concierge-dev.app\",\"target\":\"127.0.0
 chk "haproxy loopback target → invalid"        "[ \"$LB\" = 'invalid' ]"
 BADC="$(printf '{\"hostname\":\"x.staging.concierge-dev.app\",\"target\":\"bad name:80\"}' | INGRESS_MODE=haproxy INGRESS_HAPROXY_HOST=h bash "$SH" provision --plan | j .status)"
 chk "haproxy invalid container chars → invalid" "[ \"$BADC\" = 'invalid' ]"
-# SSRF/open-proxy guard: an IP literal / numeric host must NEVER be accepted as a container
-ipchk(){ printf '{"hostname":"x.staging.concierge-dev.app","target":"%s"}' "$1" | INGRESS_MODE=haproxy INGRESS_HAPROXY_HOST=h bash "$SH" provision --plan | j .status; }
+# EXISTENCE-BASED ALLOWLIST (primary) + IP-literal reject (belt-and-suspenders).
+ipchk(){ printf '{"hostname":"x.staging.concierge-dev.app","target":"%s"}' "$1" | INGRESS_MODE=haproxy INGRESS_HAPROXY_HOST=haproxy-test INGRESS_CURL="$STUB/curl-haproxy-post" bash "$SH" provision --plan | j .status; }
 chk "haproxy public IP target → invalid"       "[ \"\$(ipchk '8.8.8.8:80')\" = 'invalid' ]"
 chk "haproxy metadata IP target → invalid"     "[ \"\$(ipchk '169.254.169.254:80')\" = 'invalid' ]"
 chk "haproxy docker-gw IP target → invalid"    "[ \"\$(ipchk '172.17.0.1:80')\" = 'invalid' ]"
 chk "haproxy numeric host → invalid"           "[ \"\$(ipchk '2130706433:80')\" = 'invalid' ]"
 chk "haproxy hex IP → invalid"                 "[ \"\$(ipchk '0x7f000001:80')\" = 'invalid' ]"
 chk "haproxy octal-dotted IP → invalid"        "[ \"\$(ipchk '0300.0250.0.01:80')\" = 'invalid' ]"
-chk "haproxy legit container name still OK"    "[ \"\$(ipchk 'track42-web:80')\" != 'invalid' ]"
+chk "haproxy on-net container → planned"       "[ \"\$(ipchk 'track42-web:80')\" = 'planned' ]"
+# the real control: a name that is NOT a container on haproxy-net is rejected regardless of spelling
+chk "haproxy off-net container → invalid"      "[ \"\$(ipchk 'offnet-svc:80')\" = 'invalid' ]"
+chk "haproxy nonexistent container → invalid"  "[ \"\$(ipchk 'ghost-svc:80')\" = 'invalid' ]"
+# require mode + no docker → blocked_config (fail-closed)
+RC="$(printf '{\"hostname\":\"x.staging.concierge-dev.app\",\"target\":\"track42-web:80\"}' | env -u DOCKER_BIN DOCKER_BIN=/nonexistent-docker INGRESS_VERIFY_CONTAINER=require INGRESS_MODE=haproxy INGRESS_HAPROXY_HOST=h bash "$SH" provision --plan | j .status)"
+chk "verify=require + no docker → blocked_config" "[ \"$RC\" = 'blocked_config' ]"
 # zone-pin under staging.concierge-dev.app
 WZ="$(printf '{\"hostname\":\"x.evil.net\",\"target\":\"c:80\"}' | INGRESS_MODE=haproxy INGRESS_HAPROXY_HOST=h bash "$SH" provision --plan | j .status)"
 chk "haproxy wrong zone → invalid"             "[ \"$WZ\" = 'invalid' ]"

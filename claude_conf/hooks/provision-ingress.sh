@@ -80,6 +80,12 @@ INGRESS_ZONE="$(_pick "${INGRESS_ZONE:-}" '.ingress.zone' "$(_default_zone)")"
 INGRESS_HAPROXY_HOST="$(_pick "${INGRESS_HAPROXY_HOST:-${HAPROXY_HOST:-}}" '.ingress.haproxy_host' '')"
 INGRESS_HAPROXY_API_PORT="$(_pick "${INGRESS_HAPROXY_API_PORT:-}" '.ingress.haproxy_api_port' '8404')"
 INGRESS_HAPROXY_HTTPS_PORT="$(_pick "${INGRESS_HAPROXY_HTTPS_PORT:-}" '.ingress.haproxy_https_port' '443')"
+INGRESS_HAPROXY_NET="$(_pick "${INGRESS_HAPROXY_NET:-}" '.ingress.haproxy_net' 'haproxy-net')"
+# Container allowlist enforcement: auto = enforce when docker is available, else fall back to
+# the IP-literal reject (SSRF still closed); require = fail-closed if docker is unavailable;
+# off = skip (rely on the IP reject only).
+INGRESS_VERIFY_CONTAINER="$(_pick "${INGRESS_VERIFY_CONTAINER:-}" '.ingress.verify_container' 'auto')"
+DOCKER_BIN="${DOCKER_BIN:-docker}"
 
 # --- tunnel (fallback) knobs ---
 SECRETS_DIR="${INGRESS_SECRETS_DIR:-$PROJECT_DIR/.secrets}"
@@ -99,6 +105,17 @@ _have() { command -v "$1" >/dev/null 2>&1; }
 # never hang --plan, which the unattended /process-agent-requests processor runs per request.
 _curl() { "${INGRESS_CURL:-curl}" --connect-timeout "${INGRESS_CURL_CONNECT_TIMEOUT:-3}" --max-time "${INGRESS_CURL_MAX_TIME:-8}" "$@"; }
 _cf()   { "$CLOUDFLARED_BIN" "$@"; }                  # cloudflared wrapper (stub-able)
+_docker() { "$DOCKER_BIN" "$@"; }                    # docker wrapper (stub-able)
+
+# PRIMARY haproxy target allowlist: is <container> a real container ATTACHED to haproxy-net?
+# This makes every IP-literal encoding moot — an arbitrary address is not a container on the
+# shared proxy network, so it is rejected regardless of spelling. 0 = on-net, 1 = not.
+_container_on_haproxy_net() {  # <container>
+  local nets; nets="$(_docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}
+{{end}}' "$1" 2>/dev/null)" || return 1
+  case $'\n'"$nets"$'\n' in *$'\n'"$INGRESS_HAPROXY_NET"$'\n'*) return 0;; esac
+  return 1
+}
 
 # --- JSON emit: single object to stdout, then exit. A token/secret value is never a field.
 _emit() {  # <status> <reason> [remediation-json-array]
@@ -186,7 +203,8 @@ _derive() {
       *[!a-zA-Z0-9_.-]* ) return 14;;                         # invalid docker name chars (also bars [] : )
       [!a-zA-Z0-9]* ) return 14;;                             # must start alnum
     esac
-    # Reject anything that could be an IP literal, never a container name:
+    # Belt-and-suspenders IP-literal reject (the existence allowlist below is the real
+    # control). Reject anything that could be an IP literal, never a container name:
     #   • all digits+dots  → dotted-quad / octal / decimal-int / trailing-dot forms
     #   • 0x… / 0X…         → hex IP literal
     # (IPv6 / v4-in-v6 already fall out: their ':' / '[' fail the split or the charset check.)
@@ -196,6 +214,17 @@ _derive() {
     case "$TARGET_HOST" in
       *[!0-9.]* ) : ;;                                        # has a name char → OK
       * ) return 16;;                                         # all digits/dots → IP/numeric → reject
+    esac
+    # PRIMARY control — EXISTENCE-BASED ALLOWLIST: the target must be a real container
+    # ATTACHED to haproxy-net. Any IP/hostname (in any encoding) is not a container on that
+    # network, so this rejects the whole SSRF class by construction, not by spelling.
+    case "$INGRESS_VERIFY_CONTAINER" in
+      off) : ;;
+      *) if _have "$DOCKER_BIN"; then
+           _container_on_haproxy_net "$TARGET_HOST" || return 17
+         elif [ "$INGRESS_VERIFY_CONTAINER" = require ]; then
+           return 18
+         fi;;
     esac
     BACKEND_DESC="$TARGET_HOST:$TARGET_PORT"
     # https_port: request > config default; empty/0/"null" → HTTP-only (null in the API).
@@ -222,6 +251,8 @@ _validate_or_die() {
     14) _emit invalid "haproxy-mode target must be a container name:port on haproxy-net (not loopback); got '$TARGET_HOST'"; exit 0;;
     15) _emit invalid "https_port must be an integer or null; got '$HTTPS_PORT'"; exit 0;;
     16) _emit invalid "haproxy-mode target must be a container NAME on haproxy-net, not an IP address or numeric host; got '$TARGET_HOST'"; exit 0;;
+    17) _emit invalid "haproxy-mode target container '$TARGET_HOST' is not a running container attached to the '$INGRESS_HAPROXY_NET' network — refusing (only real containers on the shared proxy network may be exposed)"; exit 0;;
+    18) _emit blocked_config "cannot verify container membership: docker CLI unavailable and INGRESS_VERIFY_CONTAINER=require. Install docker access or set INGRESS_VERIFY_CONTAINER=auto."; exit 0;;
   esac
 }
 
@@ -265,11 +296,11 @@ _plan_haproxy() {
   local cur; cur="$(_haproxy_backend_now)"
   if [ -n "$cur" ]; then
     if [ "$cur" = "$BACKEND_DESC" ]; then _emit exists "'$HOSTNAME_REQ' is already registered to the SAME target $BACKEND_DESC; provision would be a no-op"
-    else _emit planned "would REPOINT '$HOSTNAME_REQ' from $cur to $BACKEND_DESC — an existing public route would change (not a no-op)"; fi
+    else _emit conflict "'$HOSTNAME_REQ' is already registered to a DIFFERENT target ($cur); apply would REFUSE (no silent repoint). Deprovision it first, or request the existing target."; fi
     return
   fi
   if _haproxy_exists 2>/dev/null; then
-    _emit planned "a registration for '$HOSTNAME_REQ' already exists (current target unreadable); apply would (re)point it to $BACKEND_DESC"; return
+    _emit conflict "a registration for '$HOSTNAME_REQ' already exists (current target unreadable); apply would REFUSE to repoint. Deprovision it first."; return
   fi
   _emit planned "would register '$HOSTNAME_REQ' -> $BACKEND_DESC (https_port=${HTTPS_PORT:-null}) with the haproxy Registration API at $base"
 }
@@ -279,8 +310,15 @@ _apply_haproxy() {
       "$(jq -cn '["Set HAPROXY_HOST (env / project .env / .ingress.haproxy_host)."]')"
     return
   fi
-  local cur existed=0; cur="$(_haproxy_backend_now)"; [ -n "$cur" ] && existed=1
-  [ "$existed" = 0 ] && _haproxy_exists 2>/dev/null && existed=1   # exists but body unreadable
+  # Collision guard BEFORE any POST: never silently repoint a live public route.
+  local cur; cur="$(_haproxy_backend_now)"
+  if [ -n "$cur" ]; then
+    [ "$cur" = "$BACKEND_DESC" ] && { _emit exists "'$HOSTNAME_REQ' already registered to $BACKEND_DESC; no change"; return; }
+    _emit conflict "'$HOSTNAME_REQ' is already registered to a DIFFERENT target ($cur); REFUSING to repoint to $BACKEND_DESC. Deprovision it first."; return
+  fi
+  if _haproxy_exists 2>/dev/null; then
+    _emit conflict "'$HOSTNAME_REQ' already has a registration (current target unreadable); REFUSING to repoint. Deprovision it first."; return
+  fi
   local hp; if [ -n "$HTTPS_PORT" ]; then hp="$HTTPS_PORT"; else hp="null"; fi
   local body; body="$(jq -cn --arg d "$HOSTNAME_REQ" --arg c "$TARGET_HOST" \
       --argjson http "$TARGET_PORT" --argjson https "$hp" \
@@ -289,10 +327,7 @@ _apply_haproxy() {
   code="$(_curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' \
       "$base" --data "$body" 2>/dev/null)"
   case "$code" in
-    2??) if [ "$existed" = 1 ]; then
-           if [ -n "$cur" ] && [ "$cur" = "$BACKEND_DESC" ]; then _emit exists "'$HOSTNAME_REQ' already registered to $BACKEND_DESC; no change"
-           else _emit changed "re-pointed '$HOSTNAME_REQ' to $BACKEND_DESC via haproxy${cur:+ (was $cur)}"; fi
-         else _emit ok "registered '$HOSTNAME_REQ' -> $BACKEND_DESC via haproxy (https_port=${HTTPS_PORT:-null})"; fi;;
+    2??) _emit ok "registered '$HOSTNAME_REQ' -> $BACKEND_DESC via haproxy (https_port=${HTTPS_PORT:-null})";;
     000|"") _emit error "haproxy Registration API unreachable at $base (curl failed)";;
     *) _emit error "haproxy Registration API returned HTTP $code registering '$HOSTNAME_REQ'";;
   esac

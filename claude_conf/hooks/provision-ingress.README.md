@@ -41,8 +41,14 @@ Two hard input controls, enforced before any mutation:
 - **Zone pin** — `hostname` must be a subdomain of `INGRESS_ZONE` (haproxy default
   `staging.concierge-dev.app`; tunnel default `concierge-dev.app`). No zone-escape.
 - **Target pin** (mode-specific):
-  - haproxy → `target` is a **container name:port** on `haproxy-net`. Loopback is REJECTED —
-    the shared haproxy runs in a container and cannot reach the host's `127.0.0.1`.
+  - haproxy → the target must be a **real container that is actually attached to
+    `haproxy-net`**. This is an **existence-based allowlist** (verified via `docker` before
+    accepting), which is the PRIMARY control — it rejects every off-network target *by
+    construction*, so no IP-literal spelling (dotted-quad, decimal, octal, hex, v4-in-v6,
+    trailing-dot, the docker gateway, or a cloud metadata endpoint) can be reached. An
+    IP-literal reject runs as belt-and-suspenders. `INGRESS_VERIFY_CONTAINER`: `auto`
+    (default — enforce when docker is available, else fall back to the IP reject), `require`
+    (fail-closed → `blocked_config` if docker is unavailable), `off`. Loopback is rejected.
   - tunnel → `target` must be `127.0.0.1:<port>` (or `localhost`). No open proxy.
 
 ## Request / response contract
@@ -76,20 +82,18 @@ non-secret `reason`, `remediation[]`. **No token/secret value is ever a field.**
   "tunnel_name": "ingress-track-42", "reason": "…" }
 ```
 
-`status`: `planned` (plan preview) · `ok` · `exists` (idempotent no-op) · `changed`
-(haproxy: an existing route was repointed to a new target) · `not_found` · `blocked_config`
-(haproxy: `HAPROXY_HOST` unresolved) · `blocked_scope` (tunnel: no usable Cloudflare
+`status`: `planned` (plan preview) · `ok` · `exists` (idempotent no-op) · `conflict`
+(haproxy: the hostname is already registered to a DIFFERENT target — **refused, not
+repointed**) · `not_found` · `blocked_config` (haproxy: `HAPROXY_HOST` unresolved, or
+`verify_container=require` with no docker) · `blocked_scope` (tunnel: no usable Cloudflare
 credential — never faked) · `blocked_confirm` (`--apply` without `INGRESS_APPLY_CONFIRM=1`) ·
 `partial` · `invalid` · `error` (rolled back).
 
 **Idempotent** — re-provisioning an existing hostname to the SAME target returns `exists`,
-never a duplicate; to a DIFFERENT target it returns `changed` (and `--plan` says "would
-REPOINT …"), so a live public route is never silently retargeted. `deprovision` is
-idempotent too (`not_found` when already gone). The haproxy **target pin** also rejects IP
-literals / numeric hosts (only a real container NAME on `haproxy-net` is accepted), closing
-an SSRF/open-proxy vector (arbitrary IP, docker gateway, or cloud metadata endpoint) under
-the owned public hostname. All API calls are timeout-bounded so a down dependency can never
-hang the unattended `--plan`.
+never a duplicate. To a DIFFERENT target it returns `conflict` and **refuses** (no POST) —
+a live public route is never silently retargeted; deprovision it first. `deprovision` is
+idempotent too (`not_found` when already gone). All API calls are timeout-bounded so a down
+dependency can never hang the unattended `--plan`.
 
 ## haproxy mode — what `--apply` does (no secret)
 
@@ -150,6 +154,9 @@ Only paths/names live in config — secrets stay env/secret-file only.
 | `INGRESS_HAPROXY_HOST` (or `HAPROXY_HOST`) | `.ingress.haproxy_host` | (project `.env`) | shared haproxy Registration API host |
 | `INGRESS_HAPROXY_API_PORT` | `.ingress.haproxy_api_port` | `8404` | Registration API port |
 | `INGRESS_HAPROXY_HTTPS_PORT` | `.ingress.haproxy_https_port` | `443` | https_port advertised (null = HTTP-only) |
+| `INGRESS_HAPROXY_NET` | `.ingress.haproxy_net` | `haproxy-net` | the shared proxy network the target container must be on |
+| `INGRESS_VERIFY_CONTAINER` | `.ingress.verify_container` | `auto` | container allowlist: `auto` \| `require` \| `off` |
+| `DOCKER_BIN` | — | `docker` | docker CLI used for the container-membership check |
 | `INGRESS_APPLY_CONFIRM` | — (env only) | — | must be `1` for `--apply` (owner-confirm gate) |
 | `INGRESS_CF_INI` | `.ingress.cloudflare_ini` | `<project>/.secrets/staging-tls/cloudflare.ini` | tunnel: token file (auto-read) |
 | `INGRESS_TOKEN_DIR` | `.ingress.token_dir` | `<project>/.secrets/ingress` | tunnel: 0600 token store |
@@ -163,6 +170,8 @@ Only paths/names live in config — secrets stay env/secret-file only.
   main provisions nothing on its own.
 - **No secret is emitted or logged.** haproxy mode uses no secret at all; tunnel mode returns
   only the connector token's `0600` path.
-- Zone + target pins block zone-escape and open-proxy/loopback-misroute before any mutation.
+- Zone pin blocks zone-escape. The haproxy **target pin is an existence-based allowlist**
+  (container must be on `haproxy-net`) — the primary SSRF/open-proxy control, not an IP
+  blacklist; tunnel mode pins to loopback. Enforced before any mutation.
 - A failed tunnel `--apply` **rolls back** — no orphaned tunnels, tokens, or config.
 - `blocked_scope` / `blocked_config` are returned honestly — success is never faked.
