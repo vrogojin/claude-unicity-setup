@@ -186,7 +186,13 @@ _derive() {
       *[!a-zA-Z0-9_.-]* ) return 14;;                         # invalid docker name chars (also bars [] : )
       [!a-zA-Z0-9]* ) return 14;;                             # must start alnum
     esac
-    # Only digits and dots ⇒ an IPv4 literal or a numeric host, never a container name.
+    # Reject anything that could be an IP literal, never a container name:
+    #   • all digits+dots  → dotted-quad / octal / decimal-int / trailing-dot forms
+    #   • 0x… / 0X…         → hex IP literal
+    # (IPv6 / v4-in-v6 already fall out: their ':' / '[' fail the split or the charset check.)
+    case "$TARGET_HOST" in
+      0[xX]* ) return 16;;
+    esac
     case "$TARGET_HOST" in
       *[!0-9.]* ) : ;;                                        # has a name char → OK
       * ) return 16;;                                         # all digits/dots → IP/numeric → reject

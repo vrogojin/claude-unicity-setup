@@ -106,6 +106,9 @@ chk "haproxy public IP target → invalid"       "[ \"\$(ipchk '8.8.8.8:80')\" =
 chk "haproxy metadata IP target → invalid"     "[ \"\$(ipchk '169.254.169.254:80')\" = 'invalid' ]"
 chk "haproxy docker-gw IP target → invalid"    "[ \"\$(ipchk '172.17.0.1:80')\" = 'invalid' ]"
 chk "haproxy numeric host → invalid"           "[ \"\$(ipchk '2130706433:80')\" = 'invalid' ]"
+chk "haproxy hex IP → invalid"                 "[ \"\$(ipchk '0x7f000001:80')\" = 'invalid' ]"
+chk "haproxy octal-dotted IP → invalid"        "[ \"\$(ipchk '0300.0250.0.01:80')\" = 'invalid' ]"
+chk "haproxy legit container name still OK"    "[ \"\$(ipchk 'track42-web:80')\" != 'invalid' ]"
 # zone-pin under staging.concierge-dev.app
 WZ="$(printf '{\"hostname\":\"x.evil.net\",\"target\":\"c:80\"}' | INGRESS_MODE=haproxy INGRESS_HAPROXY_HOST=h bash "$SH" provision --plan | j .status)"
 chk "haproxy wrong zone → invalid"             "[ \"$WZ\" = 'invalid' ]"
