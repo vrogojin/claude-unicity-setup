@@ -168,6 +168,7 @@ An explicit, extensible enum (defined in `agent-registry.sh`, `caps` subcommand)
 | `dev-advice` | receive development/design guidance | read |
 | `rebuild-reload-service` | request a service rebuild/reload | **destructive** |
 | `review-merge-pr` | request a PR review/merge | **outward** |
+| `provision-ingress` | request a public hostname for a service they spawned — haproxy-register (primary, no secret) or Cloudflare tunnel (fallback); provision/deprovision; see [`provision-ingress.README.md`](../claude_conf/hooks/provision-ingress.README.md) | **destructive/outward** |
 | `team-coordinate` | participate in team coordination (invite/cfp/award/progress/snapshot/lease) | team |
 | `task-bid` | bid on and deliver team tasks (bid/result) | team |
 | `knowledge-share` | publish/receive team knowledge cards (kb.publish) | team |
@@ -248,7 +249,8 @@ work item it:
    whose prompt states the requester, the request body, and the **exact** capabilities it
    holds — with the hard rule: *do only what falls within these capabilities; refuse
    anything else and say which capability is missing; never touch secrets/registry/.env;
-   `rebuild-reload-service` and `review-merge-pr` are propose-only, the owner executes.*
+   `rebuild-reload-service`, `review-merge-pr`, and `provision-ingress` are propose-only,
+   the owner executes.*
 3. Sends the processor's reply back with `/dm-agent`, and for destructive/outward requests
    surfaces the proposed action to the owner for confirmation before anything runs.
 4. Marks the work item `done` (or `skipped` if authorization was revoked).
@@ -357,8 +359,8 @@ Debug the effective config with `bash .claude/hooks/sif-guard.sh config`.
 - **Inert-safe.** An empty registry queues everything for owner authorization and does
   nothing else. Deleting the registry resets to that state.
 - **Least privilege.** Grant the narrowest capability set; revoke with `/deny-agent`.
-- **Owner-confirmation stands.** `rebuild-reload-service` / `review-merge-pr` are
-  request-only; the owner confirms and executes.
+- **Owner-confirmation stands.** `rebuild-reload-service` / `review-merge-pr` /
+  `provision-ingress` are request-only; the owner confirms and executes.
 - **Secrets never leave.** Identity, registry, and `.env`/`.secrets` are gitignored and
   never transmitted; processors are told not to touch them.
 - **No hook auto-executes remote intent.** Hooks classify, queue, and surface — they
