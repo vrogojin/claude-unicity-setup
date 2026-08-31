@@ -1345,6 +1345,158 @@ else
 fi
 
 # ============================================================
+# Phase 11: gptbridge — ChatGPT/Codex coupling (install-only, OFF by default)
+# ============================================================
+# Seeds the full `gptbridge` config block (design §7.1) into agent/config.json —
+# T1 (Codex coupling) wired here; T2 (relay) + T3 (model-consult) seeded OFF so
+# the config surface is complete and extensible. Installs the fenced reverse
+# wrapper (already copied by the Phase 1 recursive cp) + templates, reports a
+# preflight (codex/cloudflared/OPENAI_API_KEY — absence is informational, the
+# feature is OFF), and — ONLY when fully enabled AND `codex` is on PATH — merges
+# the forward `codex` MCP server into the project .mcp.json. A fresh install lands
+# DISABLED: nothing is enabled, no network surface, no API spend.
+echo ""
+info "Phase 11: gptbridge (ChatGPT/Codex coupling)..."
+
+# Master gate: SETUP_GPTBRIDGE=1 pre-enables at install (non-interactive override
+# contract), else existing config value, else OFF. setup.sh NEVER forces it true.
+# Read existing values with an explicit `if` (NOT `[ -f ] && VAR=$(jq)`): jq as the
+# last command of an &&-list is NOT set -e exempt, so a malformed config would
+# abort the whole setup — the `|| echo` fallback keeps it robust.
+GB_EX=false
+if [ -f "$CONFIG_FILE" ]; then GB_EX=$(jq -r '.gptbridge.enabled // false' "$CONFIG_FILE" 2>/dev/null || echo false); fi
+[ "$GB_EX" = "true" ] || GB_EX=false
+# Treat SET-BUT-EMPTY as "no choice" (falls through to existing) — a stray empty
+# export must not silently flip the gate.
+if [ -n "${SETUP_GPTBRIDGE:-}" ]; then
+  case "$SETUP_GPTBRIDGE" in 1|true|yes|on) GB_MASTER=true ;; *) GB_MASTER=false ;; esac
+else
+  GB_MASTER=$GB_EX
+fi
+# codex tier flag (default on — effective only when master gate on AND codex on PATH).
+GB_CODEX_EX=true
+if [ -f "$CONFIG_FILE" ]; then GB_CODEX_EX=$(jq -r '.gptbridge.codex.enabled // true' "$CONFIG_FILE" 2>/dev/null || echo true); fi
+[ "$GB_CODEX_EX" = "false" ] || GB_CODEX_EX=true
+if [ -n "${SETUP_GPTBRIDGE_CODEX:-}" ]; then
+  case "$SETUP_GPTBRIDGE_CODEX" in 0|false|no|off) GB_CODEX=false ;; *) GB_CODEX=true ;; esac
+else
+  GB_CODEX=$GB_CODEX_EX
+fi
+
+# Default gptbridge block — the full §7.1 schema. All tiers OFF; codex tier flag on
+# (gated by the master gate). Seeding T2/T3 keys now means the next feature deep-
+# merges under them without a schema migration.
+GPTBRIDGE_DEFAULTS=$(jq -n '{
+  enabled: false,
+  codex: { enabled: true, sandbox: "read-only", tool_timeout_s: 300,
+           consult_claude: { max_turns: 15, timeout_s: 300, max_question_kb: 8,
+                             allowed_tools: ["Read","Grep","Glob","LS"] } },
+  relay: { enabled: false, port: 8873, expose: "quicktunnel", ttl_hours: 4,
+           stop_with_session: true, sync_wait_s: 20, reply_policy: "owner_approve",
+           max_consult_kb: 16, max_consults_per_hour: 30 },
+  model_consult: { enabled: false, server: "mcp-chatgpt-responses" },
+  advanced_read_tools: false
+}')
+
+if [ "$DRY_RUN" = "true" ]; then
+  info "[dry-run] Seed .gptbridge defaults (enabled=$GB_MASTER, codex=$GB_CODEX) into $CONFIG_FILE"
+else
+  if [ -f "$CONFIG_FILE" ] && jq -e 'type=="object"' "$CONFIG_FILE" >/dev/null 2>&1; then
+    # Deep-merge defaults UNDER the existing block (existing leaf wins → user
+    # tuning of caps survives a re-run), then force the on/off flags deterministically.
+    if jq --argjson def "$GPTBRIDGE_DEFAULTS" --argjson master "$GB_MASTER" --argjson codex "$GB_CODEX" '
+          .gptbridge = ($def * (.gptbridge // {}))
+          | .gptbridge.enabled = $master
+          | .gptbridge.codex.enabled = $codex
+        ' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" 2>/dev/null; then
+      mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+      ok "Seeded gptbridge config (enabled=$GB_MASTER, codex tier=$GB_CODEX; all tiers OFF unless enabled)"
+    else
+      rm -f "$CONFIG_FILE.tmp"
+      warn "gptbridge config seed failed — existing config left untouched at $CONFIG_FILE"
+    fi
+  else
+    warn "config.json missing/not-an-object — gptbridge seed skipped (identity phase must run first)"
+  fi
+fi
+
+# Make the reverse-direction fenced wrapper node-runnable regardless of umask.
+[ -f "$CLAUDE_DIR/hooks/gptbridge/consult-claude-mcp.mjs" ] && \
+  run_or_dry chmod +x "$CLAUDE_DIR/hooks/gptbridge/consult-claude-mcp.mjs"
+
+# Preflight report (informational — the feature is OFF; absence is not an error).
+GB_HAVE_CODEX=no; command -v codex >/dev/null 2>&1 && GB_HAVE_CODEX=yes
+GB_HAVE_CF=no; command -v cloudflared >/dev/null 2>&1 && GB_HAVE_CF=yes
+GB_HAVE_KEY=no; [ -n "${OPENAI_API_KEY:-}" ] && GB_HAVE_KEY=yes
+
+# T1 forward: merge the `codex` MCP server into the project .mcp.json ONLY when
+# fully enabled AND codex is installed. Fresh (OFF) install → skipped.
+GB_FWD_STATUS="not merged (gptbridge master gate OFF)"
+GB_MCP_DEST="$TARGET_DIR/.mcp.json"
+GB_TEMPLATE="$CLAUDE_DIR/templates/mcp-gptbridge.json"
+if [ "$GB_MASTER" = "true" ] && [ "$GB_CODEX" = "true" ] && [ "$GB_HAVE_CODEX" = "yes" ] && [ -f "$GB_TEMPLATE" ]; then
+  if [ "$DRY_RUN" = "true" ]; then
+    GB_FWD_STATUS="[dry-run] would merge 'codex' server into $GB_MCP_DEST"
+  elif [ -f "$GB_MCP_DEST" ]; then
+    if jq -s '.[0] as $dst | .[1].mcpServers.codex as $codex
+              | $dst | .mcpServers = ((.mcpServers // {}) + {codex:$codex})' \
+          "$GB_MCP_DEST" "$GB_TEMPLATE" > "$GB_MCP_DEST.tmp" 2>/dev/null; then
+      mv "$GB_MCP_DEST.tmp" "$GB_MCP_DEST"; GB_FWD_STATUS="merged 'codex' server into .mcp.json"
+    else
+      rm -f "$GB_MCP_DEST.tmp"; GB_FWD_STATUS="MERGE FAILED — add the codex entry manually (see template)"
+    fi
+  else
+    # Create branch: write via .tmp+mv so a jq failure can't leave a truncated
+    # zero-byte .mcp.json that Claude Code then fails to parse.
+    if jq -n --slurpfile t "$GB_TEMPLATE" '{mcpServers:{codex:$t[0].mcpServers.codex}}' > "$GB_MCP_DEST.tmp" 2>/dev/null; then
+      mv "$GB_MCP_DEST.tmp" "$GB_MCP_DEST"; GB_FWD_STATUS="created .mcp.json with 'codex' server"
+    else
+      rm -f "$GB_MCP_DEST.tmp"; GB_FWD_STATUS="CREATE FAILED — add the codex entry manually (see template)"
+    fi
+  fi
+elif [ "$GB_MASTER" = "true" ] && [ "$GB_CODEX" = "true" ] && [ "$GB_HAVE_CODEX" != "yes" ]; then
+  GB_FWD_STATUS="codex tier ON but 'codex' not on PATH — inert until Codex CLI is installed"
+else
+  # Feature (or codex tier) OFF: actively STRIP any previously-merged codex server
+  # so "disabled" is honored for the forward direction too — Claude Code would
+  # otherwise keep launching `codex mcp-server` every session. Idempotent.
+  GB_FWD_STATUS="not merged (gptbridge master gate OFF)"
+  [ "$GB_MASTER" = "true" ] && [ "$GB_CODEX" != "true" ] && GB_FWD_STATUS="codex tier disabled"
+  if [ "$DRY_RUN" != "true" ] && [ -f "$GB_MCP_DEST" ] && \
+     jq -e '.mcpServers.codex' "$GB_MCP_DEST" >/dev/null 2>&1; then
+    if jq 'if .mcpServers then .mcpServers |= del(.codex) else . end' "$GB_MCP_DEST" > "$GB_MCP_DEST.tmp" 2>/dev/null; then
+      mv "$GB_MCP_DEST.tmp" "$GB_MCP_DEST"; GB_FWD_STATUS="$GB_FWD_STATUS; removed stale 'codex' entry from .mcp.json"
+    else
+      rm -f "$GB_MCP_DEST.tmp"
+    fi
+  fi
+fi
+
+echo ""
+echo "  gptbridge status (ChatGPT/Codex mutual-consult — docs/chatgpt-mcp-coupling-design.md):"
+echo "    master gate:   $GB_MASTER   (T1 Codex coupling wired; T2 relay + T3 model-consult seeded OFF)"
+echo "    codex tier:    $GB_CODEX"
+echo "    preflight:     codex=$GB_HAVE_CODEX   cloudflared=$GB_HAVE_CF (T2)   OPENAI_API_KEY=$GB_HAVE_KEY (T3)"
+echo "    forward (Claude to Codex): $GB_FWD_STATUS"
+echo "    reverse (Codex to Claude): fenced wrapper $CLAUDE_DIR/hooks/gptbridge/consult-claude-mcp.mjs"
+echo ""
+echo "    To enable T1 (Claude <-> Codex; local stdio, no tunnel, no tokens, no API spend):"
+echo "      1. Install Codex CLI, then:  codex login   (uses your existing ChatGPT subscription)"
+echo "      2. Set .gptbridge.enabled=true in $CONFIG_FILE   (or re-run with SETUP_GPTBRIDGE=1)"
+echo "      3. Forward (Claude consults Codex): re-run setup.sh (merges the codex .mcp.json entry), or:"
+echo "           claude mcp add codex -- codex mcp-server"
+echo "         Add MCP_TOOL_TIMEOUT=300000 to .claude/settings.json 'env' — agentic turns exceed the 60s default."
+echo "      4. Reverse (Codex consults Claude, read-only + fenced) — append to ~/.codex/config.toml:"
+if [ -f "$CLAUDE_DIR/templates/codex-config.toml.snippet" ]; then
+  # LITERAL substitution via bash parameter expansion (no sed) so a `|`/`&`/regex
+  # char in $TARGET_DIR can't break the delimiter or expand into the output.
+  while IFS= read -r _gb_ln || [ -n "$_gb_ln" ]; do
+    printf '           %s\n' "${_gb_ln//__PROJECT_DIR__/$TARGET_DIR}"
+  done < "$CLAUDE_DIR/templates/codex-config.toml.snippet"
+fi
+echo "    Kill switch: GPTBRIDGE_DISABLE=1 (env) makes the reverse wrapper refuse; master gate OFF disables everything."
+
+# ============================================================
 # Phase 9.5: Transport preflight
 # A fresh peer whose transport helper or identity is unresolved would SILENTLY dry-run every
 # outbound coordination message (it looks connected; replies never come). Verify here, loudly,
@@ -1420,6 +1572,7 @@ echo ""
 echo "  Config dir:      $CLAUDE_DIR/"
 echo "  Identity:        $CLAUDE_DIR/agent/identity.json"
 echo "  Roadmap:         $TARGET_DIR/docs/ROADMAP.md (⇄ Project board — run /roadmap-sync)"
+echo "  gptbridge:       installed ($([ "$GB_MASTER" = "true" ] && echo ENABLED || echo DISABLED) — ChatGPT/Codex mutual-consult; see docs/chatgpt-mcp-coupling-design.md)"
 echo ""
 info "Message daemon: starts AUTOMATICALLY on each Claude session (SessionStart hook →"
 info "  .claude/hooks/daemon-session.sh) and stops when the last session ends. It runs"

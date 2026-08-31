@@ -1,0 +1,45 @@
+{
+  "_README": [
+    "gptbridge T1/T3 MCP templates (design docs/chatgpt-mcp-coupling-design.md §5, §6).",
+    "T1 forward (Claude -> Codex): the 'codex' server below. setup.sh merges it into the",
+    "project-root .mcp.json ONLY when gptbridge.enabled && gptbridge.codex.enabled AND",
+    "`codex` is on PATH. Prerequisite (one-time): install Codex CLI + `codex login`",
+    "(runs on your existing ChatGPT subscription; no API spend). If `codex` is not a",
+    "global binary, use command:\"npx\", args:[\"-y\",\"@openai/codex\",\"mcp-server\"].",
+    "Tool timeout: Codex agentic turns exceed Claude Code's default MCP tool timeout;",
+    "set MCP_TOOL_TIMEOUT=300000 (ms) in .claude/settings.json 'env' for real turns.",
+    "For consult use, run Codex with its read-only sandbox so the counterpart cannot",
+    "mutate the repo either (sandbox=read-only in ~/.codex/config.toml or per-call).",
+    "T3 (adopt, don't build) alternatives are listed under _t3_model_consult; they are",
+    "documentation only (need OPENAI_API_KEY / metered spend) — not merged by setup."
+  ],
+  "mcpServers": {
+    "codex": {
+      "type": "stdio",
+      "command": "codex",
+      "args": ["mcp-server"]
+    }
+  },
+  "_t3_model_consult": {
+    "_note": "Copy one entry into .mcp.json manually to enable a stateless/threaded GPT second-opinion. Needs OPENAI_API_KEY in the environment (setup never writes keys to disk). Metered API spend, unlike T1/T2 which ride subscriptions.",
+    "mcp-chatgpt-responses": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["mcp-chatgpt-responses"],
+      "env": { "OPENAI_API_KEY": "${OPENAI_API_KEY}" }
+    },
+    "any-chat-completions-mcp": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@pyroprompts/any-chat-completions-mcp"],
+      "env": { "AI_CHAT_KEY": "${OPENAI_API_KEY}", "AI_CHAT_NAME": "OpenAI", "AI_CHAT_MODEL": "gpt-5.6", "AI_CHAT_BASE_URL": "https://api.openai.com/v1" }
+    },
+    "zen-mcp-server": {
+      "_when": "multi-model consensus/codereview/planner workflows are wanted",
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["zen-mcp-server"],
+      "env": { "OPENAI_API_KEY": "${OPENAI_API_KEY}" }
+    }
+  }
+}

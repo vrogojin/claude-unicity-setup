@@ -1,0 +1,24 @@
+# gptbridge T1 reverse direction — Codex CLI consults Claude Code (design §5.2).
+#
+# Append this block to ~/.codex/config.toml (or $CODEX_HOME/config.toml) to let a
+# Codex session ask THIS project's Claude Code a READ-ONLY question. It replaces
+# the unsafe community pattern (`claude mcp serve` + --dangerously-skip-permissions,
+# which exposes Claude's RAW Bash/Write/Edit surface to Codex) with a fenced,
+# single-tool wrapper: consult_claude(question) → a bounded, read-only `claude -p`.
+# The wrapper is INERT until gptbridge.enabled && gptbridge.codex.enabled are set
+# in this project's .claude/agent/config.json (GPTBRIDGE_DISABLE=1 kills it).
+#
+# __PROJECT_DIR__ is substituted with this project's absolute path by setup.sh
+# when it prints the ready-to-paste snippet; edit it by hand if you copy this file
+# directly. `node` must be on PATH.
+
+[mcp_servers.consult-claude]
+command = "node"
+args = ["__PROJECT_DIR__/.claude/hooks/gptbridge/consult-claude-mcp.mjs"]
+# Claude's read-only consult can take a while (repo reads + reasoning); the Codex
+# default tool timeout (60s) starves it. Give it headroom.
+startup_timeout_sec = 30
+tool_timeout_sec = 360
+
+# After adding: start a Codex session and run `/mcp` to confirm `consult-claude`
+# is connected and exposes the single `consult_claude` tool.
