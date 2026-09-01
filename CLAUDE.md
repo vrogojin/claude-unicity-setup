@@ -8,13 +8,13 @@ This is the Claude Code configuration repository for the **Unicity Network** eco
 
 ## Model Orchestration
 
-**Sonnet 6 orchestrates and is the default model.** Decide per task — not per session — whether to handle it yourself or delegate. Model capability/cost order (most capable/expensive first): **Fable 5** (Mythos-class, above Opus; frontier reasoning; ~2× Opus cost) > **Opus 4.8** (excellent for coding) > **Sonnet 6** (fast, cheap default).
+**Sonnet 5 orchestrates, is the default model, and does the coding; Opus 5 validates and corrects it.** Decide per step — not per session — which model each task needs. Capability/cost order (most capable/expensive first): **Fable 5** (`claude-fable-5`; Mythos-class, above Opus; frontier reasoning) > **Opus 5** (`claude-opus-5`; the validator/corrector, and hardest coding) > **Sonnet 5** (`claude-sonnet-5`; fast, cheap default coder) > **Haiku 4.5** (trivial only).
 
-- **Handle it yourself (Sonnet 6)** — orchestration/planning plus everyday, low-complexity work: exploration, small fixes, review of a few files, quick lookups.
-- **Delegate coding to Opus** — implementation, refactors, non-trivial or multi-file code changes.
-- **Delegate heavy reasoning to Fable** — hardest reasoning only: architecture, subtle multi-system debugging, security/crypto/consensus analysis, novel problem solving. It's the most expensive model, so escalate only when the task clearly warrants it.
+- **Sonnet 5 codes (default)** — orchestration/planning plus the implementation itself: writing features, refactors, tests, fixes, exploration, quick lookups.
+- **Opus 5 validates + corrects** — every non-trivial coding change Sonnet 5 makes is reviewed and fixed by Opus 5 before it ships (correctness, edge cases, security). Also takes the hardest coding directly. Trivial edits may skip the gate; non-trivial / multi-file / security-boundary changes must not.
+- **Fable 5 for heavy reasoning** — hardest reasoning only, escalated up front: architecture, subtle multi-system debugging, security/crypto/consensus analysis, novel problem solving.
 
-Route per step (a feature may use Fable to design, Opus to implement, Sonnet to clean up), default to Sonnet 6, and never under-provision hard code or security boundaries. See `claude_conf/CLAUDE.md` → "Model Orchestration" for the full policy applied in deployed workspaces.
+Route per step (a feature may use Fable 5 to design, Sonnet 5 to implement, Opus 5 to validate); default to Sonnet 5 for implementation with an Opus 5 validation pass, and never ship hard code or a security boundary unvalidated. See `claude_conf/CLAUDE.md` → "Model Orchestration" for the full policy applied in deployed workspaces.
 
 ## Repository Structure
 
