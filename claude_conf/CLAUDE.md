@@ -22,23 +22,24 @@ Configuration for developing across the Unicity Network ecosystem: TypeScript SD
 
 Conventional Commits: `<type>(<scope>): <description>`. Scope is the repository or module name (e.g., `sphere-sdk`, `aggregator`, `bft`, `alpha`).
 
-## CRITICAL: Model Orchestration — Sonnet 6 Orchestrates
+## CRITICAL: Model Orchestration — Sonnet 5 Codes, Opus 5 Validates
 
-**Sonnet 6 is the orchestrator and default model.** It runs the main loop, plans work, and decides — per task, not per session — whether to handle the work itself or delegate to a more capable model. Route each step as its own decision; do not pin one model to a whole workflow. The best economics come from using the *minimum* model that produces acceptable output for each specific task, not the most powerful one everywhere.
+**Sonnet 5 is the orchestrator, the default model, and the coder.** It runs the main loop, plans work, and performs the implementation itself. Every non-trivial coding change it produces is then **validated and corrected by Opus 5** — a review-and-fix pass that catches what the faster model missed before the work is called done. Route each step as its own decision; the best economics come from letting the cheaper model do the volume and spending the stronger model only where it earns its cost — on validation, and on the hardest reasoning.
 
 ### Model capability & cost order
 
 From most capable / most expensive to least:
 
-- **Fable 5** — Mythos-class, sits *above* Opus. Senior-research-scientist-grade reasoning; the strongest model available. ~2× Opus cost (~$10 / $50 per 1M in/out tokens). Reserve for genuinely hard reasoning.
-- **Opus 4.8** — excellent for coding and strong general reasoning, at ~half Fable's cost (~$5 / $25). The workhorse for real implementation.
-- **Sonnet 6** — fast, cheap daily driver for orchestration and simpler tasks; the default.
+- **Fable 5** (`claude-fable-5`) — Mythos-class, sits *above* Opus. Senior-research-scientist-grade reasoning; the strongest model available. The most expensive; reserve for genuinely hard, frontier-grade reasoning (design/analysis, not routine coding).
+- **Opus 5** (`claude-opus-5`) — excellent for code review, validation, and strong general reasoning. The **validator/corrector**: it reviews and fixes Sonnet's implementation, and takes the hardest coding directly when a change is too subtle to hand to Sonnet first.
+- **Sonnet 5** (`claude-sonnet-5`) — fast, cheap daily driver for orchestration **and** implementation; the default coder.
+- **Haiku 4.5** (`claude-haiku-4-5`) — fastest/cheapest; trivial lookups and mechanical text only.
 
-### The orchestrator has three moves
+### The pipeline: code with Sonnet 5, validate/correct with Opus 5
 
-1. **Handle it itself (Sonnet 6)** — the default. Orchestration/planning plus everyday, lower-complexity work: exploration, code review of a few files, test writing, routine fixes, simple edits. If a task is clearly in this band, do not delegate — delegation adds latency and coordination cost.
-2. **Delegate to Opus for coding** — implementation, refactoring, and any non-trivial or multi-file code changes. A weaker model on hard code produces lower-quality output that costs more to fix than it saves, so real coding sub-tasks go to Opus.
-3. **Delegate to Fable for heavy reasoning** — tasks that genuinely need maximum reasoning power (see routing table). Fable is the most expensive model, so escalate only when the task clearly warrants frontier-grade reasoning.
+1. **Sonnet 5 codes (the default).** Orchestration/planning plus the implementation itself — exploration, writing features, refactors, tests, routine fixes, edits. Sonnet 5 produces the change.
+2. **Opus 5 validates + corrects.** Every non-trivial coding change Sonnet 5 makes is reviewed by Opus 5 before it ships: Opus 5 checks correctness, catches bugs / edge cases / security issues, and applies the fixes. This validation gate is the point — cheap implementation, strong review. (Trivial, low-risk edits — a rename, a lint fix, a one-line doc change — may skip the gate; anything non-trivial, multi-file, or touching a security boundary must go through it.)
+3. **Fable 5 for the hardest reasoning.** Genuinely frontier-grade tasks — architecture & cross-repo design, subtle multi-system debugging, security/crypto/consensus analysis, novel first-principles work, planning long branching multi-step work — escalate to Fable 5 **up front** (design/analysis) rather than coding-then-reviewing.
 
 ### Be smart about routing — assess complexity first
 
@@ -47,18 +48,18 @@ Before spawning a sub-agent, classify the task and pick the model deliberately:
 | Task profile | Model | Examples |
 |---|---|---|
 | Hardest reasoning: architecture & cross-repo design, subtle multi-system debugging, security/crypto/consensus analysis, novel first-principles problem solving, planning long branching multi-step work | **Fable 5** | Redesign the predicate system; reason through a Byzantine consensus edge case; audit proof-verification design; plan a cross-repo migration |
-| Real coding: implementation, refactors, non-trivial or multi-file code changes, writing substantial test suites | **Opus 4.8** | Implement a new state-transition flow; refactor the aggregator storage layer; build a REST endpoint with tests |
-| Orchestration itself plus everyday/simple work: exploration, review of 2–5 files, small fixes, boilerplate, quick lookups, first-pass triage | **Sonnet 6** (self) | Rename a symbol; summarize a log; fix a lint error; scope out a task before delegating |
+| Validation & correction: reviewing Sonnet 5's implementation, hardening it, and the hardest coding directly | **Opus 5** | Review + fix a new state-transition flow; validate an auth/crypto change; correct a subtle concurrency bug Sonnet missed |
+| Implementation & orchestration: writing the code, refactors, tests, plus everyday work — exploration, small fixes, boilerplate, quick lookups, first-pass triage | **Sonnet 5** (self) | Implement a REST endpoint with tests; refactor a storage layer; rename a symbol; summarize a log; scope out a task |
 
 ### Rules of thumb
 
-- **Default to Sonnet 6.** Escalate to Opus for actual coding; escalate to Fable only when the task *clearly* needs frontier-grade reasoning.
-- **Match the model to the step, not the project.** A single feature may warrant Fable for the design/architecture step, Opus for implementation, and Sonnet for cleanup.
-- **Never under-provision hard code or security boundaries** — crypto, key management, proof verification, transport encryption, and consensus logic get Opus (implementation) or Fable (design/audit), never Sonnet.
+- **Sonnet 5 writes, Opus 5 validates.** The default flow for any non-trivial coding is: Sonnet 5 implements → Opus 5 reviews and corrects → done. Don't skip the Opus 5 gate on non-trivial or security-sensitive work.
+- **Match the model to the step, not the project.** A single feature may warrant Fable 5 for the design/architecture step, Sonnet 5 for implementation, and Opus 5 for validation.
+- **Never ship hard code or a security boundary unvalidated** — crypto, key management, proof verification, transport encryption, and consensus logic must be validated by Opus 5 (or designed/audited by Fable 5), never shipped straight from Sonnet 5.
 - **Give every delegated sub-agent thorough, self-contained instructions** — a sub-agent only sees what you pass it.
-- When in doubt about whether a step exceeds Sonnet's band, prefer escalating over shipping weaker output.
+- When in doubt about whether a change is safe to ship without validation, run the Opus 5 gate.
 
-*Rationale drawn from 2026 multi-model routing practice: route the bulk of volume to cheaper/faster models and reserve frontier compute for the fraction that genuinely needs it; per-step routing yields 30–50% cost reduction at equal-or-better quality. See [Choosing the right Claude model](https://claude.com/resources/tutorials/choosing-the-right-claude-model), [Claude Fable 5 vs Opus 4.8](https://www.truefoundry.com/blog/claude-fable-5-vs-opus-4-8-benchmarks-pricing-when-to-use-each), and [multi-model routing 2026](https://mindra.co/blog/multi-model-routing-llm-orchestration-2026).*
+*Rationale drawn from 2026 multi-model routing practice: route the bulk of volume to the cheaper/faster model and reserve stronger compute for validation and the fraction that genuinely needs frontier reasoning; per-step routing (cheap implementation + strong review) yields large cost reductions at equal-or-better quality. See [Choosing the right Claude model](https://claude.com/resources/tutorials/choosing-the-right-claude-model).*
 
 ## CRITICAL: Explore Before Building
 
