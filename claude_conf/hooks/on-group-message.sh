@@ -73,18 +73,38 @@ NEW_MSG=$(jq -n \
     }
   }')
 
-# Append to state file (create if missing)
-if [ -f "$STATE_FILE" ]; then
-  CURRENT=$(cat "$STATE_FILE")
-else
-  CURRENT='{"unread": false, "unread_count": 0, "priority_count": 0, "messages": []}'
-fi
-
 # Cap retained history to the newest N (default 500) so the shared state file can't grow
 # unbounded — see agent-comms-check.sh for the leak this prevents (AGENT_MESSAGES_MAX overrides).
 CAP="${AGENT_MESSAGES_MAX:-500}"; case "$CAP" in ''|*[!0-9]*) CAP=500 ;; esac
 
-UPDATED=$(echo "$CURRENT" | jq \
+# Append to state file (create if missing), atomically and under a lock shared with
+# on-dm.sh (same STATE_FILE, same lock name) — a DM and a group message can arrive
+# at the same moment and each spawns its own hook process, so an unlocked
+# read-modify-write here races with on-dm.sh's, not just with itself.
+#
+# The lock is released (fd 9 closed) as soon as the write is done, BEFORE notify/
+# classify-inbound run below, so a slow notify/classify can't hold a concurrent
+# invocation hostage until ITS OWN lock timeout.
+DEFAULT_STATE='{"unread": false, "unread_count": 0, "priority_count": 0, "messages": []}'
+LOCK="$STATE_FILE.lock"
+
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$LOCK"
+  flock -w 5 9 || { echo "on-group-message.sh: lock timeout on $STATE_FILE — dropping this message rather than risk a corrupt write" >&2; exit 0; }
+fi
+
+# Read CURRENT fresh, now that we hold the lock. NEVER trust a file that fails to
+# parse as JSON — jq on invalid input produces empty stdout, and blindly writing
+# that back (the previous bug here, shared with on-dm.sh) truncates the whole state
+# file to a stray newline, which then fails every SUBSEQUENT read forever.
+if [ -f "$STATE_FILE" ] && CURRENT=$(cat "$STATE_FILE") && jq -e . >/dev/null 2>&1 <<<"$CURRENT"; then
+  :
+else
+  [ -f "$STATE_FILE" ] && echo "on-group-message.sh: $STATE_FILE was missing or invalid JSON — resetting it (previous content, if any, is lost)" >&2
+  CURRENT="$DEFAULT_STATE"
+fi
+
+UPDATED=$(jq \
   --argjson msg "$NEW_MSG" \
   --argjson is_priority "$IS_PRIORITY" \
   --argjson cap "$CAP" \
@@ -92,9 +112,18 @@ UPDATED=$(echo "$CURRENT" | jq \
    .unread = true |
    .unread_count = (.unread_count + 1) |
    .priority_count = (if $is_priority then .priority_count + 1 else .priority_count end) |
-   .messages |= .[-$cap:]')
+   .messages |= .[-$cap:]' \
+  <<<"$CURRENT") || UPDATED=""
 
-echo "$UPDATED" > "$STATE_FILE"
+# Only ever replace the file with something jq actually produced.
+if [ -n "$UPDATED" ] && jq -e . >/dev/null 2>&1 <<<"$UPDATED"; then
+  TMP="$STATE_FILE.tmp.$$"
+  echo "$UPDATED" > "$TMP" && mv "$TMP" "$STATE_FILE"
+else
+  echo "on-group-message.sh: failed to build updated state (jq error) — leaving $STATE_FILE untouched, message dropped" >&2
+fi
+
+if command -v flock >/dev/null 2>&1; then exec 9>&-; fi
 
 # Notify
 if [ -f "$HOOK_DIR/notify.sh" ]; then
