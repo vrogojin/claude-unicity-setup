@@ -32,7 +32,13 @@ BASE_DIR="$(echo "$INPUT" | jq -r '.cwd // ""' 2>/dev/null)"
 TARGET_DIR="$BASE_DIR"
 FIRST_LINE="$(printf '%s\n' "$COMMAND" | head -1)"
 if echo "$FIRST_LINE" | grep -qE '^cd[[:space:]]'; then
-  CD_ARG="$(echo "$FIRST_LINE" | sed -E 's/^cd[[:space:]]+//; s/[[:space:]]*(&&|;)[[:space:]]*$//')"
+  # Truncate at the FIRST '&&', ';' or '|' — not just one anchored at the end of the
+  # line. A trailing-only anchor leaves the whole rest of an ordinary single-line
+  # compound command (`cd apps/web && git commit -m "msg"`, the common shape for
+  # this harness's Bash tool) inside CD_ARG, and the eval below would then execute
+  # that tail for real — including a genuine `git commit` — as a side effect of
+  # computing a path. This must stop at the first occurrence, wherever it falls.
+  CD_ARG="$(echo "$FIRST_LINE" | sed -E 's/^cd[[:space:]]+//' | sed -E 's/[[:space:]]*(&&|;|\|).*$//')"
   RESOLVED="$(cd "$BASE_DIR" 2>/dev/null && eval "cd $CD_ARG" 2>/dev/null && pwd)"
   [ -n "$RESOLVED" ] && TARGET_DIR="$RESOLVED"
 fi
