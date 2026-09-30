@@ -10,7 +10,36 @@ if ! echo "$COMMAND" | grep -q "git commit"; then
   exit 0
 fi
 
-cd "$CLAUDE_PROJECT_DIR" || exit 0
+# Resolve which repo this commit actually targets — NOT always $CLAUDE_PROJECT_DIR.
+# A session can run `git commit` against a different repo entirely (another checkout,
+# a worktree, a sibling project) by leading the command with `cd <path>`. Blindly
+# checking $CLAUDE_PROJECT_DIR in that case lints/typechecks the WRONG repository and
+# can block (or wrongly pass) a commit based on an unrelated project's pre-existing
+# issues.
+#
+# Base directory: the hook payload's own `.cwd` (the session's actual tracked
+# directory when this command was issued), else $CLAUDE_PROJECT_DIR as a last resort.
+# If the command's first line leads with `cd <path>`, resolve it with a REAL `cd` in a
+# subshell seeded at that base — not a textual/sed extraction fed straight to
+# `git -C`, which can't expand `$HOME`, honour quoting/escaped spaces, or resolve a
+# relative path (`cd ..`, `cd ../sibling`) against the right starting point. A
+# textual guess that's merely wrong can silently land on a different, real, EXISTING
+# directory with no error at all — worse than failing open. Only trust the result if
+# the `cd` actually succeeds; otherwise keep the base rather than proceed on a guess.
+BASE_DIR="$(echo "$INPUT" | jq -r '.cwd // ""' 2>/dev/null)"
+[ -n "$BASE_DIR" ] || BASE_DIR="$CLAUDE_PROJECT_DIR"
+
+TARGET_DIR="$BASE_DIR"
+FIRST_LINE="$(printf '%s\n' "$COMMAND" | head -1)"
+if echo "$FIRST_LINE" | grep -qE '^cd[[:space:]]'; then
+  CD_ARG="$(echo "$FIRST_LINE" | sed -E 's/^cd[[:space:]]+//; s/[[:space:]]*(&&|;)[[:space:]]*$//')"
+  RESOLVED="$(cd "$BASE_DIR" 2>/dev/null && eval "cd $CD_ARG" 2>/dev/null && pwd)"
+  [ -n "$RESOLVED" ] && TARGET_DIR="$RESOLVED"
+fi
+
+REPO_ROOT="$(git -C "$TARGET_DIR" rev-parse --show-toplevel 2>/dev/null)" || REPO_ROOT="$TARGET_DIR"
+
+cd "$REPO_ROOT" || exit 0
 
 BLOCKED=false
 REASONS=""
