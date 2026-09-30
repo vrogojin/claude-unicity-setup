@@ -32,15 +32,28 @@ BASE_DIR="$(echo "$INPUT" | jq -r '.cwd // ""' 2>/dev/null)"
 TARGET_DIR="$BASE_DIR"
 FIRST_LINE="$(printf '%s\n' "$COMMAND" | head -1)"
 if echo "$FIRST_LINE" | grep -qE '^cd[[:space:]]'; then
-  # Truncate at the FIRST '&&', ';' or '|' — not just one anchored at the end of the
-  # line. A trailing-only anchor leaves the whole rest of an ordinary single-line
+  # Truncate at the FIRST '&', ';' or '|' (a single class, so it catches '&&' and
+  # '||' too, and a bare '&' background operator) — not one anchored at the end of
+  # the line. A trailing-only anchor leaves the whole rest of an ordinary single-line
   # compound command (`cd apps/web && git commit -m "msg"`, the common shape for
   # this harness's Bash tool) inside CD_ARG, and the eval below would then execute
   # that tail for real — including a genuine `git commit` — as a side effect of
   # computing a path. This must stop at the first occurrence, wherever it falls.
-  CD_ARG="$(echo "$FIRST_LINE" | sed -E 's/^cd[[:space:]]+//' | sed -E 's/[[:space:]]*(&&|;|\|).*$//')"
-  RESOLVED="$(cd "$BASE_DIR" 2>/dev/null && eval "cd $CD_ARG" 2>/dev/null && pwd)"
-  [ -n "$RESOLVED" ] && TARGET_DIR="$RESOLVED"
+  CD_ARG="$(echo "$FIRST_LINE" | sed -E 's/^cd[[:space:]]+//' | sed -E 's/[[:space:]]*[&;|].*$//')"
+
+  # Defense in depth, in case the truncation above ever has its own gap: eval is
+  # meant to see nothing but a plain `cd <path>`. Refuse to eval anything that could
+  # DO more than that — command substitution, backticks, redirection/process
+  # substitution — so a future parsing gap fails CLOSED (falls back to the base
+  # directory) instead of reopening this exact class of bug.
+  if printf '%s' "$CD_ARG" | grep -qE '\$\(|`|[<>]'; then
+    CD_ARG=""
+  fi
+
+  if [ -n "$CD_ARG" ]; then
+    RESOLVED="$(cd "$BASE_DIR" 2>/dev/null && eval "cd $CD_ARG" 2>/dev/null && pwd)"
+    [ -n "$RESOLVED" ] && TARGET_DIR="$RESOLVED"
+  fi
 fi
 
 REPO_ROOT="$(git -C "$TARGET_DIR" rev-parse --show-toplevel 2>/dev/null)" || REPO_ROOT="$TARGET_DIR"
