@@ -60,6 +60,19 @@ if echo "$FIRST_LINE" | grep -qE '^cd[[:space:]]'; then
     CD_ARG="${!BASH_REMATCH[1]:-}${BASH_REMATCH[2]}"
   fi
 
+  # A bare '-' is bash's own "go to $OLDPWD" idiom, not a path — an entirely benign
+  # `cd -` as the first line (nothing adversarial about it) passes the whitelist
+  # below (a hyphen is a whitelisted character) and reaches `cd -- "$CD_ARG"`, but
+  # bash's cd builtin still special-cases a lone '-' even after `--`: it both jumps
+  # to $OLDPWD AND echoes the new path to stdout. That stray echo lands inside
+  # RESOLVED alongside the subsequent `pwd`, producing a two-line, embedded-newline
+  # "directory" that no `git -C` can resolve — REPO_ROOT falls back to that same
+  # garbled value, the final `cd "$REPO_ROOT"` fails, and the WHOLE hook silently
+  # exits 0, skipping every check. Reject it explicitly before it ever reaches `cd`.
+  if [ "$CD_ARG" = "-" ]; then
+    CD_ARG=""
+  fi
+
   # Final whitelist: after expansion, CD_ARG must look like a plain path — reject
   # anything else (command/process substitution, backticks, stray operators, quotes,
   # a leftover unexpanded '$') rather than trying to enumerate every dangerous
