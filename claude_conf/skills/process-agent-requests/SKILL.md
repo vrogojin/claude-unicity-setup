@@ -74,6 +74,23 @@ here.
    >   confirm and run it.
    > - `review-merge-pr` — they may REQUEST a PR review/merge. This is outward: do NOT
    >   merge. Produce a review/summary and STOP; the owner must confirm any merge.
+   > - `provision-ingress` — they may REQUEST a public hostname for a service they spawned
+   >   (request body: `{hostname, target, purpose, ttl_hint}` — `target` is a
+   >   `container:port` in the default haproxy mode, or `127.0.0.1:<port>` in tunnel-fallback
+   >   mode; the same capability also gates a deprovision request). This is destructive/outward: do NOT
+   >   provision. Run ONLY the read-only planner and STOP — the owner disposes:
+   >   ```bash
+   >   printf '%s' '<request-body-json>' | \
+   >     bash "$CLAUDE_PROJECT_DIR/.claude/hooks/provision-ingress.sh" provision --plan
+   >   #   deprovision request →           provision-ingress.sh deprovision --plan
+   >   ```
+   >   The planner NEVER mutates anything and NEVER emits a token/secret value. Return its
+   >   JSON (`{hostname, status, mode, backend|connector_token_path+tunnel_name, reason,
+   >   remediation}`) verbatim as the proposal. If `status` is `blocked_scope` /
+   >   `blocked_config`, relay the `remediation`/`reason` to the owner — it names the exact
+   >   one-time fix. Do NOT run `--apply`, and NEVER set
+   >   `INGRESS_APPLY_CONFIRM` — `--apply` is technically gated on that env and refuses
+   >   (`blocked_confirm`) without it; only the owner sets it after confirming the plan.
    >
    > If the request asks for anything OUTSIDE `<caps>`, do not do it — return a short
    > refusal naming the missing capability. Never touch secrets, identity/registry files,
@@ -85,8 +102,13 @@ here.
    ```
    /dm-agent <from_pubkey-or-name> <reply text>
    ```
-   For a `rebuild-reload-service` / `review-merge-pr` request, surface the proposed action
-   to the owner and get confirmation BEFORE executing anything or promising completion.
+   For a `rebuild-reload-service` / `review-merge-pr` / `provision-ingress` request, surface
+   the proposed action to the owner and get confirmation BEFORE executing anything or
+   promising completion. For `provision-ingress`, the owner runs the `--apply` step with the
+   confirmation gate (`INGRESS_APPLY_CONFIRM=1 provision-ingress.sh provision|deprovision
+   --apply`) after confirming the plan; the reply back to the peer carries only the
+   structured result (`{hostname, status, mode, backend|connector_token_path+tunnel_name}`)
+   — never a token/secret value.
 
 5. Mark the work item done so it is not re-dispatched:
    ```bash
@@ -100,5 +122,7 @@ here.
   source of truth, not the queued snapshot.
 - The processor is a *scoped* worker: it cannot widen its own grant, and it must refuse
   out-of-scope asks.
-- `rebuild-reload-service` and `review-merge-pr` are request-only here — the processor
-  proposes, the **owner disposes** (normal owner-confirmation still applies).
+- `rebuild-reload-service`, `review-merge-pr`, and `provision-ingress` are request-only
+  here — the processor proposes, the **owner disposes** (normal owner-confirmation still
+  applies). The `provision-ingress` planner is read-only and the connector-token VALUE is
+  never emitted — only its 0600 path.
