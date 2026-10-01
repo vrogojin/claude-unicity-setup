@@ -19,6 +19,23 @@ bash .claude/hooks/ticket.sh issue \
 # [--v1] emits the legacy long self-contained format for peers on pre-v2 framework code.
 ```
 
+### Optional: `--scope` (an application's own ceiling, carried signed)
+
+`--caps` names *which verbs* a peer gets, from the framework's closed enum. An application
+that also needs to say *over which subset* — which projects, which entities, which budget —
+can attach an opaque JSON object under its own key:
+
+```bash
+bash .claude/hooks/ticket.sh issue --caps deck --ttl 7d \
+  --scope '{"amc":{"view":["product:acme/*"],"actions":["read","summaries.read"]}}'
+```
+
+The framework never interprets it; it only guarantees the object is **inside the signed
+payload** (so the bearer cannot widen or strip it — the ticket stops verifying) and that it is
+a non-empty JSON object under 4 KB (`$TK_SCOPE_MAX_BYTES`). A malformed `--scope` fails the
+issue loudly and records nothing. `ticket.sh verify` then hands the object back verbatim as a
+`scope` key, present only when the ticket carries one. Omit `--scope` and nothing changes.
+
 It prints a single short line `ut2_…` (47 chars — paste-proof). The caps/expiry/issuer
 authorization is a **signed event published to the relay** at issue time (its content is
 encrypted under a key derived from the ticket secret, so the relay learns nothing but your

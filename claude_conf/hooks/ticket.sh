@@ -40,6 +40,7 @@ RC_REAP_DAYS="${RC_REAP_DAYS:-14}"
 TK_RATE_HEX_HOUR="${TK_RATE_HEX_HOUR:-5}"     # max FAILED redeems / sender hex / hour
 TK_RATE_DAY_GLOBAL="${TK_RATE_DAY_GLOBAL:-50}" # max FAILED redeems / day globally
 TK_ATTEMPTS_MAX="${TK_ATTEMPTS_MAX:-500}"      # bounded attempt ledger
+TK_SCOPE_MAX_BYTES="${TK_SCOPE_MAX_BYTES:-4096}" # cap on a --scope claim (compacted JSON)
 
 _tk_now_epoch() { date +%s; }
 _tk_now_iso()   { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
@@ -49,6 +50,35 @@ _tk_attempts_file()    { printf '%s/ticket-attempts.json'  "$(coord_root)"; }
 _tk_sha256() { printf '%s' "$1" | sha256sum | awk '{print $1}'; }
 _tk_warn()   { echo "WARN(ticket): $*" >&2; }
 _tk_err()    { echo "ERROR(ticket): $*" >&2; }
+
+# ── scope (optional, OPAQUE authorization detail carried by a ticket) ─────────────────
+# A ticket may carry a `scope` object alongside `caps`. The framework never interprets it —
+# it only guarantees INTEGRITY (the object rides inside the signed/encrypted payload, so it
+# cannot be altered or stripped after issue) and SHAPE (a JSON object, size-capped). What the
+# keys MEAN is entirely the consuming application's business; it is how a bearer credential
+# carries a per-ticket ceiling (e.g. which entities a panel login may see) that `caps` — a
+# closed, framework-owned enum — deliberately cannot express.
+#
+# Validation is deliberately structural-only and FAILS AT ISSUE (loud, nothing recorded)
+# rather than persisting garbage a verifier would later have to guess at.
+# Echoes the compacted JSON on stdout.
+_tk_validate_scope() {  # <json>
+  local raw="$1" compact
+  compact="$(printf '%s' "$raw" | jq -c . 2>/dev/null)" \
+    || { _tk_err "--scope is not valid JSON"; return 1; }
+  [ "$(printf '%s' "$compact" | jq -r 'type' 2>/dev/null)" = "object" ] \
+    || { _tk_err "--scope must be a JSON OBJECT (got $(printf '%s' "$compact" | jq -r 'type' 2>/dev/null))"; return 1; }
+  # An empty object carries nothing; treat it as a typo rather than silently issuing a ticket
+  # whose consumer would read it as "no scope at all".
+  [ "$(printf '%s' "$compact" | jq -r 'length' 2>/dev/null)" -gt 0 ] 2>/dev/null \
+    || { _tk_err "--scope is an EMPTY object — omit --scope instead"; return 1; }
+  # Size cap: the v2 payload is encrypted and PUBLISHED to a relay, so an unbounded scope is
+  # a self-inflicted relay rejection at issue time (or worse, at redeem time).
+  local n="${#compact}"
+  [ "$n" -le "$TK_SCOPE_MAX_BYTES" ] \
+    || { _tk_err "--scope is ${n}B, over the ${TK_SCOPE_MAX_BYTES}B cap (raise \$TK_SCOPE_MAX_BYTES if you really mean it)"; return 1; }
+  printf '%s' "$compact"
+}
 
 # Resolve the transport helper + our identity the same robust way rc_emit does.
 _tk_helper()   { local h=""; type _tc_sphere_helper >/dev/null 2>&1 && h="$(_tc_sphere_helper)"; printf '%s' "$h"; }
@@ -129,11 +159,12 @@ tk_issue() {
   # two non-destructive coordination caps and expires in minutes, not a full-capability
   # day-long ticket. Both stay overridable via --caps / --ttl.
   local caps="consult,claim-area"
-  local grantBack="" ttl="15m" bind="" label="" relay="" fmt=2
+  local grantBack="" ttl="15m" bind="" label="" relay="" fmt=2 scope="" scopeSet=0
   while [ $# -gt 0 ]; do case "$1" in
     --caps) caps="$2"; shift 2;; --grant-back) grantBack="$2"; shift 2;;
     --ttl) ttl="$2"; shift 2;; --bind) bind="$2"; shift 2;;
     --name|--label) label="$2"; shift 2;; --relay) relay="$2"; shift 2;;
+    --scope) scope="$2"; scopeSet=1; shift 2;;
     --v1) fmt=1; shift;;
     *) shift;; esac; done
   [ -n "$grantBack" ] || grantBack="$caps"
@@ -143,6 +174,14 @@ tk_issue() {
   vgrant="$(_ar_validate_caps "$(printf '%s' "$grantBack" | tr ',' ' ')")" || { _tk_err "invalid --grant-back"; return 1; }
   # Warn (do not block) if a destructive cap is included — execution still owner-gated.
   local c; for c in $vcaps; do _ar_is_destructive_cap "$c" 2>/dev/null && _tk_warn "cap '$c' is destructive — grant only permits ASKING; execution stays owner-confirmed"; done
+  # Optional opaque scope: validated HERE so a malformed claim fails the issue loudly and
+  # nothing is signed, published or recorded. `null` (jq's literal) = "no scope", which keeps
+  # every downstream construction byte-identical to a scope-less ticket.
+  # `--scope ""` is a MISTAKE, not a request for an unscoped ticket: silently ignoring it would
+  # hand back a ticket far wider than the caller asked for, so it takes the validation path
+  # (and fails) exactly like any other malformed value.
+  local scopeJson="null"
+  if [ "$scopeSet" = "1" ]; then scopeJson="$(_tk_validate_scope "$scope")" || return 1; fi
 
   local iss issName exp secret tid
   iss="$(rc_self_npub)"; [ -n "$iss" ] || { _tk_err "no self identity (run setup.sh)"; return 1; }
@@ -174,7 +213,9 @@ tk_issue() {
     payload="$(jq -nc --argjson v 1 --arg tid "$tid" --arg iss "$iss" --arg issName "$issName" \
         --argjson relays "$relaysJson" --arg secret "$secret" --argjson caps "$capsJson" \
         --argjson grantBack "$grantJson" --argjson exp "$exp" --arg bind "$bindHex" --arg label "$label" \
-        '{v:$v, tid:$tid, iss:$iss, issName:$issName, relays:$relays, secret:$secret, caps:$caps, grantBack:$grantBack, exp:$exp, bind:$bind, label:$label}')"
+        --argjson scope "$scopeJson" \
+        '{v:$v, tid:$tid, iss:$iss, issName:$issName, relays:$relays, secret:$secret, caps:$caps, grantBack:$grantBack, exp:$exp, bind:$bind, label:$label}
+         + (if $scope == null then {} else {scope:$scope} end)')"
     event="$(_tk_run_helper_stdin "$payload" ticket-sign --identity "$(_tk_identity)")" || { _tk_err "ticket-sign failed"; return 1; }
   else
     # ── v2 (default, short): the SECRET stays out of the payload — the helper derives the
@@ -185,8 +226,9 @@ tk_issue() {
     local payload signIn pub
     payload="$(jq -nc --arg iss "$iss" --arg issName "$issName" --argjson relays "$relaysJson" \
         --argjson caps "$capsJson" --argjson grantBack "$grantJson" --argjson exp "$exp" \
-        --arg bind "$bindHex" --arg label "$label" \
-        '{iss:$iss, issName:$issName, relays:$relays, caps:$caps, grantBack:$grantBack, exp:$exp, bind:$bind, label:$label}')"
+        --arg bind "$bindHex" --arg label "$label" --argjson scope "$scopeJson" \
+        '{iss:$iss, issName:$issName, relays:$relays, caps:$caps, grantBack:$grantBack, exp:$exp, bind:$bind, label:$label}
+         + (if $scope == null then {} else {scope:$scope} end)')"
     # The secret rides into jq via the ENVIRONMENT (env.TKSEC), not --arg: argv is
     # world-readable through /proc/<pid>/cmdline for the process's lifetime, environ is not.
     signIn="$(TKSEC="$secret" jq -nc --argjson p "$payload" '{secret:env.TKSEC, payload:$p}')"
@@ -197,15 +239,17 @@ tk_issue() {
   fi
 
   # Record HASH-ONLY (never the secret) in the pending ledger, under flock.
+  # The `scope` key is appended ONLY for a scoped ticket, so a scope-less record keeps exactly
+  # the shape (and key order) every existing reader of tickets.json already expects.
   _rc_write "$(_tk_tickets_file)" '
-    .tickets = ((.tickets // []) + [{
+    .tickets = ((.tickets // []) + [({
       tid:$tid, v:($v|tonumber), secretHash:$sh, caps:$caps, grantBack:$grantBack, bind:$bind, label:$label,
       exp:$exp, status:"pending", createdAt:$now, redeemedBy:null, redeemedAt:"", grantSentAt:"",
       eventId:$eid, relay:$relay
-    }])
+    } + (if $scope == null then {} else {scope:$scope} end))])
   ' --arg tid "$tid" --arg v "$fmt" --arg sh "$(_tk_sha256 "$secret")" --argjson caps "$capsJson" --argjson grantBack "$grantJson" \
     --arg bind "$bindHex" --arg label "$label" --arg exp "$(_tk_epoch_to_iso "$exp")" --arg now "$(_tk_now_iso)" \
-    --arg eid "$eventId" --arg relay "$relayUrl" \
+    --arg eid "$eventId" --arg relay "$relayUrl" --argjson scope "$scopeJson" \
     || { _tk_err "could not record ticket"; return 1; }
 
   if [ "$fmt" = "1" ]; then
@@ -218,7 +262,7 @@ tk_issue() {
     [ "$relayUrl" = "${RELAY_URL:-wss://nostr-relay.testnet.unicity.network}" ] \
       || _tk_warn "published to NON-DEFAULT relay $relayUrl — redeemer must pass --relay $relayUrl" >&2
   fi
-  _tk_warn "ticket $tid issued (v$fmt; caps: $(echo "$vcaps" | tr ' ' ','); ttl: $ttl$( [ -n "$bind" ] && echo "; bound"))." >&2
+  _tk_warn "ticket $tid issued (v$fmt; caps: $(echo "$vcaps" | tr ' ' ','); ttl: $ttl$( [ -n "$bind" ] && echo "; bound")$( [ "$scopeJson" != "null" ] && echo "; scoped: $(printf '%s' "$scopeJson" | jq -rc 'keys|join(",")')"))." >&2
   _tk_warn "This string is a BEARER credential — send it over a private channel; 'ticket.sh revoke $tid' if it leaks." >&2
 }
 
@@ -632,9 +676,36 @@ tk_verify() {
     st="$(jq -r --arg t "$tid" '[.tickets[]? | select(.tid==$t) | .status] | first // ""' "$tf" 2>/dev/null)"
     case "$st" in revoked|expired) _tkv_fail "revoked"; return 1;; esac
   fi
+  # Optional signed scope (§ "scope" above): surfaced VERBATIM and only when the payload
+  # actually carries an object. The framework does not interpret it — an unrecognized shape is
+  # the consumer's problem to fail closed on, not ours to guess at. A non-object `scope` in the
+  # payload is dropped rather than forwarded, so a verdict's `scope` is always an object.
+  # A scope-less ticket omits the key entirely ⇒ the verdict is byte-identical to pre-scope
+  # ticket.sh, which is what keeps every existing consumer working untouched.
+  local scopeJson; scopeJson="$(jq -c 'if (.scope|type) == "object" then .scope else null end' <<<"$payload" 2>/dev/null || echo null)"
   jq -nc --arg tid "$tid" --arg iss "$iss" --argjson exp "$expEpoch" \
      --argjson caps "$(printf '%s\n' $caps | jq -R . | jq -sc .)" \
-     '{ok:true, tid:$tid, iss:$iss, exp:$exp, caps:$caps}'
+     --argjson scope "${scopeJson:-null}" \
+     '{ok:true, tid:$tid, iss:$iss, exp:$exp, caps:$caps}
+      + (if $scope == null then {} else {scope:$scope} end)'
+}
+
+# ── feature probe ────────────────────────────────────────────────────────────────────
+# A consumer that depends on an optional ticket field needs to know whether the ticket.sh it
+# is shelling out to actually understands that field — otherwise it cannot tell "this ticket
+# has no scope" from "this ticket.sh predates scope and dropped it", and a permissive default
+# would silently WIDEN a deliberately narrow ticket.
+#
+# This is the ONLY shape of probe that works, because it is the only one an OLD ticket.sh
+# fails LOUDLY: an unknown subcommand hits the usage line and exits non-zero, so a consumer
+# gets a hard, unambiguous "not supported". (A *flag* would not do: tk_verify's argument loop
+# silently discards unrecognized `-*` options, so e.g. a `--require-scope` flag would be
+# dropped by old code and fail OPEN — exactly the failure this probe exists to prevent.)
+#
+# `features` is append-only: entries are never removed or repurposed, so a consumer can test
+# membership and nothing else.
+tk_features() {
+  jq -nc '{ticketSh:1, formats:["v1","v2"], features:["scope"]}'
 }
 
 # ── CLI dispatch (only when executed directly, not when sourced) ──────────────────────
@@ -650,9 +721,10 @@ _tk_cli() {
     ingest-redeem) tk_ingest_redeem "${1:--}";;
     ingest-grant)  tk_ingest_grant  "${1:--}";;
     ingest-deny)   tk_ingest_deny   "${1:--}";;
+    features)      tk_features;;
     self-test)     tk_self_test;;
     decode)        _tk_decode "${1:-}";;
-    *) echo "usage: ticket.sh {issue [--v1]|redeem [--relay url]|verify -|--require-cap C|list|revoke|reap|ingest-redeem|ingest-grant|ingest-deny|self-test} …" >&2; return 1;;
+    *) echo "usage: ticket.sh {issue [--caps C] [--ttl T] [--bind npub] [--scope JSON] [--v1]|redeem [--relay url]|verify -|--require-cap C|list|revoke|reap|ingest-redeem|ingest-grant|ingest-deny|features|self-test} …" >&2; return 1;;
   esac
 }
 if [ "${BASH_SOURCE[0]:-$0}" = "${0}" ]; then

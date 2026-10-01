@@ -131,9 +131,13 @@ the same `--relay` (the string no longer carries relay hints; issue prints a war
   "grantBack": ["self-directed", "consult", "claim-area"],
   "exp": 1765432100,
   "bind": "",
-  "label": "dev-2 peer"
+  "label": "dev-2 peer",
+  "scope": { "<consumer-key>": { "…": "…" } }
 }
 ```
+
+`scope` is **optional** and present only when the ticket was issued with `--scope` (§3.1.1);
+a ticket without it is byte-identical to a pre-scope one.
 
 | field | meaning |
 |---|---|
@@ -148,6 +152,98 @@ the same `--relay` (the string no longer carries relay hints; issue prints a war
 | `exp` | unix expiry; default now + 15m (`--ttl 15m`, accepts `30s`/`30m`/`24h`/`7d`) |
 | `bind` | optional: npub that alone may redeem (`--bind <npub>`); checked against the **transport-authenticated sender hex**, not any claimed field |
 | `label` | free-text label for the issuer's ledger |
+| `scope` | **optional** (§3.1.1) opaque authorization detail carried for the consuming application: `--scope '<json-object>'`. The framework validates only its *shape*, never its meaning |
+
+### 3.1.1 `scope` — an opaque, signed authorization detail (optional)
+
+`caps` is a **closed, framework-owned enum** (`AGENT_CAPABILITIES`): it answers *which verbs*
+a peer may use, and every value must be one the framework already knows. That is the right
+shape for agent-to-agent coordination and the wrong shape for a consumer that needs to say
+*over which subset of things* — which projects, which entities, which budget. Encoding that
+in `caps` would mean pushing application vocabulary into a framework enum every time a
+consumer grows a new dimension.
+
+So a ticket may carry one extra, **optional** field:
+
+```bash
+ticket.sh issue --caps deck --ttl 7d \
+  --scope '{"amc":{"view":["product:acme/*"],"actions":["read","summaries.read"],"deny":["tag:private"]}}'
+```
+
+**The framework never interprets it.** It guarantees exactly two things:
+
+- **Integrity.** The object is placed *inside the payload* — the same bytes `caps`, `exp` and
+  `bind` live in — so it rides inside the schnorr-signed event content (v1) and inside the
+  AES-GCM-sealed, schnorr-signed content (v2). A bearer who edits the scope to widen it, or
+  strips it to fall back to a consumer's permissive default, breaks the signature and the
+  ticket fails to verify. Scope is exactly as tamper-evident as `caps` — no separate
+  mechanism, no second signature, nothing to keep in sync.
+- **Shape.** `--scope` must parse as a **non-empty JSON object** within `$TK_SCOPE_MAX_BYTES`
+  (default 4096, compacted). Anything else fails the *issue* loudly — nothing is signed,
+  published or recorded — rather than persisting garbage a verifier would later have to guess
+  at. The cap matters because the v2 payload is published to a relay.
+
+The top-level key is the **consumer's** namespace (`"amc"` for Agentic Mission Control), which
+keeps two consumers' claims from colliding in one ticket and lets a consumer ignore a scope
+that is not addressed to it.
+
+> **Pin the issuer.** `verify` establishes that a payload was signed by whoever `iss` names —
+> **not** that `iss` is anyone you trust. A `d`-tag is not globally exclusive: anyone can
+> publish their own kind-30777 event under the same `d` (or mint a fresh ticket outright),
+> self-consistently signed with `iss` set to their own npub, and it verifies. This is a
+> property of the whole payload, `caps` included, and predates `scope` — but a consumer that
+> uses a ticket as a **login credential** must compare `vres.iss` against the npub(s) it
+> actually accepts, or an attacker can hand themselves any caps and any scope they like.
+
+`ticket.sh verify` surfaces it verbatim as a `scope` key in its verdict, and **only** when the
+payload actually carries an object:
+
+```
+$ ticket.sh verify - --require-cap deck   # scope-less ticket (unchanged since day one)
+{"ok":true,"tid":"t…","iss":"npub1…","exp":1765432100,"caps":["deck"]}
+
+$ ticket.sh verify - --require-cap deck   # scoped ticket
+{"ok":true,"tid":"t…","iss":"npub1…","exp":1765432100,"caps":["deck"],"scope":{"amc":{…}}}
+```
+
+**Compatibility, in both directions.** A ticket issued *without* `--scope` produces the same
+payload, the same ledger row and the same verdict as before this feature existed — every
+existing consumer keeps working untouched. A *new* scoped ticket presented to an *old*
+`ticket.sh` verifies normally: the extra payload field is simply ignored, so nothing errors.
+
+**That second direction is the one consumers must think about.** An old verifier cannot be
+taught to see a field it predates, so it will report a scoped ticket as scope-less — and a
+consumer whose default for "no scope" is permissive would then *widen* a deliberately narrow
+ticket. This is inherent to any additive claim and cannot be fixed on the framework side
+(making old code reject would require breaking `caps` validation, which fails the whole
+ticket rather than degrading). It is instead a **consumer obligation**:
+
+> A consumer that issues scoped tickets MUST record, at first successful verification, that a
+> given `tid` is scoped, and MUST fail closed — not fall back to its permissive default — if a
+> later verification of that same `tid` comes back without a scope.
+
+(Agentic Mission Control does exactly this: it stamps a `scoped` flag into its session cookie
+at login and resolves a scoped session whose ceiling is missing to `REVOKED`, never to full
+view.)
+
+That covers "the ceiling went missing *after* login". It cannot cover "the verifier was old at
+login time", because the consumer has nothing to compare against. For that, ask:
+
+```bash
+ticket.sh features
+# → {"ticketSh":1,"formats":["v1","v2"],"features":["scope"]}
+```
+
+A consumer that depends on `scope` should probe once at startup and refuse to run if `scope`
+is absent from `features`. This works precisely because a **pre-scope `ticket.sh` has no
+`features` subcommand**: it hits the usage line and exits non-zero, so the probe fails loudly
+rather than returning a reassuring answer. `features` is append-only — entries are never
+removed or repurposed — so membership is the only test a consumer needs.
+
+A `--require-scope` *flag* on `verify` would have been the obvious alternative and is a trap:
+`tk_verify`'s argument loop silently discards unrecognized `-*` options, so old code would
+drop the flag and answer `ok:true` anyway — failing open, which is the exact failure the probe
+exists to prevent. The probe is a subcommand for that reason.
 
 ### 3.2 v1 encoding + signature (legacy)
 

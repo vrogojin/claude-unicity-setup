@@ -311,6 +311,106 @@ bash "$REG" authorize "$SH" consult --owner >/dev/null 2>&1 && ok "owner --owner
 [ "$(jq -r '.count // 0' "$SURF" 2>/dev/null)" = "0" ] && ok "surface cleared after owner un-deny" || bad "surface not cleared"
 rm -f "$SURF"  # clean our shared-STATE_DIR footprint (repo-default dir, like section 14)
 
+echo "== 20. verify: verdict shape + optional signed scope (opaque, tamper-evident) =="
+# 20a. BACKWARD COMPAT: a scope-less ticket's verdict is EXACTLY the pre-scope 5-key object.
+# Asserted key-for-key (not just "ok:true") because every existing consumer — the AMC deck
+# login among them — parses this JSON, and an added key or reordering is a wire change.
+T20=$(issue --caps deck --ttl 5m)
+V20=$(bash "$TICKET" verify "$T20" --require-cap deck 2>/dev/null)
+[ "$(printf '%s' "$V20" | jq -r '[keys_unsorted[]]|join(",")')" = "ok,tid,iss,exp,caps" ] \
+  && ok "scope-less verdict keeps the exact legacy shape {ok,tid,iss,exp,caps}" || bad "scope-less verdict shape changed: $V20"
+[ "$(printf '%s' "$V20" | jq -r '.tid')" = "$(tid_of "$T20")" ] && ok "verdict tid matches the secret hash" || bad "verdict tid"
+[ "$(printf '%s' "$V20" | jq -r 'has("scope")')" = "false" ] && ok "no scope key for a scope-less ticket" || bad "scope key leaked onto a scope-less verdict"
+# …and the ledger record is likewise unchanged (no stray scope key).
+[ "$(jq -r --arg t "$(tid_of "$T20")" '.tickets[]|select(.tid==$t)|has("scope")' "$SBX/coord/tickets.json")" = "false" ] \
+  && ok "tickets.json record unchanged for a scope-less ticket" || bad "scope key added to a scope-less ledger record"
+# A wrong required cap still fails closed, with scope in the picture or not.
+# NB: verify EXITS NON-ZERO on a deny, and this suite runs under `set -o pipefail` — so the
+# verdict is captured first and asserted separately, never piped straight into jq.
+VNC=$(bash "$TICKET" verify "$T20" --require-cap consult 2>/dev/null)
+printf '%s' "$VNC" | jq -e '.ok==false and .error=="missing-required-cap"' >/dev/null \
+  && ok "missing-required-cap still fails closed" || bad "require-cap gate: $VNC"
+
+# 20b. ROUND-TRIP: --scope survives issue → sign → publish → fetch → verify, VERBATIM.
+# The wrapper key is the CONSUMER's ("amc" is what the AMC deck's unwrapSignedScope reads);
+# ticket.sh never looks inside it.
+SC='{"amc":{"view":["product:acme/*"],"actions":["read","summaries.read"],"deny":["tag:private"],"no_delegate":true}}'
+T21=$(issue --caps deck --ttl 5m --scope "$SC")
+V21=$(bash "$TICKET" verify "$T21" --require-cap deck 2>/dev/null)
+[ "$(printf '%s' "$V21" | jq -r '.ok')" = "true" ] && ok "scoped v2 ticket verifies" || bad "scoped v2 verify: $V21"
+[ "$(printf '%s' "$V21" | jq -c '.scope')" = "$(printf '%s' "$SC" | jq -c .)" ] \
+  && ok "scope round-trips verbatim through the verdict" || bad "scope mangled: $(printf '%s' "$V21" | jq -c '.scope')"
+[ "$(printf '%s' "$V21" | jq -r '[keys_unsorted[]]|join(",")')" = "ok,tid,iss,exp,caps,scope" ] \
+  && ok "scope is APPENDED (legacy keys keep their positions)" || bad "scoped verdict shape"
+# The signed payload on the relay carries it too (i.e. it is inside what the signature covers).
+[ "$(v2_payload_of "$T21" | jq -c '.scope')" = "$(printf '%s' "$SC" | jq -c .)" ] \
+  && ok "scope lives inside the signed+encrypted v2 payload" || bad "scope not in the signed payload"
+# …and the issuer's ledger records it (so `list` can show what was granted).
+[ "$(jq -c --arg t "$(tid_of "$T21")" '.tickets[]|select(.tid==$t)|.scope' "$SBX/coord/tickets.json")" = "$(printf '%s' "$SC" | jq -c .)" ] \
+  && ok "tickets.json records the scope" || bad "scope not recorded in the ledger"
+
+# 20c. v1 (legacy self-contained format) carries scope on the same seam.
+T22=$(issue --v1 --caps deck --ttl 5m --scope "$SC")
+V22=$(bash "$TICKET" verify "$T22" --require-cap deck 2>/dev/null)
+[ "$(printf '%s' "$V22" | jq -c '.scope')" = "$(printf '%s' "$SC" | jq -c .)" ] && ok "v1 scope round-trips" || bad "v1 scope: $V22"
+# 20d. OLD-FORMAT ticket (a payload minted with NO scope field at all) still verifies under the
+# new code — hand-signed here exactly as pre-scope ticket.sh built it.
+POLD=$(jq -nc --arg iss "$AN" '{v:1,tid:"toldformat001",iss:$iss,issName:"a",relays:["wss://x"],secret:"s",caps:["deck"],grantBack:["deck"],exp:9999999999,bind:"",label:""}')
+TOLD="unicity-ticket:v1.$(hsign "$SBX/alice.json" "$POLD" | jq -c . | basenc --base64url -w0)"
+VOLD=$(bash "$TICKET" verify "$TOLD" --require-cap deck 2>/dev/null)
+[ "$(printf '%s' "$VOLD" | jq -r '.ok')" = "true" ] && ok "old-format (pre-scope) ticket still verifies" || bad "old-format verify broke: $VOLD"
+[ "$(printf '%s' "$VOLD" | jq -r 'has("scope")')" = "false" ] && ok "old-format verdict carries no scope" || bad "scope invented for an old-format ticket"
+
+# 20e. TAMPER-EVIDENCE: the scope is inside the signed content, so editing it post-issue
+# invalidates the ticket rather than silently WIDENING the bearer's ceiling.
+EVS=$(hsign "$SBX/alice.json" "$(printf '%s' "$POLD" | jq -c --argjson s "$SC" '.scope=$s')")
+WIDE=$(printf '%s' "$EVS" | jq -c '.content=(.content|@base64d|fromjson|.scope.amc.view=["*"]|tojson|@base64)' | jq -c '.content=(.content|gsub("\\+";"-")|gsub("/";"_")|gsub("=";""))')
+TW="unicity-ticket:v1.$(printf '%s' "$WIDE" | jq -c . | basenc --base64url -w0)"
+VTW=$(bash "$TICKET" verify "$TW" --require-cap deck 2>/dev/null)
+printf '%s' "$VTW" | jq -e '.ok==false and .error=="signature-invalid"' >/dev/null \
+  && ok "post-issue scope widening is rejected (signature-invalid)" || bad "a widened scope verified: $VTW"
+# Stripping the scope entirely is equally fatal (a downgrade attempt is not silent).
+STRIP=$(printf '%s' "$EVS" | jq -c '.content=(.content|@base64d|fromjson|del(.scope)|tojson|@base64)' | jq -c '.content=(.content|gsub("\\+";"-")|gsub("/";"_")|gsub("=";""))')
+TS="unicity-ticket:v1.$(printf '%s' "$STRIP" | jq -c . | basenc --base64url -w0)"
+VTS=$(bash "$TICKET" verify "$TS" --require-cap deck 2>/dev/null)
+printf '%s' "$VTS" | jq -e '.ok==false' >/dev/null \
+  && ok "post-issue scope STRIPPING is rejected" || bad "a stripped scope verified: $VTS"
+
+# 20f. FEATURE PROBE: a consumer can ask whether this ticket.sh understands `scope` at all.
+FEAT=$(bash "$TICKET" features 2>/dev/null)
+[ "$(printf '%s' "$FEAT" | jq -r '.features|index("scope")|type')" = "number" ] \
+  && ok "features advertises scope" || bad "features probe: $FEAT"
+[ "$(printf '%s' "$FEAT" | jq -r '.formats|join(",")')" = "v1,v2" ] && ok "features advertises both formats" || bad "features formats"
+# The probe is only useful because an OLD ticket.sh — which has no `features` subcommand —
+# fails it LOUDLY (usage + non-zero), which is what lets a consumer fail closed. Assert that
+# an unknown subcommand still behaves that way, since the whole scheme rests on it.
+UNK=$(bash "$TICKET" definitely-not-a-subcommand 2>&1); URC=$?
+[ "$URC" -ne 0 ] && ok "unknown subcommand exits non-zero (probe fails closed on old code)" || bad "unknown subcommand exited 0"
+printf '%s' "$UNK" | jq -e . >/dev/null 2>&1 && bad "unknown subcommand emitted JSON" || ok "unknown subcommand emits no JSON"
+
+echo "== 21. --scope validation: malformed input is refused AT ISSUE, nothing recorded =="
+NT_BEFORE=$(jq '.tickets|length' "$SBX/coord/tickets.json")
+badscope() {  # <label> <value>
+  local out; out=$(bash "$TICKET" issue --caps deck --ttl 5m --scope "$2" 2>&1)
+  if printf '%s' "$out" | grep -q '^ut2_\|^unicity-ticket:'; then bad "malformed scope ACCEPTED ($1)"
+  else printf '%s' "$out" | grep -q 'ERROR(ticket): --scope' && ok "rejected $1" || bad "rejected $1 but without a --scope error: $out"; fi
+}
+badscope "non-JSON"       'not json at all'
+badscope "truncated JSON" '{"amc":{'
+badscope "a JSON array"   '[1,2,3]'
+badscope "a JSON string"  '"just-a-string"'
+badscope "a JSON number"  '42'
+badscope "JSON null"      'null'
+badscope "an empty object" '{}'
+badscope "an EMPTY --scope value" ''
+badscope "over the size cap" "{\"amc\":{\"view\":[\"$(head -c 5000 /dev/zero | tr '\0' 'x')\"]}}"
+[ "$(jq '.tickets|length' "$SBX/coord/tickets.json")" = "$NT_BEFORE" ] \
+  && ok "no ticket recorded for any rejected scope" || bad "a rejected --scope still recorded a ticket"
+# The cap is env-tunable rather than hard-wired (house style).
+CAPOUT=$(TK_SCOPE_MAX_BYTES=20 bash "$TICKET" issue --caps deck --ttl 5m --scope "$SC" 2>&1)
+printf '%s' "$CAPOUT" | grep -q 'over the 20B cap' \
+  && ok "TK_SCOPE_MAX_BYTES tunes the cap" || bad "TK_SCOPE_MAX_BYTES not honoured: $CAPOUT"
+
 echo ""
 echo "════════════════════════════════════════"
 echo "  onboarding-ticket: $PASS passed, $FAIL failed"
